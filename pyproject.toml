@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yanagent"
+version = "0.1.0"
+description = "A deliberately incomplete scaffold for learning how to build a stateful Agent runtime"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["yanagent*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100

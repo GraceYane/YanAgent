@@ -1,0 +1,2 @@
+# The scaffold backend intentionally uses only Python's standard library.
+# Add model SDKs, database drivers, MCP SDKs, etc. as you implement each module.

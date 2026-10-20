@@ -1,0 +1,1 @@
+"""Multi-Agent coordination contracts."""
