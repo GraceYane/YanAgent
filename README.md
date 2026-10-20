@@ -74,16 +74,21 @@ npm run dev
 
 ## 推荐开发顺序
 
-1. 完成 `ModelProvider`，先实现一次普通非流式 LLM 调用。
-2. 完成 `SessionStore`，使用 SQLite 保存消息和恢复历史。
-3. 完成 `ToolManager`，实现工具注册、Schema、参数校验和执行。
-4. 完成 `AgentLoop`，实现 `LLM -> tool call -> tool result -> LLM` 循环。
-5. 完成流式事件协议，并把 `/message` 从固定提示接到 AgentLoop。
-6. 完成 `AgentBridge`，解决 Session、Agent、模型、运行任务之间的路由与隔离。
-7. 增加上下文裁剪、摘要、取消、超时、失败重试与 Token 统计。
-8. 再开发 Memory、MCP、Skills、Multi-Agent 等差异化能力。
+以 [开发需求与实施计划](docs/DEVELOPMENT_REQUIREMENTS.md) 为后续开发的主要依据，按任务编号逐项推进。
 
-更细的任务拆分和验收标准见 [docs/IMPLEMENTATION_ROADMAP.md](docs/IMPLEMENTATION_ROADMAP.md)。
+1. P01：统一数据结构、配置、单模型调用与桌面流式聊天。
+2. P02：Session 持久化、多轮历史与会话管理。
+3. P03：最小工具系统与权限基础。
+4. P04：模型与工具循环执行的 Agent Loop。
+5. P05：Bridge 调度、上下文管理、取消与运行稳定性。
+6. P06～P10：多模型、完整工具、Skills、MCP、记忆知识库和 Multi-Agent。
+7. P11～P12：Web、多渠道、定时、桌面交付与功能对照验收。
+
+P01-01 统一数据契约已完成，见 [实现说明与运行示例](docs/P01_01_CONTRACTS.md)。当前下一项任务是 **P01-02：配置与统一错误**；真实模型与桌面聊天仍待接入。
+
+阶段导航见 [实施路线摘要](docs/IMPLEMENTATION_ROADMAP.md)，每次需求的实际开发记录追加到 [workProcess.md](workProcess.md)。
+
+求职参考见 [目标岗位与开发成果映射](docs/TARGET_ROLES.md)。技术实现以 CowAgentByYan 为依据；后续需求与岗位要求重合时，在开发记录详细沉淀实现、设计取舍和验证证据。
 
 ## 验证骨架
 
