@@ -1,1 +1,1 @@
-"""Long-term memory contracts."""
+"""长期记忆相关接口。"""

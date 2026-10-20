@@ -1,4 +1,4 @@
-"""Provider-neutral LLM interface -- deliberately not implemented."""
+"""与供应商无关的统一大模型接口——当前有意保留为空实现。"""
 
 from collections.abc import AsyncIterator, Sequence
 from typing import Any, Protocol
@@ -22,8 +22,8 @@ class UnimplementedModelProvider:
     name = "unimplemented"
 
     async def complete(self, messages: Sequence[Message], *, tools: Sequence[dict[str, Any]]) -> ModelReply:
-        raise NotImplementedError("Implement at least one concrete LLM provider")
+        raise NotImplementedError("请至少实现一个可用的大模型供应商")
 
     async def stream(self, messages: Sequence[Message], *, tools: Sequence[dict[str, Any]]):
-        raise NotImplementedError("Implement normalized streaming")
-        yield  # pragma: no cover
+        raise NotImplementedError("请实现统一格式的流式响应")
+        yield  # pragma: no cover - 仅用于保持异步生成器接口

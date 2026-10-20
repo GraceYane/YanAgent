@@ -1,1 +1,1 @@
-"""Model provider contracts."""
+"""模型供应商相关接口。"""

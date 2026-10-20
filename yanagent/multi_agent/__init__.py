@@ -1,1 +1,1 @@
-"""Multi-Agent coordination contracts."""
+"""多 Agent 协作相关接口。"""

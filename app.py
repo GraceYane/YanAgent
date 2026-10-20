@@ -1,8 +1,7 @@
-"""Minimal HTTP shell for the YanAgent learning scaffold.
+"""YanAgent 学习脚手架的最小 HTTP 服务外壳。
 
-This file deliberately does not contain an Agent loop. It only keeps the
-copied desktop client bootable while the real runtime is implemented under
-``yanagent/``.
+本文件有意不包含 Agent 执行循环，只负责让复制过来的桌面客户端能够启动。
+真正的 Agent Runtime 需要在 ``yanagent/`` 目录下逐步实现。
 """
 
 from __future__ import annotations
@@ -75,10 +74,10 @@ class YanAgentHandler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
             return {}
 
-    def do_OPTIONS(self) -> None:  # noqa: N802 - stdlib handler contract
+    def do_OPTIONS(self) -> None:  # noqa: N802 - 标准库处理器约定的方法名
         self._json({"status": "ok"})
 
-    def do_GET(self) -> None:  # noqa: N802 - stdlib handler contract
+    def do_GET(self) -> None:  # noqa: N802 - 标准库处理器约定的方法名
         path = urlparse(self.path).path
 
         if path in {"/", "/api/health"}:
@@ -159,7 +158,7 @@ class YanAgentHandler(BaseHTTPRequestHandler):
             HTTPStatus.NOT_IMPLEMENTED,
         )
 
-    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+    def do_POST(self) -> None:  # noqa: N802 - 标准库处理器约定的方法名
         path = urlparse(self.path).path
         payload = self._body()
 

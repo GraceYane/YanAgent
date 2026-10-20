@@ -1,1 +1,1 @@
-"""Agent runtime contracts."""
+"""Agent 运行时相关接口。"""

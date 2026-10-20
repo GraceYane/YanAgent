@@ -1,2 +1,2 @@
-# The scaffold backend intentionally uses only Python's standard library.
-# Add model SDKs, database drivers, MCP SDKs, etc. as you implement each module.
+# 当前脚手架后端有意只使用 Python 标准库。
+# 后续实现各模块时，再按需添加模型 SDK、数据库驱动和 MCP SDK 等依赖。

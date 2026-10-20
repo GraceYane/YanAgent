@@ -1,1 +1,1 @@
-"""Conversation persistence contracts."""
+"""对话持久化相关接口。"""

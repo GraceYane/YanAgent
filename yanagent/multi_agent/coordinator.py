@@ -1,4 +1,4 @@
-"""Multi-Agent and sub-agent orchestration -- deliberately not implemented."""
+"""多 Agent 与子 Agent 编排——当前有意保留为空实现。"""
 
 from dataclasses import dataclass
 
@@ -13,7 +13,7 @@ class Delegation:
 
 class MultiAgentCoordinator:
     async def delegate(self, delegation: Delegation) -> str:
-        raise NotImplementedError("Implement bounded, isolated sub-agent execution")
+        raise NotImplementedError("请实现有深度限制且上下文隔离的子 Agent 执行机制")
 
     async def route_mention(self, text: str, roster: list[str]) -> str | None:
-        raise NotImplementedError("Resolve an explicit @Agent without identity confusion")
+        raise NotImplementedError("请准确解析显式 @Agent 指令，避免 Agent 身份混乱")

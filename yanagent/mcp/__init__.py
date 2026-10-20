@@ -1,1 +1,1 @@
-"""MCP client contracts."""
+"""MCP 客户端相关接口。"""

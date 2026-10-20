@@ -1,4 +1,4 @@
-"""Provider- and transport-neutral data contracts."""
+"""与模型供应商和传输协议无关的统一数据契约。"""
 
 from __future__ import annotations
 

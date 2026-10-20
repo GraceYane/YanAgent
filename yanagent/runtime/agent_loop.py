@@ -1,7 +1,7 @@
-"""The central Agent loop -- deliberately not implemented.
+"""Agent 的核心执行循环——当前有意保留为空实现。
 
-Target algorithm: load context -> call model -> execute requested tools ->
-append results -> call model again -> repeat until a final answer or limit.
+目标流程：加载上下文 -> 调用模型 -> 执行模型请求的工具 ->
+追加工具结果 -> 再次调用模型 -> 重复执行，直到得到最终回答或触发限制。
 """
 
 from __future__ import annotations
@@ -26,10 +26,10 @@ class AgentLoop:
         self.limits = limits or LoopLimits()
 
     async def run(self, request: RunRequest) -> RunResult:
-        """Run one Agent task until it produces a final answer.
+        """运行一次 Agent 任务，直到生成最终回答。
 
-        TODO: load and trim context; append the user message; call the model;
-        validate and execute tool calls; append tool results; repeat with
-        cancellation, timeout and turn limits; persist the final answer.
+        待实现：加载并裁剪上下文；追加用户消息；调用模型；校验并执行
+        工具调用；追加工具结果；在支持取消、超时和轮数限制的前提下
+        重复执行；最后持久化最终回答。
         """
-        raise NotImplementedError("Implement YanAgent's model/tool execution loop")
+        raise NotImplementedError("请实现 YanAgent 的模型与工具执行循环")

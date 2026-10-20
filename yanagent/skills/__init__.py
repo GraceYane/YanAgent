@@ -1,1 +1,1 @@
-"""Skill lifecycle contracts."""
+"""Skill 生命周期相关接口。"""

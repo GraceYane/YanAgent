@@ -1,1 +1,1 @@
-"""Tool system contracts."""
+"""工具系统相关接口。"""
