@@ -10,6 +10,7 @@ YanAgent 是从 CowAgent 的桌面产品外壳中抽出的学习脚手架。项�
 - 启动 CowAgent 风格的 Electron/React 桌面界面。
 - 在聊天框发送消息后，得到“Agent Runtime 尚未实现”的固定提示。
 - 阅读各核心模块的接口、TODO 和验收条件，逐步替换占位实现。
+- 使用 Python 非流式 Provider 或离线 Fake Provider；已完成本地 HTTP 验收，尚未接到桌面聊天。
 
 ## 已移除的核心实现
 
@@ -18,7 +19,7 @@ YanAgent 是从 CowAgent 的桌面产品外壳中抽出的学习脚手架。项�
 | Agent 执行循环 | `yanagent/runtime/agent_loop.py` | 接口保留，实现为空 |
 | 运行时调度 Bridge | `yanagent/runtime/bridge.py` | 接口保留，实现为空 |
 | Session 与上下文 | `yanagent/sessions/store.py` | 接口保留，实现为空 |
-| 模型适配层 | `yanagent/models/provider.py` | 接口保留，实现为空 |
+| 模型适配层 | `yanagent/models/openai_compatible.py` | P01-03 非流式及 Fake 已实现；流式和桌面接入待开发 |
 | 工具系统 | `yanagent/tools/manager.py` | 接口保留，实现为空 |
 | 长期记忆 | `yanagent/memory/service.py` | 接口保留，实现为空 |
 | MCP Client | `yanagent/mcp/client.py` | 接口保留，实现为空 |
@@ -84,12 +85,13 @@ npm run dev
 6. P06～P10：多模型、完整工具、Skills、MCP、记忆知识库和 Multi-Agent。
 7. P11～P12：Web、多渠道、定时、桌面交付与功能对照验收。
 
-P01-01 统一数据契约已完成，见 [实现说明与运行示例](docs/P01_01_CONTRACTS.md)。P01-02 配置与统一错误也已完成，见 [配置字段与验收指南](docs/P01_02_CONFIG_ERRORS.md)。目前共 49 项离线测试通过；当前下一项任务是 **P01-03：非流式 Provider 与 Fake Provider**，真实模型与桌面聊天仍待接入。
+P01-01 统一数据契约已完成，见 [实现说明与运行示例](docs/P01_01_CONTRACTS.md)。P01-02 配置与统一错误已完成，见 [配置字段与验收指南](docs/P01_02_CONFIG_ERRORS.md)。P01-03 非流式适配和 Fake Provider 也已完成，见 [Provider 使用与验收指南](docs/P01_03_PROVIDER.md)。目前共 75 项测试通过，包含本地 HTTP 联调；当前下一项任务是 **P01-04：普通聊天联调**，外部供应商尚未实测，桌面聊天仍待接入。
 
 可在项目根目录运行本次配置演示（使用无效测试密钥，不请求网络）：
 
 ```powershell
 .\.venv\Scripts\python.exe -X utf8 -m examples.config_demo
+.\.venv\Scripts\python.exe -X utf8 -m examples.provider_demo
 ```
 
 阶段导航见 [实施路线摘要](docs/IMPLEMENTATION_ROADMAP.md)，每次需求的实际开发记录追加到 [workProcess.md](workProcess.md)。

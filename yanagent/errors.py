@@ -118,6 +118,27 @@ class ModelConnectionError(AgentError):
     retryable = True
 
 
+class ModelResponseError(AgentError):
+    """标识响应格式或工具参数损坏，不将原始正文放入错误信息。"""
+
+    code = "model_response_error"
+    message = "模型响应格式不符合约定，请检查兼容接口或模型配置。"
+
+
+class EmptyModelResponseError(ModelResponseError):
+    """标识响应没有可用文本，也没有可执行的工具请求。"""
+
+    code = "empty_model_response"
+    message = "模型没有返回文本或工具调用，请稍后重试或检查模型配置。"
+
+
+class ModelRefusalError(ModelResponseError):
+    """标识模型明确拒绝或过滤了本次输出。"""
+
+    code = "model_refusal"
+    message = "模型拒绝回答或输出被过滤，请调整请求。"
+
+
 class ModelServerError(AgentError):
     """标识模型供应商的 HTTP 5xx 服务端错误。"""
 

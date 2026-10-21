@@ -1,0 +1,119 @@
+"""有响应大小限制的 HTTP JSON 传输；阻塞 I/O 在线程中执行，不阻塞事件循环。"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from http.client import HTTPException
+from typing import Any, Protocol
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+from yanagent.errors import (
+    InvalidRequestError, ModelConnectionError, ModelResponseError, ModelTimeoutError, map_http_error,
+)
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """拒绝重复 JSON 键，避免模型工具参数出现含糊的覆盖行为。"""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ModelResponseError()
+        result[key] = value
+    return result
+
+
+def _reject_constant(_value: str) -> None:
+    """拒绝 NaN 和 Infinity 这类非标准 JSON 值。"""
+    raise ModelResponseError()
+
+
+def strict_json_loads(raw: str) -> Any:
+    """解码响应或工具参数；错误不回显原文，顶层形状由使用者检查。"""
+    try:
+        return json.loads(raw, object_pairs_hook=_unique_object, parse_constant=_reject_constant)
+    except (ValueError, TypeError, RecursionError):
+        raise ModelResponseError() from None
+
+
+class JsonTransport(Protocol):
+    """可替换的异步 JSON 传输接口，用于真实网络和确定性的离线测试。"""
+
+    async def post_json(
+        self, *, url: str, headers: dict[str, str], payload: dict[str, Any], timeout: float,
+    ) -> dict[str, Any]:
+        """发送 JSON 并返回解析后的对象，失败抛出统一错误。"""
+        ...
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    """禁止自动重定向，防止携带 Authorization 的请求被转发到别处。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """让 urllib 将 3xx 作为错误返回，而不是携带凭据继续访问。"""
+        return None
+
+
+class UrllibJsonTransport:
+    """标准库传输实现；无自动重试，每次请求结束均关闭响应。"""
+
+    def __init__(self, *, max_response_bytes: int = 8 * 1024 * 1024) -> None:
+        """设置最多读取的响应字节数，超出时拒绝而不是截断后误解析。"""
+        if type(max_response_bytes) is not int or max_response_bytes <= 0:
+            raise ValueError("响应大小限制必须是正整数")
+        self.max_response_bytes = max_response_bytes
+
+    async def post_json(
+        self, *, url: str, headers: dict[str, str], payload: dict[str, Any], timeout: float,
+    ) -> dict[str, Any]:
+        """等待一次有期限的后台请求；取消等待不能强制结束标准库线程。"""
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._post_sync, url, headers, payload, timeout), timeout=timeout,
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            raise ModelTimeoutError() from None
+
+    def _post_sync(
+        self, url: str, headers: dict[str, str], payload: dict[str, Any], timeout: float,
+    ) -> dict[str, Any]:
+        """构造请求并读取受限响应；底层错误只转换为安全的统一错误。"""
+        try:
+            body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+            # HTTP 头采用 ASCII；不让非法凭据触发包含原值的编码异常。
+            for key, value in headers.items():
+                key.encode("ascii")
+                value.encode("ascii")
+                if "\r" in value or "\n" in value:
+                    raise ValueError()
+            request = Request(url, data=body, headers=headers, method="POST")
+            with build_opener(_NoRedirect()).open(request, timeout=timeout) as response:
+                if not 200 <= response.status < 300:
+                    raise ModelResponseError()
+                raw = response.read(self.max_response_bytes + 1)
+        except HTTPError as error:
+            status = error.code
+            error.close()
+            if type(status) is int and 400 <= status <= 599:
+                raise map_http_error(status) from None
+            raise ModelResponseError() from None
+        except URLError as error:
+            if isinstance(error.reason, TimeoutError):
+                raise ModelTimeoutError() from None
+            raise ModelConnectionError() from None
+        except TimeoutError:
+            raise ModelTimeoutError() from None
+        except (OSError, HTTPException):
+            raise ModelConnectionError() from None
+        except (ValueError, TypeError, RecursionError):
+            raise InvalidRequestError() from None
+        if len(raw) > self.max_response_bytes:
+            raise ModelResponseError()
+        try:
+            data = strict_json_loads(raw.decode("utf-8"))
+        except UnicodeError:
+            raise ModelResponseError() from None
+        if type(data) is not dict:
+            raise ModelResponseError()
+        return data

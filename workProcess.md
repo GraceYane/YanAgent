@@ -240,3 +240,91 @@
 - 下一项 P01-03：实现 OpenAI-compatible 非流式 Provider、消息及响应适配和 Fake Provider，将本次配置与错误接入实际调用边界。
 - P01-04 接通桌面配置查询/保存与普通聊天；P01-05 再实现流式事件和取消，当前不自动推进。
 - 数据目录、并发配置更新、凭据持久化增强和运行时策略按后续相应阶段处理；当前可保存明文密钥，脱敏不等于加密或权限隔离。
+
+## 2026-10-21：P01-03 非流式 Provider 与 Fake Provider
+
+### 需求
+
+根据最新 AGENTS.md 继续 P01-03：实现 OpenAI-compatible 非流式调用，统一消息转换、工具调用解析、结束原因和用量；提供可预设响应序列的 Fake Provider。所有新增/修改的类和函数写中文说明，并在本记录中详细说明开发难点、十分制评分和实现方式。
+
+### 完成内容
+
+- 完善 `ModelProvider` 协议说明，新增 `NonStreamingProvider`，本阶段真实/Fake 实现的流式入口均明确报未实现，不以完整回答伪装流式。
+- 实现 `OpenAICompatibleProvider.complete()`，使用 P01-02 配置快照和就绪检查，向 `{api_base}/chat/completions` 发送一次非流式请求，传入认证头及请求超时；不管理会话、不执行工具、不自动重试。
+- `prepare_request()` 校验完整对话及工具配对，保留角色/调用 ID，工具参数对象编码成 JSON 字符串，不发送内部 metadata；失败 ToolResult 通过正文包装保留错误语义。供应商无关的工具描述转换为 function Schema。
+- `parse_reply()` 将单候选响应还原成 `ModelReply`；严格解析多个 Tool Call，拒绝缺失/重复 ID、损坏 JSON、重复键、非对象参数、错误包络及不支持的旧式调用；不自动生成 ID 或把坏参数补成空对象。
+- 结束原因保留原值，空文本但有工具请求视为有效；新增响应格式错误、空响应、明确拒绝三类统一错误。Usage 仅映射明确报告的 input/output/total，未知值不变成零，不伪造总数。
+- 新增可注入 `JsonTransport` 及标准库 `UrllibJsonTransport`：后台线程执行阻塞网络操作、等待截止时间、socket 超时、默认 8 MiB 响应限制、禁止自动重定向、关闭响应、HTTP/连接/超时安全错误映射。
+- 新增 `FakeProvider`、调用记录及耗尽错误，按预设依序返回结果或抛出统一异常；每轮记录独立输入快照；非法输入不消费预设，耗尽后不重复最后响应。
+- 新增默认离线演示及显式 `--live` 入口。离线示例手工填入固定工具结果，不执行工具；真实模式只在用户显式选择时读取配置发出请求，本次未运行。
+- 新增 26 项测试，其中 4 项通过回环随机端口执行真实 HTTP；同步更新需求、路线、README、岗位状态和详细验收指南。P01 仍进行中，下一项为 P01-04。
+
+### 参考实现与设计取舍
+
+- 开发前读取最新 AGENTS.md、P01-03 需求、岗位映射和现有契约/配置/错误；YanAgent 当时工作区干净。CowAgentByYan 存在原有未跟踪文档和桌面脚本，与本次参考源码无关，未作修改。
+- 参考 CowAgentByYan `models/openai_compatible_bot.py` 的 `_handle_sync_response()`、`_convert_tools_to_openai_format()`、`_convert_messages_to_openai_format()`：吸收供应商格式适配边界，YanAgent 使用 P01-01 内部契约，不在 Runtime 传播厂商 JSON 结构。
+- 参考 `models/openai/openai_http_client.py` 的 `_build_headers()`、`_request()`、`_parse_response()`：沿用 Base 拼路径、认证头、超时及 HTTP 分类思路；本次不引入 requests/模型 SDK，不搬入流式、Responses API 或多厂商特性。
+- 与参考实现的区别：YanAgent 用统一异常代替返回原始错误正文；请求前拒绝不完整工具历史；响应参数严格解析；不将缺失 Token 用量默认为零；禁止自动重定向，不把凭据带到后续地址。
+- 标准库 HTTP + 线程使本阶段无需新增依赖并可复用异步接口，但保留“取消等待不等于强制中断线程”的限制。传输是可替换接口，P01-05 可在此边界完善可取消的流式 I/O，不提前宣称取消闭环完成。
+
+### 涉及文件
+
+- `yanagent/models/provider.py`、`yanagent/models/__init__.py`
+- `yanagent/models/openai_compatible.py`、`yanagent/models/transport.py`、`yanagent/models/fake.py`
+- `yanagent/errors.py`
+- `tests/test_provider.py`、`tests/test_provider_http.py`
+- `examples/provider_demo.py`
+- `docs/P01_03_PROVIDER.md`
+- `docs/DEVELOPMENT_REQUIREMENTS.md`、`docs/IMPLEMENTATION_ROADMAP.md`、`docs/TARGET_ROLES.md`
+- `README.md`、`workProcess.md`
+
+### 验证结果
+
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m unittest discover -s tests -v`：75 项测试通过；新增 26 项，原有 49 项通过；没有将未实现业务的骨架测试算为真实模型或 AgentLoop 完成。
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m examples.provider_demo`：通过，两轮预设、工具引用和第二轮输入角色顺序正确，明确标注工具结果与 Usage 是固定模拟值。
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m compileall -q -f app.py yanagent tests examples`：通过。
+- `CodecTests`：消息及失败工具结果转换、Schema 隔离、坏上下文、文本/多工具响应、结束原因、未知/零用量、坏参数/重复 ID、空响应/拒绝和错误包络均通过。
+- `ProviderAsyncTests`：配置检查先于网络；真实适配器传入 URL/认证/超时/Schema；Fake 顺序、快照、耗尽、非法输入不消费；阻塞操作在线程中执行；等待超时与取消不自动重试，流式入口明确拒绝。
+- `TransportTests`：状态精确分类、HTTPError 关闭、错误栈不含原始敏感片段、DNS/超时分类、受限读取及坏 JSON/编码拒绝。
+- `LocalHttpTests`：4 项真实本地 HTTP 测试通过，验证 UTF-8 POST、认证头、文本和工具响应、401/429 无重试、307 不跟随；服务器只监听 127.0.0.1 随机端口，使用虚构密钥，正常关闭。
+- 未请求真实外部供应商，未读取或使用用户真实密钥，未运行 `--live`，未改前端或接通 `/message`；本地 HTTP 验证不能替代真实模型联调。
+
+### 难点、评分与实现方式
+
+整体开发难度：**6/10**，属于中等工程难度。分项评分描述各问题自身复杂度，不是累加分数。
+
+| 难点 | 评分 | 容易出现的问题 | 实现方式与证据 |
+|---|---|---|---|
+| 内部消息与模型协议转换 | 6/10 | 丢失调用 ID、将工具参数对象直接发给接口、遗漏失败语义 | 请求前做完整配对验证；参数编码为字符串，响应反向还原对象；失败工具正文包装；四消息和真实 HTTP 工具响应测试验证 |
+| 响应不完整或字段缺失 | 6/10 | 把坏工具 JSON 修成空参数继续执行，把工具型回复误判为空，把未知 Token 当成零 | 严格 JSON 与契约校验；允许无文本的有效工具请求；空、拒绝、格式错误分开；仅映射明确报告的 Usage，保留 finish_reason |
+| 异步与资源生命周期 | 7/10 | async 函数内部直接阻塞网络；取消等待后误认为 socket 已停止；超时后盲目重试 | 通过 to_thread 隔离阻塞 I/O，wait_for 限制等待，socket 也设超时，所有响应关闭且不自动重试；测试确认执行线程和异常路径，文档明确后台线程的剩余限制 |
+| 可复现的 Fake 模型 | 5/10 | 原消息或预设被修改后污染之前记录；预设耗尽却重复响应掩盖多调用 | 队列每轮消费、响应/输入深拷贝、记录返回副本、耗尽专用错误；用两轮工具历史及变更外部对象测试验证 |
+| 统一错误与信息边界 | 5/10 | 原始 HTTP 异常带出 URL/正文/凭据；重定向将认证转发 | 只按 HTTP 状态分类，固定安全文案，不保留错误体，抑制底层异常链打印，禁止自动重定向；真实 307 和错误栈测试验证 |
+
+这里已完成的是非流式适配基础，不包含真正的工具执行、流式拼装、多会话并发或完整停止生成，因此不按完整 Agent Runtime 的难度评分。
+
+### 实际问题与处理
+
+- 本机 Windows 沙箱内创建默认 asyncio 事件循环出现阻塞，终止探测后在经工具审批的普通执行环境中验证 `ProactorEventLoop` 正常，再运行异步测试与本地回环联调；没有修改系统设置或为测试替换产品事件循环策略。
+- P01-01 允许合法空 `ModelReply`，但真实模型无文本无工具的响应应可识别：把检测放在真实响应解析边界，Fake 仍可主动预设空结果供后续上层策略验证，避免混淆数据表达能力与调用成功条件。
+- 兼容 API 没有统一的 Tool 消息 `is_error` 字段，不能直接把内部字段全量转发：只发送标准字段，错误结果用 JSON 正文表达，并测试原始内部消息不被修改。
+- 标准库阻塞 HTTP 无法随异步取消立即强杀线程，这一限制未被隐藏为“取消已实现”；文档指出 DNS/慢速回包及事件循环退出时可能等待线程回收，P01-05 需要继续处理。
+
+### 岗位要求关联与实践证据
+
+- 开发任务：P01-03 非流式 Provider 与 Fake Provider。
+- 对应条款：XM-职责1 的模型接入链路基础、XM-职责7 的稳定性与可维护性；DYQ-职责2 的上下文及多工具调用编排基础、DYQ-职责3 的通用协议和调试能力；TX-要求1 的 Python 工程质量、TX-职责1 的工具调用接口基础。模型/Prompt 映射条目中，本次只覆盖模型适配和错误处理，不宣称完成 Prompt 优化或模型原理研究。
+- 重合范围：后续 Agent 可复用统一输入/输出及错误接口，Fake 可以稳定复现多轮调用与失败；尚未实现工具实际执行、任务规划、质量工作流或生产部署。
+- 具体实现：`OpenAICompatibleProvider` 将配置和协议转换连接到传输；`prepare_request/parse_reply` 作为边界；`JsonTransport` 允许替换网络实现；`FakeProvider.calls/remaining` 支持验证每轮上下文和调用次数。
+- 设计原因：模型厂商细节留在适配器，Runtime 面向 `ModelReply`；Tool Call 必须保留请求/结果关联；错误分类让调用方决定策略；可控 Fake 避免联网模型的随机响应导致基础回归不可复现。
+- 验证证据：新增 26 项测试及默认示例；真实回环 HTTP 验证传输而非只 Mock 方法；超时/取消通过受控异步替身验证，未当成远端网络可立即取消的证据。
+- 难点与取舍：见上表，重点为严格工具参数与未知用量处理、非流式线程 I/O 的取消限制、Fake 状态隔离；暂不自动修复模型输出或在 Provider 层重试，避免隐式改变语义。
+- 指标与结论：75 项测试通过是当前受控正确性证据；未测量真实任务成功率、吞吐、Token 成本或生产可用率，没有性能提升数字。
+- 面试可讲事实：为 Agent Runtime 实现统一非流式模型适配层，将工具参数与消息格式转换、Usage、错误类型收口，提供确定性 Fake Provider 并用本地 HTTP 服务验证真实请求链路，为后续 AgentLoop 建立可重复测试基础。
+- 后续差距：未验证真实模型能力，未接桌面用户链路，未实现 ToolManager/AgentLoop、流式与完整取消、自动退避、多模型切换或完整评测；不能把本阶段写成已完成 Multi-Agent 平台或企业业务落地。
+
+### 后续事项
+
+- 下一项 P01-04：模型与配置接口、`/message` 非流式调用、`inline_reply` 桌面展示和统一错误反馈。
+- P01-05 接入流式协议、内部事件及取消生命周期；需优先解决本次记录的后台线程限制。
+- 真实外部供应商验收另行记录所用模型与结果；当前仅提供显式 `--live` 入口，未自动使用真实凭据。
