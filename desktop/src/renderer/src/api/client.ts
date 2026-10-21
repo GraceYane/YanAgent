@@ -173,7 +173,16 @@ class ApiClient {
       },
     })
     if (!res.ok) {
-      throw new Error(`HTTP ${res.status}: ${res.statusText}`)
+      // P01-04 后端返回统一 JSON 错误。优先展示安全的中文 message，
+      // 这样聊天气泡能区分缺少密钥、认证失败、限流和超时。
+      let detail = res.statusText
+      try {
+        const body = await res.clone().json()
+        if (typeof body?.message === 'string' && body.message) detail = body.message
+      } catch {
+        /* 非 JSON 错误仍保留标准 HTTP 状态说明。 */
+      }
+      throw new Error(`HTTP ${res.status}: ${detail}`)
     }
     return res.json()
   }

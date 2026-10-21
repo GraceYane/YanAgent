@@ -328,3 +328,98 @@
 - 下一项 P01-04：模型与配置接口、`/message` 非流式调用、`inline_reply` 桌面展示和统一错误反馈。
 - P01-05 接入流式协议、内部事件及取消生命周期；需优先解决本次记录的后台线程限制。
 - 真实外部供应商验收另行记录所用模型与结果；当前仅提供显式 `--live` 入口，未自动使用真实凭据。
+
+## 2026-10-21：P01-04 普通聊天联调
+
+### 需求
+
+按照开发计划完成 P01-04：接通桌面端配置与模型查询/保存接口，让 `/message` 调用 P01-03 的非流式 Provider，并使用现有前端支持的 `inline_reply` 展示完整回答；非法输入和模型调用失败返回明确错误。继续遵循最新 `AGENTS.md`：新增类和函数使用中文说明，关键流程输出带文件名与函数名的中文日志，并记录难点评分、实现方式及岗位重合证据。
+
+### 完成内容
+
+- 新增 `YanAgentApplication` 应用层，将 `ConfigStore`、Provider 工厂和桌面 HTTP 契约隔离开。生产默认创建 `OpenAICompatibleProvider`，测试注入 `FakeProvider`；应用层不依赖 `BaseHTTPRequestHandler`，可以离线验证。
+- 接通 `GET/POST /config`：将精简配置映射到复制桌面端的 `ConfigData`，兼容 `bot_type → model_provider`、`agent_permission_mode → permission_mode`；`cow_lang` 和 `use_linkai` 作为尚未进入精简配置的复制 UI 字段不落盘。未知字段失败，不静默吞掉拼写错误。
+- 接通 `GET/POST /api/models`：返回单一 `openai-compatible` Provider、密钥/API Base 脱敏状态、模型目录和 Chat 能力；支持 `set_provider`、Chat 的 `set_capability` 及 `delete_provider`。语音、视觉、Embedding、搜索、模型发现和多 Provider 管理未实现时明确拒绝或显示不可编辑，不返回虚假成功。
+- 将 `/message` 从固定占位回复改为真实 Provider 调用：校验 `session_id`、消息、stream 类型、Agent 和 P01-04 能力范围；构造一条内部 `Message(role="user")`，调用 `complete(..., tools=[])`，把 `ModelReply` 转成 `stream=false + inline_reply`，并返回 finish reason 与 Usage。
+- 对齐了桌面 `chatStore` 的已有兼容分支：前端当前仍发送 `stream=true`，收到 `stream=false` 和 `inline_reply` 后会结束 loading 并一次性写入 Assistant 气泡。本任务没有伪造 SSE，流式按 P01-05 实现。
+- 每个消息请求在调用模型前分配 `run-...` 请求 ID；成功和失败日志均可关联该 ID。日志写明 `[chat.py][类.函数]` 或 `[app.py][类.函数]`，记录动作、错误码、Provider 和输出长度，不记录用户消息正文、API Key 或上游响应正文。
+- HTTP 层增加 1 MiB 请求上限、严格 JSON 对象解析和错误状态映射；单条消息限制 200,000 字符。空字段、附件、语音、其他 Agent 及意外工具请求均明确失败，避免被当成普通聊天成功。
+- 新增 `RequestValidationError` 与 `UnexpectedToolCallError`。配置/请求返回 400，认证 401，权限 403，模型不存在 404，限流 429，超时 504，拒绝 422，连接/响应/上游服务异常 502；正文保留统一安全错误对象。
+- 修改 TypeScript API Client：非 2xx 时读取后端安全的 JSON `message`，聊天气泡可以显示“缺少 API Key”“认证失败”“超时”等中文原因，而不只有浏览器状态文本。
+- 健康状态从 `not_implemented` 更新为 `non_streaming_chat`；AgentLoop 的占位测试仍保留，防止将本次普通单轮调用误写成完整工具循环已实现。
+- 新增 10 项 P01-04 行为测试、接口说明和手工验收步骤；同步更新需求勾选、路线、README 和岗位状态。P01 仍是进行中，下一项为 P01-05。
+
+### 调用流程与设计取舍
+
+```text
+Electron/React chatStore
+  → POST /message（stream=true）
+  → YanAgentHandler：正文边界、JSON、HTTP 错误
+  → YanAgentApplication：业务字段和阶段能力校验
+  → ConfigStore.load()：当前生效配置快照
+  → ProviderFactory(config)
+  → OpenAICompatibleProvider.complete([User Message], tools=[])
+  → ModelReply
+  → {stream:false, inline_reply, request_id, finish_reason, usage}
+  → chatStore 完成当前 Assistant 气泡
+```
+
+- 没有把模型调用直接写进路由分支：HTTP 只做传输，应用层做请求语义和配置适配，Provider 继续只负责模型协议。这使测试不必启动 Electron，也不必把 Fake 逻辑写入生产代码。
+- 配置模型在 P01-04 每次消息读取一次不可变快照；网络等待期间不持有配置锁。配置读写用进程内 `RLock` 避免当前线程 HTTP 服务内的交叉写入，但尚未解决多进程写同一文件的问题。
+- 当前 `BaseHTTPRequestHandler` 每条请求运行在线程中，内部暂用 `asyncio.run()` 执行一次非流式协程。这对 P01-04 的单次调用足够清晰，但不适合作为长期异步 Runtime；P01-05 必须设计常驻事件循环、Run 任务、事件队列和跨线程通信。
+- Provider 没有收到工具描述，若模型仍返回 Tool Call，不自动执行、不丢弃，也不把空文本当回答，而是返回 `unexpected_tool_call`。真正工具链属于 P03～P04。
+- 当前模型目录给出常见名称作为首次设置入口；它们不是能力声明或真实可用性保证。用户选择的模型必须与 API Base 一致，外部真实验证留到 P01-06。
+- 只有当前用户消息进入 Provider，多轮上下文、完整历史和持久化明确留在 P02；`session_id` 当前用于接口关联，不代表数据库归属校验已完成。
+
+### 涉及文件
+
+- `yanagent/chat.py`
+- `app.py`
+- `yanagent/errors.py`
+- `desktop/src/renderer/src/api/client.ts`
+- `tests/test_chat_integration.py`、`tests/test_scaffold.py`
+- `docs/P01_04_CHAT_INTEGRATION.md`
+- `docs/DEVELOPMENT_REQUIREMENTS.md`、`docs/IMPLEMENTATION_ROADMAP.md`、`docs/TARGET_ROLES.md`
+- `README.md`、`workProcess.md`
+
+### 验证结果
+
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m unittest discover -s tests -v`：85 项测试通过；其中 P01-04 新增 10 项，原有 75 项回归通过。
+- P01-04 应用测试：配置/模型两种适配返回同一状态且不泄密；旧配置字段和模型动作正确落入精简配置；`inline_reply`、结束原因、Usage 和当前单条输入符合契约；坏请求不消费 Fake 预设；配置缺失在发网前失败；意外 Tool Call 不执行。
+- P01-04 真实回环 HTTP：桌面完整请求即使携带 `stream=true` 也收到 `stream=false + inline_reply`；`/config` 和 `/api/models` 路径可查询/保存；400 请求错误与 401 认证错误均返回稳定代码、安全中文说明和请求 ID。
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m compileall -q -f app.py yanagent tests examples`：通过。
+- `desktop\npm run build`：Vite renderer 与 TypeScript main 构建通过。构建输出保留既有的字体路径、Browserslist 数据、动态/静态导入及大 chunk 警告；这些不是本次引入的失败，未在 P01-04 扩大范围处理。
+- 本次没有读取、打印或调用用户真实 API Key，没有访问外部模型供应商。真实回环 HTTP 和 Fake 证明接口/控制流可复现，但不等于真实模型桌面联调已通过。
+- 开发时在受限 Windows 沙箱内运行 asyncio 测试仍会阻塞；中止该轮后，在用户授权的普通 Windows 执行环境运行完整测试并通过。未修改系统事件循环或安全设置。
+- 对本次新增/修改 Python 代码执行中文 Docstring 检查并进行差异检查；所有新增类和函数均有中文说明，日志关键路径包含文件名和函数名。
+
+### 难点、评分与实现方式
+
+整体开发难度：**7/10**。难点不在“再调用一次 API”，而在同时对齐复制前端、同步 HTTP 服务、异步 Provider、配置安全和真实错误语义。
+
+| 难点 | 评分 | 容易出现的问题 | 实现方式与证据 |
+|---|---:|---|---|
+| 复制桌面端与精简后端契约对齐 | 7/10 | 前端请求 `/config` 而后端只有 `/api/config`；聊天固定发 `stream=true` 后只等待 SSE；模型控制台字段远多于当前配置 | 阅读 `client.ts`、`chatStore.ts`、`types.ts` 和模型页面；同时提供两套查询兼容映射；利用已有 `inline_reply` 分支；模型动作按白名单支持，其余明确拒绝；前端生产构建和真实 HTTP 验证 |
+| 同步 HTTP 与异步 Provider 生命周期 | 7/10 | 在路由里阻塞事件循环、随意共享循环、把临时方案扩展成错误的 SSE 架构 | 应用层保持 async `chat()`，线程 Handler 仅在 P01-04 用 `asyncio.run()`；配置锁不跨网络等待；文档将常驻异步 Runtime 列为 P01-05 必须替换点，不提前实现半套流式 |
+| 错误语义与桌面可见反馈 | 7/10 | 后端错误被前端压成 `HTTP 400`；上游正文或密钥进入响应/日志；失败没有 request ID | 内部错误类型→HTTP 状态→安全 JSON message；客户端读取 message；模型前分配 request ID 并贯穿错误日志/响应；测试覆盖 400/401、缺配置和不泄密 |
+| 阶段边界和“不伪装成功” | 6/10 | 接受附件却忽略、模型请求工具却显示空白、把非流式完整文本标成 stream、把 session_id 当成已持久化 | 不支持能力显式报错；Tool Call 返回专用错误；成功明确 `stream=false`；文档写明当前只使用单条输入，Session/Persistence/Tool Loop/Cancel 均未完成 |
+| 配置兼容与密钥保护 | 6/10 | 把整个复制 UI 配置写进精简文件、回写 `********` 覆盖密钥、环境值或密钥被接口泄露 | 白名单映射到底层 8 字段；脱敏值保存时跳过；查询只返回掩码；日志只记录字段名；测试检查序列化响应中不存在原始密钥 |
+
+### 岗位要求关联与实践证据
+
+- 开发任务：P01-04 普通聊天联调。
+- 对应条款：XM-职责1“任务接入、上下文管理、执行编排、结果回写”的任务接入和结果回写基础，XM-职责6～7 的稳定性/可观测性/可维护性基础；DYQ-职责2 的核心链路及结果汇总基础、DYQ-职责3 的可复用协议和调试能力；TX-要求1 的 Python/TypeScript 工程能力。当前只覆盖单模型单轮非流式接入，不覆盖规划、多工具编排、Multi-Agent 或规模化业务。
+- 重合范围：已经实现从桌面输入到 Provider 再回写聊天气泡的完整普通请求路径，统一配置与错误能被 TypeScript 客户端消费；没有实现长期上下文、任务拆解、工具执行、Reflection、评测体系或企业系统接入。
+- 具体实现：`YanAgentApplication` 分离 HTTP/应用/模型边界；`/config` 与 `/api/models` 兼容适配；`/message` 的输入边界、请求 ID、Provider 调用和 `inline_reply`；客户端安全错误详情；Fake 与回环 HTTP 行为测试。
+- 设计原因：让模型协议、业务语义和前端传输各自有单一边界，后续流式和 AgentLoop 可替换对应层而不是重写所有接口；对未实现能力失败比静默忽略更利于稳定性和调试。
+- 验证证据：85 项 Python 测试、10 项本任务行为测试、真实回环 HTTP 和桌面生产构建；没有把未运行的真实外部调用写成验证通过。
+- 难点与取舍：见上表。最大取舍是保留线程 HTTP 外壳并暂时每请求创建事件循环，以最小范围完成普通联调，同时明确 P01-05 的架构替换点。
+- 指标与结论：当前只测得本地受控正确性和构建结果，没有真实模型延迟、吞吐、Token 成本、任务成功率或生产可用率数据，不声称任何百分比提升。
+- 面试可讲事实：为自研 Agent Runtime 完成桌面到 OpenAI-compatible Provider 的普通聊天链路，设计应用层隔离配置/HTTP/模型协议，实现请求 ID、统一错误与密钥脱敏，并用 Fake 和真实回环 HTTP 覆盖成功及失败路径，同时维护 Python/TypeScript 接口兼容。
+- 后续差距：需在 P01-05 实现常驻异步 Runtime、SSE、真正取消、并发隔离；P01-06 记录真实模型与桌面人工验收；P02 后才有多轮 Session；P03～P04 后才有工具调用闭环。不能据此声称完成 Agent Harness、Multi-Agent 或生产级系统。
+
+### 后续事项
+
+- 下一项 P01-05：设计长期异步执行环境、内部事件、Provider 增量解析、Run 事件队列、SSE 订阅、基本取消和任务清理。
+- P01-06：补两请求隔离、流式错误与停止生成验证，并在用户自愿配置真实服务后记录模型名称和桌面人工结果；真实密钥不进入仓库或开发记录。
+- P01-04 已完成，不自动进入 P01-05；等待用户明确开始下一项。

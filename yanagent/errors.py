@@ -9,6 +9,11 @@ CONFIG_FIELDS = frozenset({
     "host", "port", "model_provider", "api_base", "model", "api_key",
     "request_timeout", "permission_mode",
 })
+REQUEST_FIELDS = frozenset({
+    "body", "session_id", "message", "stream", "attachments", "is_voice",
+    "agent_id", "speaker_agent_id", "updates", "action", "provider_id",
+    "capability", "model",
+})
 
 
 class AgentError(Exception):
@@ -64,6 +69,44 @@ class ConfigurationError(AgentError):
         if self.field is not None:
             result["field"] = self.field
         return result
+
+
+class RequestValidationError(AgentError):
+    """标识本地 HTTP 请求不合法；只返回固定原因和已知字段。"""
+
+    code = "request_validation_error"
+    _reasons = {
+        "invalid_json": "请求正文必须是有效的 JSON 对象。",
+        "missing": "请求缺少必填字段。",
+        "invalid": "请求字段类型或取值不合法。",
+        "too_large": "请求内容超过允许大小。",
+        "unsupported": "当前开发阶段尚不支持该请求能力。",
+        "unknown_field": "请求包含不支持的字段。",
+    }
+
+    def __init__(self, *, reason: str = "invalid", field: str | None = None) -> None:
+        """将外部输入收敛为白名单原因，避免原始正文进入错误和日志。"""
+        self.reason = reason if reason in self._reasons else "invalid"
+        self.field = field if field in REQUEST_FIELDS else None
+        self.message = self._reasons[self.reason]
+        if self.field is not None:
+            self.message = f"{self.field}：{self.message}"
+        super().__init__()
+
+    def to_dict(self) -> dict[str, Any]:
+        """输出前端可识别的失败原因和字段，不回显用户输入。"""
+        result = super().to_dict()
+        result["reason"] = self.reason
+        if self.field is not None:
+            result["field"] = self.field
+        return result
+
+
+class UnexpectedToolCallError(AgentError):
+    """标识普通聊天收到工具请求，但工具循环尚未进入本阶段。"""
+
+    code = "unexpected_tool_call"
+    message = "模型请求调用工具；普通聊天阶段尚未启用工具执行，请更换模型或提示词。"
 
 
 class AuthenticationError(AgentError):

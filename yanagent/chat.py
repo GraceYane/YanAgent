@@ -1,0 +1,321 @@
+"""P01-04 普通聊天应用层：连接桌面接口、配置存储与非流式 Provider。"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import uuid
+from collections.abc import Callable
+from typing import Any
+
+from yanagent.config import AppConfig, ConfigStore, MASKED_SECRET
+from yanagent.contracts import Message
+from yanagent.errors import (
+    ConfigurationError,
+    RequestValidationError,
+    UnexpectedToolCallError,
+)
+from yanagent.models import ModelProvider, OpenAICompatibleProvider
+
+
+LOGGER = logging.getLogger("yanagent.chat")
+PROVIDER_ID = "openai-compatible"
+DEFAULT_API_BASE = "https://api.openai.com/v1"
+DEFAULT_MODEL_SUGGESTIONS = ("gpt-4o-mini", "deepseek-chat", "qwen-plus")
+MAX_MESSAGE_CHARS = 200_000
+ProviderFactory = Callable[[AppConfig], ModelProvider]
+
+
+def _require_text(
+    payload: dict[str, Any], field: str, *, maximum: int = 256, allow_multiline: bool = False,
+) -> str:
+    """读取必填文本，拒绝空白、控制字符和超过接口上限的值。"""
+    value = payload.get(field)
+    if value is None:
+        raise RequestValidationError(reason="missing", field=field)
+    if (
+        type(value) is not str
+        or not value.strip()
+        or len(value) > maximum
+        or any(
+            ord(char) < 32 and (not allow_multiline or char not in "\n\r\t")
+            for char in value
+        )
+    ):
+        reason = "too_large" if type(value) is str and len(value) > maximum else "invalid"
+        raise RequestValidationError(reason=reason, field=field)
+    return value
+
+
+def _ensure_keys(payload: dict[str, Any], allowed: set[str]) -> None:
+    """拒绝接口未声明的字段，防止拼写错误被静默忽略。"""
+    if any(type(key) is not str or key not in allowed for key in payload):
+        raise RequestValidationError(reason="unknown_field", field="body")
+
+
+class YanAgentApplication:
+    """封装无状态普通聊天与配置接口，供 HTTP 处理器和离线测试共同调用。"""
+
+    def __init__(
+        self,
+        config_store: ConfigStore | None = None,
+        *,
+        provider_factory: ProviderFactory | None = None,
+    ) -> None:
+        """注入配置仓库和 Provider 工厂；锁只保护短暂的配置读写。"""
+        self.config_store = config_store if config_store is not None else ConfigStore()
+        self.provider_factory = (
+            provider_factory if provider_factory is not None else OpenAICompatibleProvider
+        )
+        self._config_lock = threading.RLock()
+
+    def load_config(self) -> AppConfig:
+        """读取一次经过文件和环境覆盖后的不可变配置快照。"""
+        with self._config_lock:
+            return self.config_store.load()
+
+    def save_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """接收桌面旧配置字段，只把 P01-02 支持的设置持久化。"""
+        if type(payload) is not dict:
+            raise RequestValidationError(reason="invalid_json", field="body")
+        _ensure_keys(payload, {"updates"})
+        updates = payload.get("updates")
+        if type(updates) is not dict:
+            raise RequestValidationError(reason="invalid", field="updates")
+
+        allowed = {
+            "host", "port", "model_provider", "api_base", "model", "api_key",
+            "request_timeout", "permission_mode", "bot_type", "agent_permission_mode",
+            "use_linkai", "cow_lang",
+        }
+        if any(type(key) is not str or key not in allowed for key in updates):
+            raise RequestValidationError(reason="unknown_field", field="updates")
+
+        normalized: dict[str, Any] = {}
+        for key, value in updates.items():
+            if key in {"use_linkai", "cow_lang"}:
+                # 复制界面会发送这两个产品层字段；P01 配置不持久化它们。
+                continue
+            target = {
+                "bot_type": "model_provider",
+                "agent_permission_mode": "permission_mode",
+            }.get(key, key)
+            if target == "api_key" and value == MASKED_SECRET:
+                continue
+            normalized[target] = value
+
+        if not normalized:
+            config = self.load_config()
+        else:
+            with self._config_lock:
+                config = self.config_store.save(normalized)
+        LOGGER.info(
+            "[chat.py][YanAgentApplication.save_config] 配置保存完成，变更字段=%s",
+            sorted(normalized),
+        )
+        return {"status": "success", "applied": config.to_dict()}
+
+    def config_payload(self) -> dict[str, Any]:
+        """把精简配置映射为复制桌面端 `/config` 所需的兼容字段。"""
+        config = self.load_config()
+        models = self._model_names(config)
+        return {
+            "status": "success",
+            "use_agent": True,
+            "title": "YanAgent",
+            "model": config.model,
+            "bot_type": config.model_provider,
+            "use_linkai": False,
+            "channel_type": "web",
+            "agent_max_context_tokens": 64_000,
+            "agent_max_context_turns": 20,
+            "agent_max_steps": 20,
+            "agent_permission_mode": config.permission_mode,
+            "permission_modes": ["deny", "ask", "allow"],
+            "enable_thinking": False,
+            "reasoning_effort": "",
+            "reasoning_effort_by_model": {},
+            "subagent_enabled": False,
+            "self_evolution_enabled": False,
+            "api_bases": {"api_base": config.api_base},
+            "api_keys": {"api_key": MASKED_SECRET if config.api_key else ""},
+            "providers": {
+                PROVIDER_ID: {
+                    "label": {"zh": "OpenAI 兼容接口", "en": "OpenAI-compatible"},
+                    "models": models,
+                    "api_base_key": "api_base",
+                    "api_base_default": DEFAULT_API_BASE,
+                    "api_base_placeholder": DEFAULT_API_BASE,
+                    "api_key_field": "api_key",
+                }
+            },
+        }
+
+    def models_payload(self) -> dict[str, Any]:
+        """返回模型控制台可渲染的单 Provider 目录和聊天能力状态。"""
+        config = self.load_config()
+        models = self._model_names(config)
+        catalog = [{"name": name, "capabilities": ["text"]} for name in models]
+        empty = {"editable": False, "current_provider": "", "current_model": "", "providers": []}
+        capabilities = {
+            "chat": {
+                "editable": True,
+                "current_provider": config.model_provider,
+                "current_model": config.model,
+                "providers": [PROVIDER_ID],
+                "provider_models": {PROVIDER_ID: models},
+            },
+            "vision": dict(empty),
+            "asr": dict(empty),
+            "tts": dict(empty),
+            "embedding": dict(empty),
+            "image": dict(empty),
+            "search": {"editable": False, "providers": [], "available": False},
+        }
+        return {
+            "status": "success",
+            "providers": [{
+                "id": PROVIDER_ID,
+                "label": {"zh": "OpenAI 兼容接口", "en": "OpenAI-compatible"},
+                "configured": bool(config.api_base and config.api_key),
+                "is_custom": False,
+                "active": True,
+                "api_key_field": "api_key",
+                "api_base_field": "api_base",
+                "api_key_masked": MASKED_SECRET if config.api_key else "",
+                "api_base": config.api_base,
+                "api_base_default": DEFAULT_API_BASE,
+                "api_base_placeholder": DEFAULT_API_BASE,
+                "catalog": catalog,
+                "hidden": [],
+                "seed": catalog,
+                "effective": catalog,
+                "models": models,
+            }],
+            "capabilities": capabilities,
+        }
+
+    def save_model_action(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """处理本阶段的凭据保存、聊天模型选择和清除动作。"""
+        if type(payload) is not dict:
+            raise RequestValidationError(reason="invalid_json", field="body")
+        action = payload.get("action")
+        if type(action) is not str:
+            raise RequestValidationError(reason="missing", field="action")
+
+        if action == "set_provider":
+            _ensure_keys(payload, {"action", "provider_id", "api_key", "api_base"})
+            self._require_provider(payload)
+            updates = {
+                key: payload[key]
+                for key in ("api_key", "api_base")
+                if key in payload and payload[key] != MASKED_SECRET
+            }
+            if not updates:
+                raise RequestValidationError(reason="missing", field="updates")
+        elif action == "set_capability":
+            _ensure_keys(payload, {"action", "capability", "provider_id", "model"})
+            self._require_provider(payload)
+            if payload.get("capability") != "chat":
+                raise RequestValidationError(reason="unsupported", field="capability")
+            updates = {"model": _require_text(payload, "model", maximum=256)}
+        elif action == "delete_provider":
+            _ensure_keys(payload, {"action", "provider_id"})
+            self._require_provider(payload)
+            updates = {"api_base": "", "api_key": "", "model": ""}
+        else:
+            raise RequestValidationError(reason="unsupported", field="action")
+
+        with self._config_lock:
+            if (
+                action == "set_provider"
+                and "api_key" in updates
+                and "api_base" not in updates
+                and not self.config_store.load().api_base
+            ):
+                updates["api_base"] = DEFAULT_API_BASE
+            config = self.config_store.save(updates)
+        LOGGER.info(
+            "[chat.py][YanAgentApplication.save_model_action] 模型配置动作完成，动作=%s，变更字段=%s",
+            action,
+            sorted(updates),
+        )
+        return {"status": "success", "applied": config.to_dict()}
+
+    async def chat(
+        self, payload: dict[str, Any], *, request_id: str | None = None,
+    ) -> dict[str, Any]:
+        """校验一条桌面消息，调用非流式 Provider 并返回内联完整回答。"""
+        request_id = request_id or f"run-{uuid.uuid4().hex}"
+        session_id, message = self._validate_chat_payload(payload)
+        config = self.load_config()
+        provider = self.provider_factory(config)
+        LOGGER.info(
+            "[chat.py][YanAgentApplication.chat] 开始普通聊天请求，request_id=%s，provider=%s，model=%s",
+            request_id,
+            config.model_provider,
+            config.model or "<未配置>",
+        )
+        reply = await provider.complete([Message(role="user", content=message)], tools=[])
+        if reply.tool_calls:
+            raise UnexpectedToolCallError()
+        LOGGER.info(
+            "[chat.py][YanAgentApplication.chat] 普通聊天请求完成，request_id=%s，输出字符数=%d",
+            request_id,
+            len(reply.content),
+        )
+        return {
+            "status": "success",
+            "request_id": request_id,
+            "stream": False,
+            "inline_reply": reply.content,
+            "speaker": "default",
+            "received_session_id": session_id,
+            "finish_reason": reply.finish_reason,
+            "usage": reply.usage,
+        }
+
+    def _validate_chat_payload(self, payload: dict[str, Any]) -> tuple[str, str]:
+        """检查聊天正文及本阶段允许的兼容字段，不执行附件或语音请求。"""
+        if type(payload) is not dict:
+            raise RequestValidationError(reason="invalid_json", field="body")
+        allowed = {
+            "session_id", "message", "stream", "attachments", "is_voice", "lang",
+            "agent_id", "speaker_agent_id",
+        }
+        _ensure_keys(payload, allowed)
+        session_id = _require_text(payload, "session_id", maximum=256)
+        message = _require_text(
+            payload, "message", maximum=MAX_MESSAGE_CHARS, allow_multiline=True,
+        )
+        if "stream" in payload and type(payload["stream"]) is not bool:
+            raise RequestValidationError(reason="invalid", field="stream")
+        if payload.get("attachments") not in (None, []):
+            raise RequestValidationError(reason="unsupported", field="attachments")
+        if payload.get("is_voice") not in (None, False):
+            raise RequestValidationError(reason="unsupported", field="is_voice")
+        for field in ("agent_id", "speaker_agent_id"):
+            if payload.get(field) not in (None, "", "default"):
+                raise RequestValidationError(reason="unsupported", field=field)
+        if "lang" in payload and payload["lang"] is not None and type(payload["lang"]) is not str:
+            raise RequestValidationError(reason="invalid", field="body")
+        return session_id, message
+
+    def _require_provider(self, payload: dict[str, Any]) -> None:
+        """保证桌面动作只修改当前阶段唯一的兼容 Provider。"""
+        if payload.get("provider_id") != PROVIDER_ID:
+            raise RequestValidationError(reason="unsupported", field="provider_id")
+
+    def _model_names(self, config: AppConfig) -> list[str]:
+        """优先展示已保存模型；未配置时提供可替换的常见示例名称。"""
+        names = ([config.model] if config.model else []) + list(DEFAULT_MODEL_SUGGESTIONS)
+        return list(dict.fromkeys(name for name in names if name))
+
+
+def ensure_application_ready(application: YanAgentApplication) -> None:
+    """启动阶段验证配置文件可读，但不要求此时已经填写模型密钥。"""
+    try:
+        application.load_config()
+    except ConfigurationError:
+        LOGGER.exception("[chat.py][ensure_application_ready] 配置加载失败，服务拒绝启动")
+        raise
