@@ -84,7 +84,13 @@ npm run dev
 6. P06～P10：多模型、完整工具、Skills、MCP、记忆知识库和 Multi-Agent。
 7. P11～P12：Web、多渠道、定时、桌面交付与功能对照验收。
 
-P01-01 统一数据契约已完成，见 [实现说明与运行示例](docs/P01_01_CONTRACTS.md)。当前下一项任务是 **P01-02：配置与统一错误**；真实模型与桌面聊天仍待接入。
+P01-01 统一数据契约已完成，见 [实现说明与运行示例](docs/P01_01_CONTRACTS.md)。P01-02 配置与统一错误也已完成，见 [配置字段与验收指南](docs/P01_02_CONFIG_ERRORS.md)。目前共 49 项离线测试通过；当前下一项任务是 **P01-03：非流式 Provider 与 Fake Provider**，真实模型与桌面聊天仍待接入。
+
+可在项目根目录运行本次配置演示（使用无效测试密钥，不请求网络）：
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m examples.config_demo
+```
 
 阶段导航见 [实施路线摘要](docs/IMPLEMENTATION_ROADMAP.md)，每次需求的实际开发记录追加到 [workProcess.md](workProcess.md)。
 

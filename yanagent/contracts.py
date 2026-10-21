@@ -292,17 +292,19 @@ def _run_identity(value: RunRequest | RunResult) -> None:
 class RunRequest(JsonContract):
     """发起一次任务的输入；身份字段是路由信息，不代表已获得授权。"""
 
-    session_id: str  # 一段持续对话的标识；同一会话可包含多个 Run。
+    session_id: str  # 一段持续对话的标识；同一会话可包含多个 Run。 属于哪段持续对话？
     user_message: str  # 本次用户输入，纯空白输入无效。
-    agent_id: str = "default"  # 执行任务的 Agent，预留多 Agent 路由。
+    agent_id: str = "default"  # 执行任务的 Agent，预留多 Agent 路由。 由哪个 Agent 处理？
     metadata: dict[str, Any] = field(default_factory=dict)  # 渠道来源等 JSON 信息。
-    user_id: str = "local"  # 本地单用户默认身份；后续由可信入口解析真实用户。
-    request_id: str | None = None  # 一次 Run 的标识；None 表示尚未由 Bridge 分配。
+    user_id: str = "local"  # 本地单用户默认身份；后续由可信入口解析真实用户。 谁发起了任务？
+    request_id: str | None = None  # 一次 Run 的标识；None 表示尚未由 Bridge 分配。 是哪一次任务执行？
 
     def validate(self) -> None:
         _run_identity(self)
         _text(self.user_message, "RunRequest.user_message", nonempty=True)
         _json_object(self.metadata, "RunRequest.metadata")
+
+
 
 
 @dataclass(slots=True)

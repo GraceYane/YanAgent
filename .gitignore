@@ -78,3 +78,8 @@ desktop/resources/bin/
 
 # Persistent Agent Mail credentials and npm runtime created by the optional compose overlay.
 docker/agent-mail-data/
+
+# YanAgent 配置保存及离线验收的临时文件（异常退出时可能残留）。
+/.config.json.*.tmp
+/.yan-config-test-*/
+/.yan-config-demo-*/

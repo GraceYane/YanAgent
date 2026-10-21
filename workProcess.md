@@ -166,3 +166,77 @@
 
 - P01-01 已完成；下一项为 P01-02 配置与统一错误。
 - 后续 Provider/Session/Loop 接入时使用这些契约，按需要补充多模态、流式事件与迁移策略。
+
+## 2026-10-21：P01-02 配置与统一错误
+
+### 需求
+
+按开发计划继续 P01-02，完成模型配置读取和保存、环境变量优先覆盖、字段校验、密钥脱敏，以及配置、认证、限流、超时、服务端错误的统一表达。遵循本次读取到的最新 AGENTS.md：新增每个类和函数均写中文说明；保留用户对约定文件的未提交修改。
+
+### 完成内容
+
+- 新增不可变 `AppConfig`，承载 `model_provider / api_base / model / api_key / request_timeout`，保留骨架的 `host / port / permission_mode` 字段；统一校验类型、枚举、数值范围及文本。配置允许初始未填写，通过 `require_model_ready()` 在未来调用模型前检查完整性。
+- 新增 `ConfigStore`，默认只使用 YanAgent 根目录的 `config.json`，支持显式路径和 `YAN_CONFIG_PATH`；文件不存在时返回默认值，坏 JSON、重复键、未知字段明确失败，兼容 UTF-8 BOM。
+- 以“默认值 → 文件 → 非空 YAN_* 环境变量”合并配置；环境中的空串占位保留文件值，非法非空覆盖报错。创建实例时捕获环境，每次读取重新加载文件。
+- 保存采用局部更新并基于文件层合并，不将环境密钥或环境模型自动写回文件。省略密钥保留、非空替换、空串清除；拒绝把脱敏星号回写成真实密钥。
+- 保存前完成校验和序列化，使用同目录临时文件、flush/fsync、os.replace；失败不回退到截断原文件。用故障注入验证落盘与替换失败时原文件保持完整。
+- `AppConfig.to_dict()` 完全隐藏非空密钥，对象 repr 不含密钥；统一错误使用固定原因和已知字段，不回显原始值、路径、底层异常正文或供应商响应。
+- 新增统一错误层和 `map_http_error()`，区分配置、认证、权限、模型/路径不存在、请求参数、限流、超时、连接和服务端错误。错误码、说明、重试提示和上游状态均可序列化；没有自动重试。
+- 新增 26 项离线测试、配置演示、详细验收文档；更新无凭据模板、临时文件忽略规则及阶段状态。P01 仍为进行中，下一项 P01-03。
+
+### 参考实现与设计取舍
+
+- 开发前检查 CowAgentByYan 工作区，对应本次读取的源码没有已跟踪改动；存在用户的未跟踪文档和桌面脚本，均未修改。
+- 参考 `config.py` 的环境覆盖、空串占位和敏感字段处理：采用相同的“非空环境优先”规则，但本项目仅接受专属变量、显式解析数字，非法值报错；不输出短密钥或密钥首尾片段。
+- 参考 `channel/web/api/config.py` 的“全部校验后应用”和按文件层局部更新：文件配置与生效配置分离，避免环境值污染持久配置；桌面 API 适配继续留在 P01-04。
+- 参考 `common/atomic_write.py` 及 `tests/test_root_config_atomic_write.py` 的临时文件替换机制：本次采取替换失败即失败，不提供原地写回退，以保持原文件不被截断的承诺。
+- 参考 `models/openai/openai_compat.py` 的 HTTP 状态分类：内部错误不继承某个 SDK，也不保存上游原始 message/body；实际传输异常捕获在 P01-03 完成。
+- 仍使用标准库，不为单模型配置引入额外依赖。`permission_mode` 只存储枚举，不提前宣称已实现工具权限；完整运行时和目录隔离继续按原阶段推进。
+
+### 涉及文件
+
+- `yanagent/config/__init__.py`、`yanagent/config/settings.py`
+- `yanagent/errors.py`
+- `tests/test_config.py`、`tests/test_errors.py`
+- `examples/config_demo.py`
+- `config.example.json`、`.gitignore`
+- `docs/P01_02_CONFIG_ERRORS.md`
+- `docs/DEVELOPMENT_REQUIREMENTS.md`、`docs/IMPLEMENTATION_ROADMAP.md`、`docs/TARGET_ROLES.md`
+- `README.md`、`workProcess.md`
+
+### 验证结果
+
+- `.\.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -v`：49 项测试通过，含本次配置测试 22 项、错误测试 4 项及原有 23 项。
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m examples.config_demo`：通过；展示环境覆盖、密钥脱敏、局部保存未写回环境密钥、非法超时不覆盖旧值和模拟 HTTP 429 分类。
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m compileall -q -f app.py yanagent tests examples`：通过，警告按错误处理。
+- `test_failed_fsync_or_replace_preserves_old_file_and_cleans_temp`：分别模拟刷盘和替换失败，原文件字节不变，临时文件清理，公开异常栈不回显模拟底层敏感信息。
+- `test_patch_preserves_key_and_never_persists_environment`：读取使用环境值；保存其他设置后重新读取文件，仍保留文件中的密钥和模型。
+- `test_masked_display_cannot_overwrite_secret`、`test_secret_redaction_in_display_and_logs`：展示脱敏、日志输出与脱敏占位符回写保护均通过。
+- 以上均为离线行为验证，模拟密钥无效；没有真实模型请求、桌面页面联调或 HTTP 接口接入，本次未改前端。
+- 对本次新增 Python 文件进行 AST 检查：所有类和函数均有中文 Docstring；本次修改的已跟踪文件通过 `git diff --check`。开发期间发现 `contracts.py` 出现用户补充的身份字段注释，已保留，未纳入本次实现。
+
+### 实际问题与处理
+
+- 首轮测试在当前 Windows 沙箱分配的系统临时目录中遇到 WinError 5，影响临时文件访问及清理。停止该轮测试后，用项目内独立临时目录验证可正常读写，随后测试和演示统一使用此位置并正常清理；未改变系统权限，首轮失败不计为通过。
+- `UnicodeDecodeError` 属于 `ValueError` 子类，若通用捕获写在前面会误报读取失败。在自查时调整异常分支顺序，加入非法 UTF-8 测试，确保返回配置格式错误。
+- 环境覆盖后的对象不能直接当作文件配置回写：通过文件层局部更新和返回独立生效快照解决，并验证同时存在不同文件/环境密钥的场景。
+- 保存展示字典会把星号误当作凭据：密钥全星号校验阻止这一操作，文档要求只提交变更字段。
+
+### 岗位要求关联与实践证据
+
+- 开发任务：P01-02 配置与统一错误。
+- 对应条款：XM-职责6 的稳定性与安全基础、XM-职责7 的稳定性与可维护性；DYQ-职责3 的可复用框架工程化；TX-要求1 的 Python 基础与代码质量。现有岗位映射中的模型接入条款，本次只覆盖其配置和错误边界，不覆盖 Prompt 优化、模型原理或真实调用。
+- 重合范围：统一配置入口、错误协议、凭据显示边界和失败保护，可供后续 Provider/Runtime 复用。没有企业内部系统接入、团队协作部署或生产合规验收。
+- 具体实现：`AppConfig` 的不可变快照和就绪检查；`ConfigStore._read_file/_effective/save/_write_atomic` 分离读、覆盖、保存；`AgentError.to_dict` 与状态分类提供稳定程序接口。
+- 设计原因：区分持久值和临时环境值使配置行为可解释；整体校验与原子替换减少失败后配置被破坏的风险；明确错误类型让调用方无需解析自然语言异常来决定反馈方式。
+- 验证证据：26 项新增测试和离线演示可复现覆盖优先级、密钥不落盘、坏输入拒绝及失败保留旧文件；共 49 项回归测试通过。
+- 难点与取舍：空环境变量不等于主动删除；脱敏展示不可直接回写；配置未填写与远端认证失败分开；错误只给重试提示，是否重试仍需运行时结合副作用决定。为保持原文件完整，替换失败时宁可返回错误。
+- 指标与结论：测试证明当前代码在这些本地受控场景下的行为，没有测量可用率、Token 成本、性能提升或真实用户规模，不填写优化百分比。
+- 面试可讲事实：为 Agent Runtime 实现可校验的配置管理和统一错误接口，将文件配置与环境覆盖分离，使用原子替换和故障注入测试验证保存失败时保留旧配置，并实现密钥脱敏和回写保护。
+- 后续差距：未连接模型 API、未实现请求超时执行和退避重试、未接桌面设置、未提供加密存储/跨进程写锁/完整可观测性；这些基础工作不能写成已完成生产级 Agent 平台。
+
+### 后续事项
+
+- 下一项 P01-03：实现 OpenAI-compatible 非流式 Provider、消息及响应适配和 Fake Provider，将本次配置与错误接入实际调用边界。
+- P01-04 接通桌面配置查询/保存与普通聊天；P01-05 再实现流式事件和取消，当前不自动推进。
+- 数据目录、并发配置更新、凭据持久化增强和运行时策略按后续相应阶段处理；当前可保存明文密钥，脱敏不等于加密或权限隔离。
