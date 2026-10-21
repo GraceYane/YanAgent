@@ -10,7 +10,7 @@ YanAgent 是从 CowAgent 的桌面产品外壳中抽出的学习脚手架。项�
 - 启动 CowAgent 风格的 Electron/React 桌面界面。
 - 配置 OpenAI-compatible 模型后，在聊天框发送消息并一次性显示完整真实回答。
 - 阅读各核心模块的接口、TODO 和验收条件，逐步替换占位实现。
-- 使用 Python 非流式 Provider 或离线 Fake Provider；配置、普通聊天和错误已接到桌面 HTTP 契约。
+- 使用 Python 普通/流式 Provider 或离线 Fake Provider；配置、SSE、取消和错误已接到桌面 HTTP 契约。
 
 ## 已移除的核心实现
 
@@ -19,7 +19,8 @@ YanAgent 是从 CowAgent 的桌面产品外壳中抽出的学习脚手架。项�
 | Agent 执行循环 | `yanagent/runtime/agent_loop.py` | 接口保留，实现为空 |
 | 运行时调度 Bridge | `yanagent/runtime/bridge.py` | 接口保留，实现为空 |
 | Session 与上下文 | `yanagent/sessions/store.py` | 接口保留，实现为空 |
-| 模型适配层 | `yanagent/models/openai_compatible.py`、`yanagent/chat.py` | P01-04 已接通非流式桌面消息；流式待 P01-05 |
+| 模型适配层 | `yanagent/models/openai_compatible.py`、`yanagent/chat.py` | P01-05 已接通普通与流式桌面消息、增量组装和安全错误 |
+| 最小流式 Runtime | `yanagent/runtime/streaming.py`、`yanagent/events.py`、`app.py` | 常驻事件循环、Run 隔离、SSE 回放、基本取消与终态清理已完成 |
 | 工具系统 | `yanagent/tools/manager.py` | 接口保留，实现为空 |
 | 长期记忆 | `yanagent/memory/service.py` | 接口保留，实现为空 |
 | MCP Client | `yanagent/mcp/client.py` | 接口保留，实现为空 |
@@ -85,7 +86,7 @@ npm run dev
 6. P06～P10：多模型、完整工具、Skills、MCP、记忆知识库和 Multi-Agent。
 7. P11～P12：Web、多渠道、定时、桌面交付与功能对照验收。
 
-P01-01 统一数据契约、P01-02 配置与统一错误、P01-03 非流式 Provider 和 P01-04 普通聊天联调均已完成。P01-04 说明见 [普通聊天联调与验收指南](docs/P01_04_CHAT_INTEGRATION.md)。目前共 85 项测试及桌面生产构建通过；当前下一项任务是 **P01-05：流式链路**。外部供应商、SSE、取消、多轮历史和工具循环仍未完成。
+P01-01 统一数据契约、P01-02 配置与统一错误、P01-03 非流式 Provider、P01-04 普通聊天联调和 P01-05 流式链路均已完成。P01-05 说明见 [流式链路与验收指南](docs/P01_05_STREAMING.md)。目前共 96 项测试及桌面生产构建通过；当前下一项任务是 **P01-06：验证与文档**。真实外部供应商和桌面人工验收仍待完成，多轮历史和工具循环分别属于 P02、P03～P04。
 
 可在项目根目录运行本次配置演示（使用无效测试密钥，不请求网络）：
 

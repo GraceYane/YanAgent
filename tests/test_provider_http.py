@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +30,28 @@ class LocalHandler(BaseHTTPRequestHandler):
             self.send_header("Location", "/redirected")
             self.send_header("Content-Length", "0")
             self.end_headers()
+            return
+        if data.get("stream") is True:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.end_headers()
+            first = {"choices": [{"index": 0, "delta": {
+                "role": "assistant", "content": "本地",
+            }, "finish_reason": None}]}
+            first_event = "data: " + json.dumps(first, ensure_ascii=False) + "\n\n"
+            self.wfile.write(first_event.encode("utf-8"))
+            self.wfile.flush()
+            if model == "slow-stream":
+                self.server.release_slow.wait(2)
+            final = {"choices": [{"index": 0, "delta": {"content": "流回复"},
+                                   "finish_reason": "stop"}],
+                     "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}}
+            try:
+                self.wfile.write(("data: " + json.dumps(final, ensure_ascii=False) +
+                                  "\n\ndata: [DONE]\n\n").encode("utf-8"))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
         status = {"auth": 401, "limited": 429}.get(model, 200)
         if status != 200:
@@ -57,7 +80,12 @@ class LocalHttpTests(unittest.IsolatedAsyncioTestCase):
         """启动仅监听本机的测试服务器，端口由系统分配。"""
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), LocalHandler)
         cls.server.received = []
-        cls.worker = threading.Thread(target=cls.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        cls.server.release_slow = threading.Event()
+        cls.worker = threading.Thread(
+            target=cls.server.serve_forever,
+            kwargs={"poll_interval": 0.01},
+            daemon=True,
+        )
         cls.worker.start()
 
     @classmethod
@@ -70,6 +98,7 @@ class LocalHttpTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         """每次测试清空请求记录，防止把上一用例的请求计入结果。"""
         self.server.received.clear()
+        self.server.release_slow.clear()
 
     def provider(self, model="normal") -> OpenAICompatibleProvider:
         """创建使用固定无效密钥和本地随机端口的真实 Provider。"""
@@ -94,6 +123,30 @@ class LocalHttpTests(unittest.IsolatedAsyncioTestCase):
         reply = await self.provider("tool").complete([Message("user", "计算")])
         self.assertEqual(reply.tool_calls[0].arguments, {"x": 1})
         self.assertEqual(reply.tool_calls[0].id, "c1")
+
+    async def test_real_http_sse_text_and_wire_request(self) -> None:
+        """默认 SSE 传输通过真实回环连接逐块读取，并在 [DONE] 后关闭。"""
+        events = [event async for event in self.provider().stream([Message("user", "流式")])]
+        self.assertEqual([event.kind for event in events], [
+            "text_delta", "text_delta", "completed",
+        ])
+        self.assertEqual(events[-1].reply.content, "本地流回复")
+        self.assertEqual(events[-1].reply.usage["total_tokens"], 5)
+        self.assertTrue(self.server.received[0][2]["stream"])
+
+    async def test_real_http_sse_cancel_closes_wait_without_retry(self) -> None:
+        """取消正在等待下一块的真实 SSE 后能有限返回，且只发送一次请求。"""
+        stream = self.provider("slow-stream").stream([Message("user", "停止")])
+        first = await anext(stream)
+        self.assertEqual(first.content, "本地")
+        pending = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0.02)
+        pending.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(pending, timeout=1.5)
+        await stream.aclose()
+        self.server.release_slow.set()
+        self.assertEqual(len(self.server.received), 1)
 
     async def test_real_http_errors_are_classified_without_retry(self) -> None:
         """真实 401 和 429 分别分类，各只发送一次请求且不透传错误正文。"""

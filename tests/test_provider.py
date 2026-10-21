@@ -19,6 +19,7 @@ from yanagent.errors import (
     ModelConnectionError, ModelRefusalError, ModelResponseError, ModelServerError,
     ModelTimeoutError, RateLimitError,
 )
+from yanagent.events import ModelStreamEvent
 from yanagent.models import FakeProvider, FakeProviderExhaustedError, OpenAICompatibleProvider
 from yanagent.models.openai_compatible import parse_reply, prepare_request
 from yanagent.models.transport import UrllibJsonTransport
@@ -61,6 +62,22 @@ class RecordingTransport:
         """拷贝请求参数供断言，并返回独立响应。"""
         self.requests.append(deepcopy(kwargs))
         return deepcopy(self.data)
+
+
+class RecordingStreamTransport:
+    """记录流请求并依序产出预设 SSE data 正文。"""
+
+    def __init__(self, items: list[str]) -> None:
+        """保存预设帧和空请求记录。"""
+        self.items = items
+        self.requests: list[dict] = []
+
+    async def stream_data(self, **kwargs):
+        """复制请求参数，并在异步检查点逐帧产出。"""
+        self.requests.append(deepcopy(kwargs))
+        for item in self.items:
+            await asyncio.sleep(0)
+            yield item
 
 
 class CodecTests(unittest.TestCase):
@@ -249,13 +266,72 @@ class ProviderAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await fake.complete(messages)).content, "结果为 1")
         self.assertEqual([m.role for m in fake.calls[1].messages], ["user", "assistant", "tool"])
 
-    async def test_stream_is_explicitly_not_implemented(self) -> None:
-        """两个实现都明确拒绝流式入口，不能消耗 Fake 的普通响应。"""
-        fake = FakeProvider([ModelReply(content="a")])
-        for provider in (fake, OpenAICompatibleProvider(config())):
-            with self.assertRaises(NotImplementedError):
-                await anext(provider.stream([Message("user", "hi")]))
+    async def test_stream_text_usage_request_and_fake_sequence(self) -> None:
+        """真实适配器和 Fake 都产出类型化增量与唯一完成事件。"""
+        chunks = [
+            json.dumps({"choices": [{"index": 0, "delta": {
+                "role": "assistant", "content": "你",
+            }, "finish_reason": None}]}),
+            json.dumps({"choices": [{"index": 0, "delta": {
+                "content": "好",
+            }, "finish_reason": "stop"}]}),
+            json.dumps({"choices": [], "usage": {
+                "prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4,
+            }}),
+            "[DONE]",
+        ]
+        transport = RecordingStreamTransport(chunks)
+        provider = OpenAICompatibleProvider(config(), stream_transport=transport)
+        events = [event async for event in provider.stream([Message("user", "hi")])]
+        self.assertEqual([event.kind for event in events], [
+            "text_delta", "text_delta", "completed",
+        ])
+        self.assertEqual(events[-1].reply.content, "你好")
+        self.assertEqual(events[-1].reply.usage["total_tokens"], 4)
+        self.assertTrue(transport.requests[0]["payload"]["stream"])
+        self.assertEqual(transport.requests[0]["headers"]["Accept"], "text/event-stream")
+
+        fake = FakeProvider([ModelReply(content="普通")], stream_outcomes=[events])
+        copied = [event async for event in fake.stream([Message("user", "hi")])]
+        self.assertEqual(copied, events)
         self.assertEqual(fake.remaining, 1)
+        self.assertEqual(fake.remaining_streams, 0)
+
+    async def test_stream_reassembles_split_tool_arguments(self) -> None:
+        """工具 ID、名称和 JSON 参数分片按 index 还原，不丢失调用关联。"""
+        chunks = [
+            json.dumps({"choices": [{"index": 0, "delta": {"role": "assistant",
+                "tool_calls": [{"index": 0, "id": "call-1", "type": "function",
+                                "function": {"name": "calculator", "arguments": "{\"x\":"}}]},
+                "finish_reason": None}]}),
+            json.dumps({"choices": [{"index": 0, "delta": {
+                "tool_calls": [{"index": 0, "function": {"arguments": " 3}"}}]},
+                "finish_reason": "tool_calls"}]}),
+            "[DONE]",
+        ]
+        provider = OpenAICompatibleProvider(
+            config(), stream_transport=RecordingStreamTransport(chunks),
+        )
+        events = [event async for event in provider.stream(
+            [Message("user", "计算")], tools=[schema()],
+        )]
+        self.assertEqual([event.kind for event in events], [
+            "tool_call_delta", "tool_call_delta", "completed",
+        ])
+        self.assertEqual(events[-1].reply.tool_calls, [
+            ToolCall("call-1", "calculator", {"x": 3}),
+        ])
+
+    async def test_stream_rejects_missing_done_and_malformed_chunk(self) -> None:
+        """断流、坏 JSON 和空回答不能被误报为正常完成。"""
+        valid = json.dumps({"choices": [{"index": 0, "delta": {"content": "a"},
+                                         "finish_reason": "stop"}]})
+        for chunks in ([valid], ["{"], [json.dumps({"choices": []}), "[DONE]"]):
+            provider = OpenAICompatibleProvider(
+                config(), stream_transport=RecordingStreamTransport(list(chunks)),
+            )
+            with self.subTest(chunks=chunks), self.assertRaises(ModelResponseError):
+                _ = [event async for event in provider.stream([Message("user", "hi")])]
 
     async def test_transport_runs_off_event_loop_thread(self) -> None:
         """实际 to_thread 让阻塞实现在线程池运行，事件循环线程保持独立。"""

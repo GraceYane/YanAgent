@@ -1,4 +1,4 @@
-"""P01-04 普通聊天应用层：连接桌面接口、配置存储与非流式 Provider。"""
+"""聊天应用层：连接桌面接口、配置存储与统一模型 Provider。"""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import logging
 import threading
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from yanagent.config import AppConfig, ConfigStore, MASKED_SECRET
@@ -24,6 +25,16 @@ DEFAULT_API_BASE = "https://api.openai.com/v1"
 DEFAULT_MODEL_SUGGESTIONS = ("gpt-4o-mini", "deepseek-chat", "qwen-plus")
 MAX_MESSAGE_CHARS = 200_000
 ProviderFactory = Callable[[AppConfig], ModelProvider]
+
+
+@dataclass(frozen=True)
+class PreparedChat:
+    """完成同步校验后的单轮聊天快照，可交给常驻异步运行环境执行。"""
+
+    session_id: str
+    message: Message
+    config: AppConfig
+    provider: ModelProvider
 
 
 def _require_text(
@@ -54,7 +65,7 @@ def _ensure_keys(payload: dict[str, Any], allowed: set[str]) -> None:
 
 
 class YanAgentApplication:
-    """封装无状态普通聊天与配置接口，供 HTTP 处理器和离线测试共同调用。"""
+    """封装无状态单轮聊天与配置接口，供 HTTP 和离线测试共同调用。"""
 
     def __init__(
         self,
@@ -247,16 +258,14 @@ class YanAgentApplication:
     ) -> dict[str, Any]:
         """校验一条桌面消息，调用非流式 Provider 并返回内联完整回答。"""
         request_id = request_id or f"run-{uuid.uuid4().hex}"
-        session_id, message = self._validate_chat_payload(payload)
-        config = self.load_config()
-        provider = self.provider_factory(config)
+        prepared = self.prepare_chat(payload)
         LOGGER.info(
             "[chat.py][YanAgentApplication.chat] 开始普通聊天请求，request_id=%s，provider=%s，model=%s",
             request_id,
-            config.model_provider,
-            config.model or "<未配置>",
+            prepared.config.model_provider,
+            prepared.config.model or "<未配置>",
         )
-        reply = await provider.complete([Message(role="user", content=message)], tools=[])
+        reply = await prepared.provider.complete([prepared.message], tools=[])
         if reply.tool_calls:
             raise UnexpectedToolCallError()
         LOGGER.info(
@@ -270,10 +279,21 @@ class YanAgentApplication:
             "stream": False,
             "inline_reply": reply.content,
             "speaker": "default",
-            "received_session_id": session_id,
+            "received_session_id": prepared.session_id,
             "finish_reason": reply.finish_reason,
             "usage": reply.usage,
         }
+
+    def prepare_chat(self, payload: dict[str, Any]) -> PreparedChat:
+        """同步固定请求、配置和 Provider；具体 Provider 在执行前检查必需配置。"""
+        session_id, message = self._validate_chat_payload(payload)
+        config = self.load_config()
+        return PreparedChat(
+            session_id=session_id,
+            message=Message(role="user", content=message),
+            config=config,
+            provider=self.provider_factory(config),
+        )
 
     def _validate_chat_payload(self, payload: dict[str, Any]) -> tuple[str, str]:
         """检查聊天正文及本阶段允许的兼容字段，不执行附件或语音请求。"""

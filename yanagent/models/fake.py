@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
 from yanagent.contracts import Message, ModelReply
 from yanagent.errors import AgentError
+from yanagent.events import ModelStreamEvent
 from .openai_compatible import prepare_request
 from .provider import NonStreamingProvider
 
@@ -30,12 +32,17 @@ class FakeProviderExhaustedError(AgentError):
 
 
 class FakeProvider(NonStreamingProvider):
-    """依序返回预设响应或抛出统一错误，并保留每轮独立输入记录。"""
+    """依序返回完整或流式预设，并保留每轮独立输入记录。"""
 
     name = "fake"
 
-    def __init__(self, outcomes: Sequence[ModelReply | AgentError]) -> None:
-        """复制预设响应；仅接受完整契约或统一错误，不接收真实凭据。"""
+    def __init__(
+        self,
+        outcomes: Sequence[ModelReply | AgentError],
+        *,
+        stream_outcomes: Sequence[Sequence[ModelStreamEvent | AgentError]] = (),
+    ) -> None:
+        """复制两类预设；仅接受内部契约或统一错误，不接收真实凭据。"""
         self._outcomes: deque[ModelReply | AgentError] = deque()
         for outcome in outcomes:
             if isinstance(outcome, ModelReply):
@@ -45,6 +52,17 @@ class FakeProvider(NonStreamingProvider):
             else:
                 raise TypeError("Fake 预设必须是 ModelReply 或 AgentError")
         self._calls: list[ProviderCall] = []
+        self._stream_outcomes: deque[list[ModelStreamEvent | AgentError]] = deque()
+        for stream in stream_outcomes:
+            copied: list[ModelStreamEvent | AgentError] = []
+            for outcome in stream:
+                if isinstance(outcome, ModelStreamEvent):
+                    copied.append(deepcopy(outcome))
+                elif isinstance(outcome, AgentError):
+                    copied.append(outcome)
+                else:
+                    raise TypeError("Fake 流预设必须是 ModelStreamEvent 或 AgentError")
+            self._stream_outcomes.append(copied)
 
     @property
     def calls(self) -> list[ProviderCall]:
@@ -55,6 +73,11 @@ class FakeProvider(NonStreamingProvider):
     def remaining(self) -> int:
         """返回尚未消费的预设数量，用于验证调用轮数。"""
         return len(self._outcomes)
+
+    @property
+    def remaining_streams(self) -> int:
+        """返回尚未消费的流式预设数量，用于验证调用轮数。"""
+        return len(self._stream_outcomes)
 
     async def complete(
         self, messages: Sequence[Message], *, tools: Sequence[dict[str, Any]] = (),
@@ -68,3 +91,19 @@ class FakeProvider(NonStreamingProvider):
         if isinstance(outcome, AgentError):
             raise outcome from None
         return ModelReply.from_dict(outcome.to_dict())
+
+    async def stream(
+        self, messages: Sequence[Message], *, tools: Sequence[dict[str, Any]] = (),
+    ) -> AsyncIterator[ModelStreamEvent]:
+        """依序产出一条流预设；取消会在下一个异步检查点立即生效。"""
+        prepare_request(messages, tools)
+        self._calls.append(ProviderCall(deepcopy(list(messages)), deepcopy(list(tools))))
+        if not self._stream_outcomes:
+            raise FakeProviderExhaustedError()
+        outcomes = self._stream_outcomes.popleft()
+        for outcome in outcomes:
+            # 即使预设立即可得也让出执行权，使并发和取消测试接近真实流。
+            await asyncio.sleep(0)
+            if isinstance(outcome, AgentError):
+                raise outcome from None
+            yield deepcopy(outcome)

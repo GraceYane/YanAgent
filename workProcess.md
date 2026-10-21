@@ -423,3 +423,112 @@ Electron/React chatStore
 - 下一项 P01-05：设计长期异步执行环境、内部事件、Provider 增量解析、Run 事件队列、SSE 订阅、基本取消和任务清理。
 - P01-06：补两请求隔离、流式错误与停止生成验证，并在用户自愿配置真实服务后记录模型名称和桌面人工结果；真实密钥不进入仓库或开发记录。
 - P01-04 已完成，不自动进入 P01-05；等待用户明确开始下一项。
+
+## 2026-10-21：配置本地 DeepSeek 默认模型
+
+### 需求
+
+为 YanAgent 准备一份可由用户稍后自行粘贴真实凭据的 DeepSeek 本地默认配置。
+
+### 完成内容
+
+- 更新项目根目录、已被 Git 忽略的 `config.json`，使用 OpenAI-compatible Provider。
+- API Base 使用 DeepSeek 官方地址，默认模型使用当前可用的 `deepseek-flash`；旧 `deepseek-chat` 已由官方停止使用，因此没有继续写入过期模型名。
+- 将配置文件中原有的非占位凭据替换为无效占位内容；开发记录不保存任何凭据值。
+- 未把凭据硬编码到 Python/TypeScript 源码，也未修改 `config.example.json` 或全局默认配置，避免模板和 Git 历史携带秘密。
+
+### 涉及文件
+
+- 本地忽略文件：`config.json`
+- 开发记录：`workProcess.md`
+
+### 验证结果
+
+- 使用 `ConfigStore` 成功读取配置，并通过 `require_model_ready()` 完整性校验。
+- 安全展示只返回脱敏密钥；`git check-ignore` 确认 `config.json` 不会被正常 Git 提交。
+
+### 后续事项
+
+- 用户需要在本地 `config.json` 中将占位内容替换为自己的真实 DeepSeek API Key，然后重启 YanAgent。
+- 真实模型请求尚未在本次配置操作中发送；填写有效凭据后再从桌面聊天页验收。
+
+## 2026-10-21：P01-05 流式链路
+
+### 需求
+
+按照 `docs/DEVELOPMENT_REQUIREMENTS.md` 和最新 `AGENTS.md` 完成 P01-05：确定长期异步执行环境；定义内部流式事件；实现 OpenAI-compatible Provider 的真实 SSE 响应、文本和工具参数增量组装；创建 request_id、运行事件队列和桌面 SSE 订阅；实现基本取消、并发隔离与任务清理。技术行为继续对齐 CowAgentByYan 的桌面 SSE 契约，但不提前实现 Session、工具执行或完整 AgentBridge。
+
+### 完成内容
+
+- 新增 `yanagent/events.py`，把供应商 SSE、Provider 增量和桌面事件分成三个边界。`ModelStreamEvent` 明确区分 `text_delta`、`tool_call_delta`、`completed`；`RunEvent` 带独立序号和 request_id，并只向桌面暴露 `delta/done/cancelled/error`。
+- 扩展 `OpenAICompatibleProvider.stream()`：发送 `stream=true` 的 Chat Completions 请求，逐块解析文本，按 tool index 累积调用 ID、函数名和 arguments 字符串，在 `[DONE]` 后严格解析参数对象并生成唯一 `ModelReply`。断流、坏 JSON、索引空洞、字段冲突、空回答和拒绝均不会冒充成功。
+- 新增标准库 `UrllibSseTransport`：在守护读取线程中处理真实 HTTP SSE，多行 `data` 按空行组帧；禁止携带认证头自动重定向；限制总响应 8 MiB、单事件 1 MiB；沿用统一 HTTP 错误映射，不读取或回显上游错误正文。
+- 扩展 `FakeProvider`，允许分别预设完整响应序列和流式事件序列，并继续复制输入/输出快照，给并发、错误、取消和后续 AgentLoop 提供确定性离线入口。
+- 新增 `yanagent/runtime/streaming.py`：进程只维护一个后台线程和一个常驻 asyncio 事件循环。非流式请求也提交到该循环，不再由 HTTP Handler 为每条消息创建 `asyncio.run()`。
+- 每条流式消息建立独立 `RunRecord`，保存 session_id、Future、带序号事件和终态。线程安全 Condition 连接异步生产者与 ThreadingHTTPServer；从 cursor 0 回放，因此模型先返回、EventSource 后建立也不丢开头；两条并发请求只读取各自事件。
+- `/message` 根据 `stream` 选择完整回答或创建 Run；`/stream?request_id=...` 输出与现有 TypeScript `EventSource.onmessage` 一致的匿名 `data: JSON`；`/cancel` 可按 request_id 精确取消，也支持 session_id 兜底；未知 Run 返回 `unknown_request` 错误事件。
+- 取消正常路径产生 `cancelled` 后再产生 `done(finish_reason=cancelled)`，保证前端立即恢复输入且 SSE 有明确终态。对“任务还没进入协程函数体就被取消”的竞态，RunRecord 使用 100 ms 兜底补齐终态；重复取消返回 0。
+- Windows 标准库 `HTTPResponse.close()` 可能等待另一个线程的 `readline()`，因此响应关闭被移到独立守护线程，不能阻塞 asyncio 取消。读取线程仍受 `request_timeout` 限制，避免把“UI 已停止”等同于“操作系统已强杀 socket”。
+- 终态 Run 默认保留 60 秒支持晚订阅/短期重连，之后惰性清理；活动 Run 不按 TTL 删除。服务关闭时幂等取消活动任务、停止事件循环并回收异步生成器。
+- 新增 `docs/P01_05_STREAMING.md`；同步更新 README、需求、路线和岗位映射。P01 仍为进行中，下一项是 P01-06；真实外部模型与桌面人工验收没有被虚构为完成。
+
+### 涉及文件
+
+- 运行与协议：`yanagent/events.py`、`yanagent/runtime/streaming.py`、`yanagent/runtime/__init__.py`
+- Provider 与传输：`yanagent/models/provider.py`、`yanagent/models/openai_compatible.py`、`yanagent/models/transport.py`、`yanagent/models/fake.py`
+- 应用与 HTTP：`yanagent/chat.py`、`app.py`
+- 测试：`tests/test_provider.py`、`tests/test_provider_http.py`、`tests/test_chat_integration.py`、`tests/test_streaming_runtime.py`、`tests/test_scaffold.py`
+- 文档：`docs/P01_05_STREAMING.md`、`docs/DEVELOPMENT_REQUIREMENTS.md`、`docs/IMPLEMENTATION_ROADMAP.md`、`docs/TARGET_ROLES.md`、`README.md`、`workProcess.md`
+
+### 关键流程日志
+
+- `[streaming.py][AgentRuntime.start_stream]`：记录 Run 登记、request_id 与 session_id，不记录消息正文和密钥。
+- `[streaming.py][AgentRuntime._run_stream]`：记录完成字符数、取消或统一错误码。
+- `[streaming.py][AgentRuntime.cancel]`：记录取消目标和实际取消数量。
+- `[streaming.py][AgentRuntime.close]`：记录常驻异步运行环境关闭。
+- `[app.py][YanAgentHandler.do_GET]`：记录 SSE 客户端断开，但不自动取消后台任务。
+
+### 验证结果
+
+- `.\.venv\Scripts\python.exe -m unittest discover -s tests -v`：96 项测试通过；原有 85 项全部回归通过，本任务新增 11 项核心行为覆盖。
+- Provider 流测试：文本分块、Usage、工具 ID/名称/参数跨块还原、可控 Fake、缺失 `[DONE]`、坏 JSON 和空响应均验证。
+- 真实回环 HTTP/SSE：默认标准库传输收到逐块文本和 `[DONE]`；取消阻塞中的下一块约 0.1 秒内返回；同一请求不重试；普通 401/429、禁止重定向和非流式路径继续通过。
+- Runtime 测试：两条并发 Run 内容互不混淆；晚订阅完整回放；运行中取消到达 Provider；立即取消竞态仍得到终态；终态 TTL 到期后清理。
+- 桌面 HTTP 测试：`POST /message(stream=true)` 返回 request_id；真实 `GET /stream` 得到两条 delta 和一条 done；`POST /cancel` 能终止活动 Provider 并产生 cancelled + done；非流式 `inline_reply` 兼容路径继续通过。
+- `desktop\npm run build`：Vite renderer 与 TypeScript main 构建通过。保留的字体路径、Browserslist、动态/静态 import 和大 chunk 提示均是已有构建警告，不是本次流式改动失败。
+- `python -m compileall` 和 `git diff --check` 通过；Git 仅提示 Windows 后续可能转换 LF/CRLF。
+
+### 开发难点与评分
+
+整体难度：**8/10**。这次不只是“把文字一块块返回”，而是同时处理线程 HTTP、单一异步循环、真实网络增量、事件回放、取消竞态和资源生命周期；任一层含糊都会表现为串流、卡死、假取消或工具参数损坏。
+
+| 难点 | 难度 | 主要风险 | 实现方式与验证 |
+|---|---:|---|---|
+| 线程 HTTP 与异步 Runtime 桥接 | 8/10 | 每请求新建事件循环导致任务无法被另一接口取消；跨线程直接操作 asyncio 对象 | 独立后台线程维护唯一事件循环；`run_coroutine_threadsafe` 调度；RunRecord 用 Condition 连接异步生产者和 SSE 请求线程；双 Run 和关闭测试验证 |
+| 流式协议和工具参数组装 | 8/10 | 文本重复/丢块；工具 ID 与参数串错；半段 JSON 被当完整对象；断流被误报成功 | 三层事件；按 tool index 累积并校验 ID/名称；只在 `[DONE]` 后完成；坏 JSON、索引和真实 HTTP SSE 测试验证 |
+| 取消竞态与阻塞 I/O | 9/10 | Future 取消早于协程启动时没有终态；同步 close 卡住事件循环；UI 停止但后台永久占用 | 正常 CancelledError 分支 + 100 ms 终态兜底；close 移到守护线程；socket timeout 保证底层有限回收；立即取消与慢 SSE 测试验证 |
+| SSE 晚订阅、断线和清理 | 7/10 | Run 返回速度快于 EventSource 建连而丢首块；断线误取消；终态永久占内存 | 事件列表按序保留并从 0 回放；客户端断开不取消 Run；终态保留 60 秒后惰性清理；晚订阅与 TTL 测试验证 |
+| 桌面兼容与错误边界 | 6/10 | 发送 `event: delta` 导致现有 onmessage 收不到；错误正文/密钥进入 SSE；非流式回归破坏 | 严格对齐 `data: {type:...}`；统一安全错误；保留 inline_reply；真实桌面接口测试和 TypeScript 构建验证 |
+
+### 与目标岗位的重合点
+
+- **XM-职责1**：完成了任务接入后的运行登记、流式执行与结果回写基础；request_id 将创建请求、SSE 和取消串成一条链。尚无上下文恢复和工具编排。
+- **XM-职责6～7**：响应大小限制、统一错误、禁止认证重定向、超时、取消竞态、终态清理和关键日志属于稳定性、可观测性、性能与可维护性基础；没有生产流量、成本或 SLA 数据。
+- **XM-要求2、XM-要求5～6**：体现 Python 异步/线程实现、TypeScript 协议联调、可运行 Side Project 和中文设计/复盘。不能替代学历、出勤或团队经历。
+- **DYQ-职责2～3**：实现 Agent 核心链路中的模型增量、执行管控、结果汇总和可复用事件/Provider/Runtime 协议，并用自动化测试形成调试与质量证据；尚无任务规划、多工具调用和业务价值评测。
+- **DYQ-要求2～4、DYQ-加分1**：体现 Python 工程、Agent 项目实践、结构化文档和可展示个人项目基础；没有开源贡献事实时不能写成开源贡献。
+- **TX-职责1、TX-职责3**：实现最小任务调度、运行隔离、取消传播和质量保障测试；尚未实现 Multi-Agent、规划、成本评测体系。
+- **TX-要求1～2、TX-要求6、TX-加分1～2**：体现 Python/TypeScript、Tool Use 协议前置能力、系统边界思考和 Agent Runtime 实践；当前工具只组装不执行，也没有 Memory、Reflection 或系统性效果评测。
+- **DYG-职责4、DYG-要求2～5**：属于基于 LLM 的 Agent 工程链路落地和可靠性基础；当前没有用户增长业务、自动规划、任务拆解、Multi-Agent 或亿级场景证据。
+
+### 能力边界与面试口径
+
+- 可以表述：为自研 Agent Runtime 设计常驻异步执行环境和线程安全 Run 注册表，实现 OpenAI-compatible SSE 增量解析、工具参数跨块组装、晚订阅回放、请求隔离、基本取消和资源清理，并以 96 项测试、真实回环 SSE 和桌面构建验证。
+- 不可以表述：已完成完整 Agent Harness、工具执行闭环、多轮上下文、生产级 Gateway、云端 Runtime、Multi-Agent、MCP 或企业级部署。
+- 本阶段没有发送真实 DeepSeek/外部模型请求，也没有记录桌面人工演示；真实密钥从未进入源码、测试或开发记录。
+
+### 后续事项
+
+- 下一项 P01-06：使用用户本地有效配置做真实模型和桌面人工联调，覆盖流式错误、停止生成、两请求隔离及阶段验收记录；凭据不得进入 Git 或文档。
+- P02 实现 Session 与持久化后，done/cancelled/error 才能形成可恢复历史；当前 Run 只保存在进程内 60 秒。
+- P03～P04 才消费已经正确组装的 ToolCall，加入 Schema、权限、执行、结果回写和循环；本次不能把“解析工具调用”描述成“会调用工具”。

@@ -18,7 +18,32 @@ from yanagent.contracts import ModelReply, ToolCall
 from yanagent.errors import (
     AuthenticationError, ConfigurationError, RequestValidationError, UnexpectedToolCallError,
 )
+from yanagent.events import ModelStreamEvent
 from yanagent.models import FakeProvider
+
+
+class BlockingHttpProvider:
+    """发出首块后等待取消，用于验证 HTTP cancel 到模型协程的完整链路。"""
+
+    name = "blocking-http"
+
+    def __init__(self) -> None:
+        """创建可由测试线程观察的取消标记。"""
+        self.started = threading.Event()
+        self.cancelled = threading.Event()
+
+    async def complete(self, messages, *, tools=()):
+        """提供协议要求的非流式入口，本测试不会调用。"""
+        return ModelReply(content="完整")
+
+    async def stream(self, messages, *, tools=()):
+        """先发首块，再无限等待并在 finally 中记录取消传播。"""
+        self.started.set()
+        yield ModelStreamEvent(kind="text_delta", content="开")
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.cancelled.set()
 
 
 class ChatApplicationTests(unittest.TestCase):
@@ -157,7 +182,14 @@ class ChatHttpIntegrationTests(unittest.TestCase):
             if self._testMethodName == "test_provider_error_maps_to_http_without_original_secret"
             else ModelReply(content="HTTP 联调成功", finish_reason="stop")
         )
-        self.fake = FakeProvider([outcome])
+        self.fake = FakeProvider([outcome], stream_outcomes=[[
+            ModelStreamEvent(kind="text_delta", content="HTTP "),
+            ModelStreamEvent(kind="text_delta", content="流式成功"),
+            ModelStreamEvent(kind="completed", reply=ModelReply(
+                content="HTTP 流式成功", finish_reason="stop",
+                usage={"input_tokens": 2, "output_tokens": 3},
+            )),
+        ]])
         application = YanAgentApplication(store, provider_factory=lambda _config: self.fake)
         self.server = create_server("127.0.0.1", 0, application=application)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -191,11 +223,11 @@ class ChatHttpIntegrationTests(unittest.TestCase):
             return response.status, json.loads(response.read().decode("utf-8"))
 
     def test_desktop_message_contract_over_real_http(self) -> None:
-        """桌面传 stream=true 时，后端应按 P01-04 返回 inline_reply 而非 SSE。"""
+        """显式非流式消息仍返回 P01-04 的 inline_reply 兼容结果。"""
         status, body = self._request("/message", method="POST", payload={
             "session_id": "desktop-session",
             "message": "你好",
-            "stream": True,
+            "stream": False,
             "attachments": [],
             "is_voice": False,
             "lang": "zh",
@@ -206,6 +238,22 @@ class ChatHttpIntegrationTests(unittest.TestCase):
         self.assertEqual(body["status"], "success")
         self.assertEqual(body["inline_reply"], "HTTP 联调成功")
         self.assertFalse(body["stream"])
+
+    def test_desktop_stream_contract_over_real_http(self) -> None:
+        """流式消息返回 request_id，随后 SSE 回放 delta 和 done JSON。"""
+        status, body = self._request("/message", method="POST", payload={
+            "session_id": "desktop-session", "message": "你好", "stream": True,
+            "attachments": [], "is_voice": False, "lang": "zh", "agent_id": "default",
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(body["stream"])
+        stream_url = self.base_url + f"/stream?request_id={body['request_id']}"
+        with urlopen(stream_url, timeout=3) as response:
+            lines = response.read().decode("utf-8").splitlines()
+        events = [json.loads(line[6:]) for line in lines if line.startswith("data: ")]
+        self.assertEqual([event["type"] for event in events], ["delta", "delta", "done"])
+        self.assertEqual("".join(event.get("content", "") for event in events[:-1]), "HTTP 流式成功")
+        self.assertEqual(events[-1]["content"], "HTTP 流式成功")
 
     def test_invalid_message_has_structured_http_error(self) -> None:
         """坏消息应返回 400、稳定错误码和安全中文说明。"""
@@ -244,6 +292,59 @@ class ChatHttpIntegrationTests(unittest.TestCase):
         self.assertTrue(models["providers"][0]["configured"])
         self.assertEqual(config["api_keys"]["api_key"], MASKED_SECRET)
         self.assertNotIn("http-key", json.dumps([models, config], ensure_ascii=False))
+
+
+class ChatCancelHttpTests(unittest.TestCase):
+    """验证桌面停止按钮使用的 HTTP 接口能取消正在运行的流。"""
+
+    def setUp(self) -> None:
+        """启动使用阻塞 Provider 的独立回环服务。"""
+        self.temporary = tempfile.TemporaryDirectory()
+        store = ConfigStore(Path(self.temporary.name) / "config.json", environ={})
+        store.save({
+            "api_base": "https://example.invalid/v1", "model": "fake", "api_key": "fake-key",
+        })
+        self.provider = BlockingHttpProvider()
+        application = YanAgentApplication(store, provider_factory=lambda _config: self.provider)
+        self.server = create_server("127.0.0.1", 0, application=application)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def tearDown(self) -> None:
+        """停止服务并清理临时配置。"""
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=3)
+        self.temporary.cleanup()
+
+    def _post(self, path: str, payload: dict[str, object]) -> dict[str, object]:
+        """向本地服务发送 JSON POST 并解析成功响应。"""
+        request = Request(
+            self.base_url + path,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urlopen(request, timeout=3) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def test_cancel_endpoint_terminates_active_stream(self) -> None:
+        """创建 Run 后调用 /cancel，SSE 最终得到 delta、cancelled、done。"""
+        created = self._post("/message", {
+            "session_id": "cancel-session", "message": "停止", "stream": True,
+        })
+        self.assertTrue(self.provider.started.wait(1))
+        cancelled = self._post("/cancel", {
+            "request_id": created["request_id"], "session_id": "cancel-session",
+        })
+        self.assertEqual(cancelled["cancelled"], 1)
+        stream_url = self.base_url + f"/stream?request_id={created['request_id']}"
+        with urlopen(stream_url, timeout=3) as response:
+            lines = response.read().decode("utf-8").splitlines()
+        events = [json.loads(line[6:]) for line in lines if line.startswith("data: ")]
+        self.assertEqual([event["type"] for event in events][-2:], ["cancelled", "done"])
+        self.assertTrue(self.provider.cancelled.wait(1))
 
 
 if __name__ == "__main__":

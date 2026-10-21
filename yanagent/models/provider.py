@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator, Sequence
 from typing import Any, Protocol
 
 from yanagent.contracts import Message, ModelReply
+from yanagent.events import ModelStreamEvent
 
 
 class ModelProvider(Protocol):
@@ -19,19 +20,19 @@ class ModelProvider(Protocol):
 
     def stream(
         self, messages: Sequence[Message], *, tools: Sequence[dict[str, Any]]
-    ) -> AsyncIterator[dict[str, Any]]:
-        """返回内部流式增量；事件格式和实现由 P01-05 补齐。"""
+    ) -> AsyncIterator[ModelStreamEvent]:
+        """返回类型化模型增量，最后必须产生且只产生一个完成事件。"""
         ...
 
 
 class NonStreamingProvider:
-    """明确拒绝尚未实现的流式调用，供本阶段的真实和 Fake Provider 复用。"""
+    """供只支持完整响应的实现复用，明确拒绝流式入口。"""
 
     async def stream(
         self, messages: Sequence[Message], *, tools: Sequence[dict[str, Any]] = ()
-    ) -> AsyncIterator[dict[str, Any]]:
-        """流式实现留到 P01-05，不用完整回答伪装成流式增量。"""
-        raise NotImplementedError("流式模型调用将在 P01-05 实现")
+    ) -> AsyncIterator[ModelStreamEvent]:
+        """不把完整回答伪装成增量，调用方可据此拒绝错误配置。"""
+        raise NotImplementedError("当前 Provider 不支持流式模型调用")
         yield  # pragma: no cover - 保持异步生成器接口。
 
 

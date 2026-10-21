@@ -1,8 +1,7 @@
-"""YanAgent 本地 HTTP 服务：连接桌面端、配置和 P01-04 普通聊天。"""
+"""YanAgent 本地 HTTP 服务：连接桌面端、常驻运行时与 SSE 流。"""
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import signal
@@ -10,7 +9,7 @@ import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, cast
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from yanagent.chat import ProviderFactory, YanAgentApplication, ensure_application_ready
 from yanagent.config import ConfigStore
@@ -20,6 +19,7 @@ from yanagent.errors import (
     ModelServerError, ModelTimeoutError, PermissionDeniedError, RateLimitError,
     RequestValidationError, UnexpectedToolCallError,
 )
+from yanagent.runtime import AgentRuntime
 
 
 LOGGER = logging.getLogger("yanagent.http")
@@ -30,7 +30,7 @@ def health_payload() -> dict[str, str]:
     """返回进程和当前运行能力状态，不探测外部模型网络。"""
     return {
         "status": "ok", "name": "YanAgent", "edition": "core-runtime-learning",
-        "agent_runtime": "non_streaming_chat",
+        "agent_runtime": "streaming_chat",
     }
 
 
@@ -73,9 +73,16 @@ class YanAgentHTTPServer(ThreadingHTTPServer):
     def __init__(
         self, server_address: tuple[str, int], application: YanAgentApplication,
     ) -> None:
-        """保存应用服务后初始化监听套接字，便于处理器和测试注入。"""
+        """保存应用服务并启动唯一常驻异步运行环境。"""
         self.application = application
         super().__init__(server_address, YanAgentHandler)
+        self.runtime = AgentRuntime(application)
+
+    def server_close(self) -> None:
+        """关闭监听套接字前幂等停止异步运行环境及其中的活动任务。"""
+        if hasattr(self, "runtime"):
+            self.runtime.close()
+        super().server_close()
 
 
 class YanAgentHandler(BaseHTTPRequestHandler):
@@ -87,6 +94,11 @@ class YanAgentHandler(BaseHTTPRequestHandler):
     def application(self) -> YanAgentApplication:
         """从类型化 Server 获取共享应用层。"""
         return cast(YanAgentHTTPServer, self.server).application
+
+    @property
+    def runtime(self) -> AgentRuntime:
+        """获取该进程唯一的常驻异步运行环境。"""
+        return cast(YanAgentHTTPServer, self.server).runtime
 
     def log_message(self, fmt: str, *args: object) -> None:
         """将标准库访问日志统一为包含文件和函数的中文可检索格式。"""
@@ -137,14 +149,59 @@ class YanAgentHandler(BaseHTTPRequestHandler):
             payload["request_id"] = request_id
         self._json(payload, status)
 
+    def _sse_headers(self) -> None:
+        """发送 EventSource 需要的响应头；不缓存、不缓冲且由服务端主动关闭。"""
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("Connection", "close")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.close_connection = True
+
+    def _sse_data(self, payload: dict[str, Any]) -> None:
+        """写出一条桌面端按 onmessage 消费的匿名 SSE JSON 事件。"""
+        body = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        self.wfile.write(f"data: {body}\n\n".encode("utf-8"))
+        self.wfile.flush()
+
+    def _stream(self, request_id: str) -> None:
+        """从 cursor=0 回放并跟随一个运行，直至 done/error 终态。"""
+        self._sse_headers()
+        cursor = 0
+        while True:
+            batch = self.runtime.wait_events(request_id, cursor, timeout=15.0)
+            if batch is None:
+                self._sse_data({
+                    "type": "error", "reason": "unknown_request",
+                    "message": "未找到对应的运行，请重新发送消息。",
+                })
+                return
+            events, terminal = batch
+            if not events:
+                self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+            for event in events:
+                self._sse_data(event.to_dict())
+                cursor += 1
+            if terminal:
+                return
+
     def do_OPTIONS(self) -> None:  # noqa: N802 - 标准库处理器约定的方法名
         """响应浏览器跨域预检。"""
         self._json({"status": "ok"})
 
     def do_GET(self) -> None:  # noqa: N802 - 标准库处理器约定的方法名
-        """处理健康、模型配置及仍为骨架状态的只读接口。"""
-        path = urlparse(self.path).path
+        """处理 SSE、健康、模型配置及仍为骨架状态的只读接口。"""
+        parsed = urlparse(self.path)
+        path = parsed.path
         try:
+            if path == "/stream":
+                values = parse_qs(parsed.query, keep_blank_values=True).get("request_id", [])
+                if len(values) != 1 or not values[0] or len(values[0]) > 128:
+                    raise RequestValidationError(reason="invalid", field="request_id")
+                self._stream(values[0])
+                return
             if path in {"/", "/api/health"}:
                 self._json(health_payload())
                 return
@@ -155,7 +212,7 @@ class YanAgentHandler(BaseHTTPRequestHandler):
                 self._json({
                     "status": "success", "default_agent_id": "default",
                     "agents": [{"id": "default", "name": "YanAgent", "enabled": True}],
-                    "channel_instances": [], "revision": "p01-04",
+                    "channel_instances": [], "revision": "p01-05",
                 })
                 return
             if path == "/api/sessions":
@@ -192,18 +249,23 @@ class YanAgentHandler(BaseHTTPRequestHandler):
                 "status": "not_implemented",
                 "message": f"Scaffold endpoint not implemented: GET {path}",
             }, HTTPStatus.NOT_IMPLEMENTED)
+        except (BrokenPipeError, ConnectionResetError):
+            LOGGER.info("[app.py][YanAgentHandler.do_GET] SSE 客户端已断开，运行继续在后台执行")
         except AgentError as error:
             self._error(error)
 
     def do_POST(self) -> None:  # noqa: N802 - 标准库处理器约定的方法名
-        """处理配置保存、模型动作及一次非流式消息调用。"""
+        """处理配置保存、模型动作、普通/流式消息及取消请求。"""
         path = urlparse(self.path).path
         request_id: str | None = None
         try:
             payload = self._body()
             if path == "/message":
                 request_id = f"run-{uuid.uuid4().hex}"
-                self._json(asyncio.run(self.application.chat(payload, request_id=request_id)))
+                if payload.get("stream") is True:
+                    self._json(self.runtime.start_stream(payload, request_id=request_id))
+                else:
+                    self._json(self.runtime.complete(payload, request_id=request_id))
                 return
             if path == "/config":
                 self._json(self.application.save_config(payload))
@@ -215,7 +277,25 @@ class YanAgentHandler(BaseHTTPRequestHandler):
                 self._json({"status": "success", "has_content": False})
                 return
             if path == "/cancel":
-                self._json({"status": "success", "cancelled": 0})
+                allowed = {"request_id", "session_id", "lang"}
+                if any(type(key) is not str or key not in allowed for key in payload):
+                    raise RequestValidationError(reason="unknown_field", field="body")
+                request_value = payload.get("request_id")
+                session_value = payload.get("session_id")
+                if request_value is not None and (
+                    type(request_value) is not str or not request_value or len(request_value) > 128
+                ):
+                    raise RequestValidationError(reason="invalid", field="request_id")
+                if session_value is not None and (
+                    type(session_value) is not str or not session_value or len(session_value) > 256
+                ):
+                    raise RequestValidationError(reason="invalid", field="session_id")
+                if request_value is None and session_value is None:
+                    raise RequestValidationError(reason="missing", field="request_id")
+                cancelled = self.runtime.cancel(
+                    request_id=request_value, session_id=session_value,
+                )
+                self._json({"status": "success", "cancelled": cancelled})
                 return
             self._json({
                 "status": "not_implemented",
@@ -258,7 +338,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, stop_server)
     host, port = server.server_address[:2]
     LOGGER.info("[app.py][main] YanAgent 后端已启动：http://%s:%s", host, port)
-    LOGGER.info("[app.py][main] 当前能力：P01-04 非流式普通聊天；流式链路将在 P01-05 实现")
+    LOGGER.info("[app.py][main] 当前能力：P01-05 普通聊天、SSE 流式输出与基本取消")
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
