@@ -713,3 +713,76 @@ Electron/React chatStore
 - 下一项严格执行 P02-02：实现会话创建、分页、重命名、置顶、删除；事务追加消息；按稳定序号读取；保存时间、归属和元数据。
 - P02-02 需要决定 SessionStore 的同步/异步边界和写事务策略，并复用本次 `Database.connection()`；不能绕过复合归属字段直接按裸 `session_id` 查询。
 - P02-03 前聊天 Provider 仍只收到本次用户消息；数据库文件存在不代表当前聊天已经具有多轮记忆。
+
+## 2026-10-22：P02-02 会话与消息存储
+
+### 需求
+
+按照 `docs/DEVELOPMENT_REQUIREMENTS.md` 和最新 `AGENTS.md` 完成 P02-02：在 P02-01 SQLite 基础上实现会话创建、读取、分页、重命名、置顶和删除；事务追加完整消息；按稳定序号读取；保存时间、用户/Agent 归属和元数据，并为后续多轮上下文及桌面会话接口提供真实仓储。
+
+### 实际完成内容
+
+- 将 `yanagent/sessions/store.py` 从空接口替换为真实 `SessionStore`。仓储在构造时绑定 `user_id + agent_id`，所有会话与消息 SQL 均使用完整作用域，避免只凭裸 `session_id` 跨用户或跨 Agent 读取。
+- 新增 `SessionRecord`、`SessionPage` 和 `StoredMessage`：分别表达会话摘要、分页状态和带稳定序号/消息 ID/时间的持久化消息。会话列表按 `pinned DESC, updated_at DESC, session_id ASC` 排序，相同时间下也能稳定分页。
+- 实现 `create/get/list_sessions/rename/set_pinned/delete`。标题、分页、标识、布尔值和 JSON 元数据在进入 SQL 前校验；删除依靠已启用的复合外键级联清理关联消息。
+- 实现异步 `append()` 与 `history()`，SQLite 阻塞操作通过 `asyncio.to_thread` 移出事件循环。追加使用 `BEGIN IMMEDIATE`：确认会话归属、读取最大序号、逐条写入、增加 `message_count` 和刷新时间处于同一事务，任意异常整体回滚。
+- 消息存储覆盖角色、正文、名称、元数据、Assistant `tool_calls`、Tool `tool_call_id` 和 `is_error`。读取时恢复成统一 `Message` / `ToolCall` 契约，工具调用关联和失败含义不会因落库丢失。
+- 数据库升级至 Schema v2，新增 `sessions.message_count` 和 `messages.is_error`。新增真实 v1→v2 升级测试：先用 v1 Schema 写入旧会话，再由当前版本迁移，确认旧数据保留且新字段得到默认值。
+- 新增会话统一错误：参数非法、不存在、重复和存储失败。对外错误不回显 SQL、消息正文、工具参数或数据库异常原文；关键操作日志为中文，并带 `store.py` 与具体函数名。
+- `context()` 继续明确为 P02-03 未实现，没有把“读取完整历史”冒充成“按 Token 预算构建模型上下文”。本阶段也没有提前修改桌面接口。
+- 新增 `docs/P02_02_SESSION_STORE.md`，同步更新 README、需求文档、路线和岗位映射；P02-02 标记完成，下一项为 P02-03。
+
+### 涉及文件
+
+- 会话仓储：`yanagent/sessions/store.py`、`yanagent/sessions/__init__.py`
+- 统一错误：`yanagent/errors.py`
+- Schema v2 与事务入口：`yanagent/storage/database.py`
+- 自动化测试：`tests/test_database.py`、`tests/test_session_store.py`
+- 实现说明：`docs/P02_02_SESSION_STORE.md`
+- 状态与导航：`README.md`、`docs/DEVELOPMENT_REQUIREMENTS.md`、`docs/IMPLEMENTATION_ROADMAP.md`、`docs/TARGET_ROLES.md`
+- 开发记录：`workProcess.md`
+
+### 验证结果
+
+- `tests.test_database + tests.test_session_store`：18 项定向测试通过，其中 P02-02 新增 10 项（1 项迁移升级、9 项会话仓储）。
+- CRUD 与分页：验证重复会话错误、标题规范化、置顶排序、分页总数/续页标记，以及其他用户会话不进入当前列表。
+- 完整消息往返：固定四消息序列保存后还原，Assistant 工具调用对象、Tool 调用 ID、名称、元数据和 `is_error=True` 均一致，序号为 0～3。
+- 事务故障注入：让批次第二条消息的全局 `message_id` 冲突，确认第一条也回滚、历史为空且 `message_count` 仍为 0。
+- 持久化与隔离：重新创建 Database/SessionStore 后仍能读取会话和消息；删除用户 A 的同名会话不会影响用户 B，会话消息通过外键完成级联清理。
+- Schema 升级：真实建立 v1 并写入旧会话后升级到 v2，旧标题保留、`message_count=0`、迁移记录连续。
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m unittest discover -s tests -q`：最终全量 118 项测试通过，本次运行 5.606 秒；该耗时仅是本机单次记录，不作为性能结论。Windows asyncio 测试在允许本机线程/回环资源且不访问公网的受控环境执行。
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m compileall -q -f app.py yanagent tests examples scripts`：通过；`git diff --check`：通过；敏感值模式扫描没有发现实际密钥，文档只包含 `Authorization: Bearer ...` 说明占位符。
+- 本次没有修改 Electron/TypeScript，因此未重复桌面生产构建；P01-06 的构建证据保持不变。
+
+### 开发难点与评分
+
+整体难度：**7/10**。这次不难在 SQL CRUD 本身，而在于同时保证“归属不越界、批次不半写、顺序可恢复、内部消息语义不丢失、旧数据库可升级”。
+
+| 难点 | 难度 | 容易出现的问题 | 实现方式与证据 |
+|---|---:|---|---|
+| 批次原子性与序号分配 | 7/10 | 先提交用户消息、Assistant 写入失败后留下半轮；两个写入读取同一最大序号；计数和真实消息不一致 | `BEGIN IMMEDIATE` 内读取最大序号、写整批、更新计数并一次提交；重复消息 ID 故障测试证明整批和计数同时回滚 |
+| 完整内部消息持久化 | 7/10 | 只保存正文导致 ToolCall 参数、调用 ID 或失败含义丢失，重启后无法继续 Agent 循环 | ToolCall 使用 JSON 保存，Tool 结果独立保存引用和 `is_error`；四消息往返逐字段比较 `Message.to_dict()` |
+| 多维归属隔离 | 7/10 | 全局按 `session_id` 查询，同名会话跨用户/Agent 可见或被误删 | Store 在构造时绑定可信作用域，每条查询都带三元身份；分页和删除隔离测试验证，接口认证仍明确属于后续范围 |
+| 向前兼容迁移 | 6/10 | 直接修改 v1 建表语句使已有数据库缺字段；升级时丢失会话；旧消息无法表达工具失败 | 保持 v1 不变并新增 v2 `ALTER TABLE`；测试建立真实 v1、写旧数据后升级并检查默认值和迁移连续性 |
+| 异步与 SQLite 边界 | 6/10 | 在 `async` 方法中同步访问磁盘阻塞事件循环；取消等待被误认为能强制终止底层线程 | 公共接口用 `asyncio.to_thread`；SQLite 自身事务控制一致性；文档明确线程取消和 Run 排队/取消仍属 P05 |
+
+### 岗位要求关联与实践证据
+
+- **小米职责1～2（上下文管理完整链路、Sessions 设计）**：本阶段真实实现 Session 后端的数据归属、CRUD、分页、稳定消息顺序和重启恢复，是后续上下文构建的持久化基础。当前 Provider 仍未加载历史，也没有 Gateway、本地 daemon/云端双 Runtime，因此只能描述为 Sessions 存储层证据。
+- **小米职责6～7（稳定性、可观测性、维护性）**：事务回滚、向前迁移、统一安全错误、响应上限式分页和中文关键日志属于工程稳定性实践；没有生产压测、Token 成本或性能提升数据。
+- **小米要求3（上下文管理实践）**：可以解释完整历史与模型上下文为什么分开，P02-02 保存不可丢失的完整记录，P02-03/P05 才负责选择和裁剪输入；本阶段尚无 Token 预算或摘要实践。
+- **字节质量 Agent 职责2～3（上下文构建、执行管控、复用框架与调试评测）**：统一会话/消息模型、事务边界、稳定游标和确定性测试可作为框架基础证据；没有测试生成、代码评审、缺陷发现或 Agent 效果评测。
+- **腾讯职责2～3及要求1、要求6（Memory、质量保障、系统思维）**：实现了短期会话记忆的数据层和 10 项新增行为测试，体现 Python/SQLite、迁移和故障注入；这不等于长期 Memory、向量检索、Reflection 或系统性 Benchmark。
+- **岗位通用结构化表达**：`docs/P02_02_SESSION_STORE.md` 和本记录可用于讲清楚事务流程、游标分页、复合身份、Schema 升级和已知边界；只能陈述个人项目中已实现与已验证的内容。
+
+### 面试可讲事实与边界
+
+- 可以表述：为自研 Agent Runtime 实现 SQLite SessionStore，支持会话 CRUD/分页和完整消息持久化；以 `user + agent + session` 作为查询作用域，以立即事务分配稳定序号并原子提交整批消息。
+- 可以表述：设计并验证 Schema v1→v2 无损迁移，保存 Assistant ToolCall、Tool Result 引用和失败语义；通过故障注入证明批次第二条失败不会留下第一条或错误计数。
+- 不可以表述：模型已经能记住上一轮、桌面会话列表已接通、具备生产多租户认证、同 Session Run 队列、崩溃自动恢复、长期记忆或上下文 Token 压缩。这些仍属于 P02-03～P02-05、P05 和 P09。
+
+### 后续事项
+
+- 下一项严格执行 P02-03：区分完整历史与本次模型输入，将同 Session 的先前完整轮次传入 Provider，并为以后工具消息成对选择保留正确语义。
+- P02-04 才把会话 CRUD 与历史接入 HTTP/桌面；本阶段通过后端单测验收，不把现有桌面静态会话 UI 当作功能证据。
+- P02-05/P05 继续处理同 Session 并发排队、未结束 Run 恢复、取消传播和更完整的身份/授权入口。

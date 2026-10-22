@@ -64,7 +64,7 @@ class DatabaseSchemaTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def test_initialize_creates_four_tables_and_version(self) -> None:
-        """首次初始化必须建立四张目标表并登记 Schema v1。"""
+        """首次初始化必须建立四张目标表并登记全部 Schema 迁移。"""
         info = self.database.initialize()
         self.assertEqual(info.schema_version, CURRENT_SCHEMA_VERSION)
         self.assertEqual(info.path, self.data_dir.resolve() / "yanagent.db")
@@ -77,12 +77,24 @@ class DatabaseSchemaTests(unittest.TestCase):
                 ).fetchall()
             }
             self.assertTrue({"sessions", "messages", "runs", "schema_migrations"} <= tables)
-            migration = connection.execute(
-                "SELECT version, name, checksum FROM schema_migrations"
-            ).fetchone()
-            self.assertEqual(migration["version"], 1)
-            self.assertEqual(migration["name"], "initial_session_schema")
-            self.assertEqual(len(migration["checksum"]), 64)
+            migrations = connection.execute(
+                "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
+            ).fetchall()
+            self.assertEqual(
+                [row["version"] for row in migrations],
+                list(range(1, CURRENT_SCHEMA_VERSION + 1)),
+            )
+            self.assertEqual(migrations[0]["name"], "initial_session_schema")
+            self.assertEqual(migrations[1]["name"], "session_message_storage")
+            self.assertTrue(all(len(row["checksum"]) == 64 for row in migrations))
+            session_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(sessions)")
+            }
+            message_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(messages)")
+            }
+            self.assertIn("message_count", session_columns)
+            self.assertIn("is_error", message_columns)
             self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
             self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "wal")
 
@@ -100,7 +112,45 @@ class DatabaseSchemaTests(unittest.TestCase):
         with reopened.connection() as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 1)
             self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 1,
+                connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
+                CURRENT_SCHEMA_VERSION,
+            )
+
+    def test_v1_database_upgrades_to_v2_without_losing_sessions(self) -> None:
+        """已有 Schema v1 必须原地升级，并保留升级前的会话数据。"""
+        first_migration = database_module.MIGRATIONS[0]
+        legacy_columns = {
+            table: set(columns) for table, columns in database_module.REQUIRED_COLUMNS.items()
+        }
+        legacy_columns["sessions"].remove("message_count")
+        legacy_columns["messages"].remove("is_error")
+        with (
+            patch.object(database_module, "CURRENT_SCHEMA_VERSION", 1),
+            patch.object(database_module, "MIGRATIONS", (first_migration,)),
+            patch.object(database_module, "REQUIRED_COLUMNS", legacy_columns),
+        ):
+            legacy = Database(data_dir=self.data_dir, environ={})
+            legacy.initialize()
+            with legacy.connection() as connection:
+                connection.execute(
+                    "INSERT INTO sessions("
+                    "user_id, agent_id, session_id, title, created_at, updated_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?)",
+                    ("u", "a", "legacy", "旧会话", 1, 1),
+                )
+
+        upgraded = Database(data_dir=self.data_dir, environ={})
+        info = upgraded.initialize()
+        self.assertEqual(info.schema_version, CURRENT_SCHEMA_VERSION)
+        with upgraded.connection() as connection:
+            row = connection.execute(
+                "SELECT title, message_count FROM sessions WHERE session_id = 'legacy'"
+            ).fetchone()
+            self.assertEqual(row["title"], "旧会话")
+            self.assertEqual(row["message_count"], 0)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
+                CURRENT_SCHEMA_VERSION,
             )
 
     def test_foreign_key_sequence_and_status_constraints(self) -> None:

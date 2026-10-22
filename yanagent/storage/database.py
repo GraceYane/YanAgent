@@ -17,7 +17,7 @@ from pathlib import Path
 LOGGER = logging.getLogger("yanagent.storage")
 DATA_DIR_ENV = "YANAGENT_DATA_DIR"
 DATABASE_FILENAME = "yanagent.db"
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 class DatabaseInitializationError(RuntimeError):
@@ -147,6 +147,22 @@ MIGRATIONS = (
             """,
         ),
     ),
+    Migration(
+        version=2,
+        name="session_message_storage",
+        statements=(
+            """
+            ALTER TABLE sessions
+                ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0
+                CHECK (message_count >= 0)
+            """,
+            """
+            ALTER TABLE messages
+                ADD COLUMN is_error INTEGER NOT NULL DEFAULT 0
+                CHECK (is_error IN (0, 1))
+            """,
+        ),
+    ),
 )
 
 
@@ -154,11 +170,12 @@ REQUIRED_COLUMNS = {
     "schema_migrations": {"version", "name", "checksum", "applied_at"},
     "sessions": {
         "user_id", "agent_id", "session_id", "title", "pinned", "created_at",
-        "updated_at", "metadata_json",
+        "updated_at", "message_count", "metadata_json",
     },
     "messages": {
         "message_id", "user_id", "agent_id", "session_id", "sequence", "role",
-        "content", "tool_calls_json", "tool_call_id", "name", "created_at", "metadata_json",
+        "content", "tool_calls_json", "tool_call_id", "name", "created_at", "is_error",
+        "metadata_json",
     },
     "runs": {
         "request_id", "user_id", "agent_id", "session_id", "parent_request_id", "status",
@@ -255,6 +272,18 @@ class Database:
             yield connection
         finally:
             connection.close()
+
+    @contextmanager
+    def transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+        """开启显式事务；异常时完整回滚，正常结束时一次提交。"""
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            try:
+                yield connection
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
 
     def _info(self) -> DatabaseInfo:
         """构造当前数据库只读信息。"""

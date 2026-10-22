@@ -102,6 +102,35 @@ class RequestValidationError(AgentError):
         return result
 
 
+class SessionValidationError(AgentError):
+    """标识会话标识、标题、分页或消息参数不满足仓储约定。"""
+
+    code = "session_validation_error"
+    message = "会话操作参数不合法，请检查会话标识、分页或消息内容。"
+
+
+class SessionNotFoundError(AgentError):
+    """标识当前用户与 Agent 范围内不存在目标会话。"""
+
+    code = "session_not_found"
+    message = "目标会话不存在或不属于当前用户与 Agent。"
+
+
+class SessionAlreadyExistsError(AgentError):
+    """标识同一用户与 Agent 范围内重复创建了会话标识。"""
+
+    code = "session_already_exists"
+    message = "同一用户与 Agent 下已存在该会话。"
+
+
+class SessionStorageError(AgentError):
+    """标识会话数据库读写失败；原始 SQL 和消息内容不会向外暴露。"""
+
+    code = "session_storage_error"
+    message = "会话数据读写失败，请稍后重试。"
+    retryable = True
+
+
 class UnexpectedToolCallError(AgentError):
     """标识普通聊天收到工具请求，但工具循环尚未进入本阶段。"""
 
