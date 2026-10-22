@@ -210,9 +210,34 @@ class SessionStore:
             self._history_sync, selected_id, limit, before_sequence
         )
 
+    async def complete_history(self, session_id: str) -> list[StoredMessage]:
+        """逐页读取会话的全部持久化消息，并按稳定序号升序返回。"""
+        selected_id = _identifier(session_id)
+        pages: list[list[StoredMessage]] = []
+        before_sequence: int | None = None
+        while True:
+            page = await self.history(
+                selected_id,
+                limit=MAX_HISTORY_LIMIT,
+                before_sequence=before_sequence,
+            )
+            if not page:
+                break
+            pages.append(page)
+            if len(page) < MAX_HISTORY_LIMIT:
+                break
+            before_sequence = page[0].sequence
+        records = [record for page in reversed(pages) for record in page]
+        LOGGER.info(
+            "[store.py][SessionStore.complete_history] 完整历史读取完成，session_id=%s，消息数量=%d",
+            selected_id,
+            len(records),
+        )
+        return records
+
     async def context(self, session_id: str, *, token_budget: int) -> list[Message]:
-        """P02-03 才实现历史到模型上下文的选择，本阶段不提前伪装完成。"""
-        raise NotImplementedError("P02-03 将实现历史到模型上下文的转换")
+        """P05-04 才实现 Token 预算裁剪；P02-03 使用完整历史组装模型输入。"""
+        raise NotImplementedError("P05-04 将实现按 Token 预算选择模型上下文")
 
     async def delete(self, session_id: str) -> None:
         """删除当前作用域内的会话，关联消息由数据库外键级联删除。"""

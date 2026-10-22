@@ -20,6 +20,7 @@ from yanagent.errors import (
     RequestValidationError, UnexpectedToolCallError,
 )
 from yanagent.runtime import AgentRuntime
+from yanagent.sessions import SessionStore
 from yanagent.storage import Database
 
 
@@ -36,7 +37,7 @@ def health_payload() -> dict[str, str]:
 
 
 def empty_sessions_payload() -> dict[str, Any]:
-    """返回 P02 前使用的空会话分页结构。"""
+    """返回 P02-04 桌面 Session API 接入前使用的空会话分页结构。"""
     return {
         "status": "success", "sessions": [], "total": 0, "page": 1,
         "page_size": 50, "has_more": False, "group_mode": "time", "project_order": [],
@@ -317,10 +318,19 @@ def create_server(
     provider_factory: ProviderFactory | None = None,
     database: Database | None = None,
 ) -> YanAgentHTTPServer:
-    """根据生效配置创建服务；数据库在 P02-01 起可由启动入口注入。"""
+    """根据配置创建服务；生产入口注入数据库时同时启用完整会话历史。"""
     if application is not None and (config_store is not None or provider_factory is not None):
         raise ValueError("application 与 config_store/provider_factory 不能同时传入")
-    app = application or YanAgentApplication(config_store, provider_factory=provider_factory)
+    session_store = (
+        SessionStore(database, user_id="local", agent_id="default")
+        if application is None and database is not None
+        else None
+    )
+    app = application or YanAgentApplication(
+        config_store,
+        provider_factory=provider_factory,
+        session_store=session_store,
+    )
     ensure_application_ready(app)
     config = app.load_config()
     bind_host = config.host if host is None else host
@@ -349,7 +359,9 @@ def main() -> None:
         database_info.schema_version,
         database_info.path,
     )
-    LOGGER.info("[app.py][main] 当前能力：P01 单模型聊天；P02-01 SQLite 与迁移基础")
+    LOGGER.info(
+        "[app.py][main] 当前能力：P01 单模型聊天；P02-03 会话持久化与完整历史上下文"
+    )
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:

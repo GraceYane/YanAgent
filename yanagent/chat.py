@@ -10,13 +10,16 @@ from dataclasses import dataclass
 from typing import Any
 
 from yanagent.config import AppConfig, ConfigStore, MASKED_SECRET
-from yanagent.contracts import Message
+from yanagent.contracts import Message, ModelReply
 from yanagent.errors import (
     ConfigurationError,
     RequestValidationError,
+    SessionAlreadyExistsError,
+    SessionNotFoundError,
     UnexpectedToolCallError,
 )
 from yanagent.models import ModelProvider, OpenAICompatibleProvider
+from yanagent.sessions import SessionStore
 
 
 LOGGER = logging.getLogger("yanagent.chat")
@@ -65,19 +68,21 @@ def _ensure_keys(payload: dict[str, Any], allowed: set[str]) -> None:
 
 
 class YanAgentApplication:
-    """封装无状态单轮聊天与配置接口，供 HTTP 和离线测试共同调用。"""
+    """封装聊天、会话历史和配置接口，供 HTTP 与离线测试共同调用。"""
 
     def __init__(
         self,
         config_store: ConfigStore | None = None,
         *,
         provider_factory: ProviderFactory | None = None,
+        session_store: SessionStore | None = None,
     ) -> None:
-        """注入配置仓库和 Provider 工厂；锁只保护短暂的配置读写。"""
+        """注入配置、Provider 和会话仓储；仓储为空时保留离线无状态测试模式。"""
         self.config_store = config_store if config_store is not None else ConfigStore()
         self.provider_factory = (
             provider_factory if provider_factory is not None else OpenAICompatibleProvider
         )
+        self.session_store = session_store
         self._config_lock = threading.RLock()
 
     def load_config(self) -> AppConfig:
@@ -265,13 +270,14 @@ class YanAgentApplication:
             prepared.config.model_provider,
             prepared.config.model or "<未配置>",
         )
-        reply = await prepared.provider.complete([prepared.message], tools=[])
+        messages = await self.begin_chat(prepared, request_id=request_id)
+        reply = await prepared.provider.complete(messages, tools=[])
         if reply.tool_calls:
             raise UnexpectedToolCallError()
+        await self.finish_chat(prepared, reply, request_id=request_id)
         LOGGER.info(
-            "[chat.py][YanAgentApplication.chat] 普通聊天请求完成，request_id=%s，输出字符数=%d",
-            request_id,
-            len(reply.content),
+            "[chat.py][YanAgentApplication.chat] 普通聊天请求完成，request_id=%s，上下文消息数=%d，输出字符数=%d",
+            request_id, len(messages), len(reply.content),
         )
         return {
             "status": "success",
@@ -283,6 +289,73 @@ class YanAgentApplication:
             "finish_reason": reply.finish_reason,
             "usage": reply.usage,
         }
+
+    async def begin_chat(
+        self, prepared: PreparedChat, *, request_id: str
+    ) -> list[Message]:
+        """加载完整历史并先持久化用户消息，返回本轮发送给 Provider 的上下文。"""
+        current = Message(
+            role="user",
+            content=prepared.message.content,
+            metadata={"request_id": request_id},
+        )
+        if self.session_store is None:
+            LOGGER.info(
+                "[chat.py][YanAgentApplication.begin_chat] 未注入会话仓储，使用无状态测试模式，request_id=%s",
+                request_id,
+            )
+            return [current]
+        # 生产持久化链路在落库前先拒绝缺失配置，避免留下从未调用模型的消息。
+        # 无仓储的离线 Fake Provider 模式由 Provider 自己决定是否要求配置。
+        prepared.config.require_model_ready()
+        await self._ensure_session(prepared.session_id)
+        stored = await self.session_store.complete_history(prepared.session_id)
+        await self.session_store.append(prepared.session_id, [current])
+        messages = [record.message for record in stored] + [current]
+        LOGGER.info(
+            "[chat.py][YanAgentApplication.begin_chat] 历史已装入模型上下文且用户消息已落库，request_id=%s，session_id=%s，历史消息数=%d",
+            request_id,
+            prepared.session_id,
+            len(stored),
+        )
+        return messages
+
+    async def finish_chat(
+        self, prepared: PreparedChat, reply: ModelReply, *, request_id: str
+    ) -> None:
+        """在回答对外标记完成前保存完整 Assistant 消息。"""
+        if self.session_store is None:
+            return
+        assistant = reply.to_message()
+        assistant.metadata["request_id"] = request_id
+        await self.session_store.append(prepared.session_id, [assistant])
+        LOGGER.info(
+            "[chat.py][YanAgentApplication.finish_chat] Assistant 完整回答已落库，request_id=%s，session_id=%s",
+            request_id,
+            prepared.session_id,
+        )
+
+    async def _ensure_session(self, session_id: str) -> None:
+        """保证目标会话存在，并处理并发首次创建造成的重复竞态。"""
+        if self.session_store is None:
+            return
+        try:
+            await self.session_store.get(session_id)
+            return
+        except SessionNotFoundError:
+            pass
+        try:
+            await self.session_store.create(
+                session_id,
+                metadata={"created_by": "chat"},
+            )
+        except SessionAlreadyExistsError:
+            # 另一请求可能刚在 get 与 create 之间创建了同一会话。
+            pass
+        LOGGER.info(
+            "[chat.py][YanAgentApplication._ensure_session] 会话已就绪，session_id=%s",
+            session_id,
+        )
 
     def prepare_chat(self, payload: dict[str, Any]) -> PreparedChat:
         """同步固定请求、配置和 Provider；具体 Provider 在执行前检查必需配置。"""

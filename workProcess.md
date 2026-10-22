@@ -786,3 +786,78 @@ Electron/React chatStore
 - 下一项严格执行 P02-03：区分完整历史与本次模型输入，将同 Session 的先前完整轮次传入 Provider，并为以后工具消息成对选择保留正确语义。
 - P02-04 才把会话 CRUD 与历史接入 HTTP/桌面；本阶段通过后端单测验收，不把现有桌面静态会话 UI 当作功能证据。
 - P02-05/P05 继续处理同 Session 并发排队、未结束 Run 恢复、取消传播和更完整的身份/授权入口。
+
+## 2026-10-22：P02-03 历史与上下文接通
+
+### 需求
+
+按照 `docs/DEVELOPMENT_REQUIREMENTS.md` 和最新 `AGENTS.md` 完成 P02-03：区分数据库完整历史和本轮模型输入，将同一 Session 的先前完整轮次传入 Provider，并让普通/流式聊天真实写入 P02-02 的 SessionStore；工具调用及结果从数据库还原后保持内部消息语义。
+
+### 实际完成内容
+
+- 在 `YanAgentApplication` 中新增 `begin_chat()`：生产持久化模式先检查模型配置，创建或确认 Session，使用稳定游标读取完整历史，保存当前 User Message，再组装“旧历史 + 当前 User”交给 Provider。
+- 新增 `finish_chat()`：将成功 `ModelReply` 转为完整 Assistant Message，附加当前 `request_id` 后落库。普通聊天只有在 Assistant 保存成功后才返回 `inline_reply`。
+- `_ensure_session()` 支持桌面第一次直接发消息时自动建立会话，并容忍两个请求在 `get → create` 间发生的重复创建竞态；真正的同 Session 请求排队仍留到 P02-05/P05。
+- 流式 Runtime 改为使用 `begin_chat()` 生成上下文。收到 Provider 完成事件后，先核对增量拼接结果，再保存 Assistant，最后发送 `done`；因此客户端看到成功终态时数据库已经有完整回答。
+- 明确失败语义：模型失败、配置失败或未启用的工具请求不会产生虚假 Assistant；Provider 已开始前保存的 User Message继续保留。流式取消不把部分 Assistant 文本冒充完整回答写入历史。
+- 在 `SessionStore` 新增 `complete_history()`，通过 `before_sequence` 多页读取并恢复升序。501 条旧消息测试确认不会被单页 500 条上限静默截断。
+- 正式 `create_server(database=...)` 路径现在自动注入 `SessionStore(user_id=local, agent_id=default)`；源码/桌面启动会使用 `~/.yanagent/yanagent.db`。显式不注入仓储的旧离线测试模式继续保持单轮行为，避免测试污染真实用户数据。
+- 工具消息历史进入 Provider 前恢复成统一 Message：Assistant ToolCall、Tool Result、调用 ID 和 `is_error` 均保留。P03/P04 未实现前仍不会真正执行新工具请求。
+- 新增 `docs/P02_03_HISTORY_CONTEXT.md`，同步 README、需求状态、路线和岗位映射；P02-03 标记完成，下一项为 P02-04。
+
+### 涉及文件
+
+- 聊天上下文与持久化：`yanagent/chat.py`
+- 流式完成顺序：`yanagent/runtime/streaming.py`
+- 完整历史读取：`yanagent/sessions/store.py`
+- 正式启动注入：`app.py`
+- 自动化测试：`tests/test_chat_history.py`、`tests/test_chat_integration.py`
+- 实现说明：`docs/P02_03_HISTORY_CONTEXT.md`
+- 状态与导航：`README.md`、`docs/DEVELOPMENT_REQUIREMENTS.md`、`docs/IMPLEMENTATION_ROADMAP.md`、`docs/TARGET_ROLES.md`
+- 开发记录：`workProcess.md`
+
+### 验证结果
+
+- `tests.test_session_store + tests.test_chat_history`：15 项定向测试通过，其中 P02-03 新增 6 项。
+- 两轮上下文：第一轮“我叫张三”，第二轮“我叫什么”；第二次 Fake Provider 实际收到 User/Assistant/User，SQLite 最终为连续的 User/Assistant/User/Assistant 四条消息，并保存每轮 request_id。
+- 重启与隔离：用新的 Database/SessionStore 打开同一目录后仍能恢复旧历史；不同 Session 的首次输入只包含自己的当前消息。
+- 失败路径：Provider 抛认证错误后数据库仅保存 User，不伪造 Assistant；真实 HTTP/SSE 成功链路确认 `done` 后数据库已有回答。
+- 工具历史：预置 Assistant ToolCall + 失败 Tool Result + Assistant 总结，下一轮 Provider 收到完整五消息上下文，调用 ID 与失败标记一致。
+- 完整历史：501 条旧消息跨两页读取，加当前输入共 502 条传给 Provider，首条与末条顺序正确。
+- 第一次全量回归暴露 6 个旧 Fake 测试被提前配置检查拦截；将提前配置检查限定在“已注入持久化仓储”的生产路径后，旧无状态 Fake 模式和新持久化模式均按各自契约工作。
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m unittest discover -s tests -q`：最终全量 124 项测试通过，本次运行 6.732 秒；耗时仅为本机单次记录，不作为性能结论。
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m compileall -q -f app.py yanagent tests examples scripts`：通过；`git diff --check`：通过，仅提示 Windows 工作区既有 LF→CRLF 转换信息。
+- 敏感值模式扫描没有发现实际 API Key；测试只使用 `fake-key` 和无效示例地址。本次没有修改 Electron/TypeScript，因此未重复桌面生产构建。
+
+### 开发难点与评分
+
+整体难度：**7/10**。核心难点是决定历史读取、User 落库、Provider 调用、Assistant 落库和流式 `done` 的严格顺序，并对失败、取消、重启和长历史给出不夸大的确定语义。
+
+| 难点 | 难度 | 容易出现的问题 | 实现方式与证据 |
+|---|---:|---|---|
+| 数据库历史与模型输入区分 | 7/10 | 把当前 User 重复写入或重复发送；用裁剪后的上下文覆盖完整历史；不同 Session 串历史 | 调用前先读取旧记录，再独立追加当前 User，临时组装 Provider 输入；两轮、重启和 Session 隔离测试逐条断言 |
+| 流式完成与持久化顺序 | 8/10 | 先发 `done` 再写库，写库失败后 UI 显示成功但重启丢回答；每个 delta 都写库造成半条消息 | delta 只用于实时显示；完成事件先校验并保存完整 Assistant，成功后才 `done`；真实 HTTP/SSE→数据库测试验证 |
+| 失败与取消历史语义 | 7/10 | 模型失败却伪造 Assistant；部分流式文本被当作完整答案；失败时删除用户事实 | User 在调用前保存；只有完整成功 Reply 保存 Assistant；失败测试确认仅一条 User；部分回答恢复留到后续阶段 |
+| 跨页完整历史 | 6/10 | `history(limit=500)` 被误当完整上下文，长对话静默遗忘最早事实 | `complete_history()` 沿排他序号游标翻页并逆页恢复升序；501+1 条 Provider 输入测试验证 |
+| 兼容旧 Fake 测试与正式持久化 | 6/10 | 为避免坏配置落库而全局提前检查，导致不依赖真实配置的 Fake Provider 失效 | 仅持久化生产路径提前检查；无仓储模式继续由 Provider 决定；首次回归失败被保留为修复证据，最终 124 项通过 |
+
+### 岗位要求关联与实践证据
+
+- **小米职责1（任务接入、上下文管理、执行编排、结果回写）**：已实现桌面请求进入 Runtime、按 Session 加载历史、调用 Provider、先持久化再成功回写的单模型多轮链路；还没有工具执行、桌面 Session 管理、Token 预算或生产认证，不能宣称完整 Agent 链路全部完成。
+- **小米职责2及要求3（Sessions、上下文管理、Verification Loop）**：可以结合源码解释完整历史与模型上下文的边界、流式 `done` 前落库、重启恢复和失败语义，并有 Fake/SQLite/HTTP/SSE 分层测试；尚未实现 Gateway、双 Runtime、Sub-agent 或上下文压缩。
+- **小米职责6～7（稳定性、可观测性、成本与维护性）**：关键步骤包含中文文件/函数日志，request_id 写入消息元数据，错误不伪造成功回答；本阶段发送全部历史，尚未优化 Token 成本，也没有生产性能数据。
+- **字节用户增长职责1～2及质量 Agent 职责2～3**：具备可验证的多轮上下文构建、数据隔离、结果落库顺序和复用接口；没有自规划、任务拆解、多工具调用、多 Agent 协作或亿级 C 端证据。
+- **腾讯职责2～3及要求2、要求6**：实现短期会话 Memory 的读取和决策输入链路，并用重启、长历史、工具语义和失败测试做质量保障；长期记忆、Planning、Reflection、评测和成本体系仍未完成。
+
+### 面试可讲事实与边界
+
+- 可以表述：把 SQLite SessionStore 接入普通与流式 Agent 聊天链路，明确“完整历史”和“本轮 Provider 输入”边界；第二轮调用真实携带第一轮 User/Assistant，关闭后重启仍可继续。
+- 可以表述：设计流式一致性顺序——实时 delta 不逐块落库，完整响应校验后先事务保存 Assistant，再发成功 `done`；模型失败只保留真实 User，不制造 Assistant。
+- 可以表述：通过 501 条跨页历史、工具调用配对、重启、Session 隔离和真实 HTTP/SSE 测试验证；同时明确当前全量历史会带来 Token 上限风险。
+- 不可以表述：已经有 Token 裁剪/摘要、桌面会话管理、同 Session 串行队列、未完成 Run 恢复、长期记忆、工具执行、Multi-Agent 或生产级多租户。
+
+### 后续事项
+
+- 下一项严格执行 P02-04：将 `/api/sessions`、`/api/history` 和新建/打开/重命名/置顶/删除接到桌面真实界面，并明确单条删除和重新生成规则。
+- P02-05/P05 处理同 Session 并发串行、未结束 Run 的中断恢复和取消记录；当前并发请求可能读取彼此写入前的历史快照。
+- P05-04 才实现 Token 预算、完整轮次裁剪和摘要；当前 `SessionStore.context(token_budget=...)` 继续明确未实现，防止把“全部历史”伪装成安全预算上下文。

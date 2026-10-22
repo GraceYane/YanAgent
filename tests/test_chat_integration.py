@@ -128,7 +128,7 @@ class ChatApplicationTests(unittest.TestCase):
         self.assertEqual(saved.api_base, DEFAULT_API_BASE)
 
     def test_chat_returns_inline_reply_and_records_only_current_turn(self) -> None:
-        """普通聊天应返回非流式完整回答，且 P02 前只发送本次用户消息。"""
+        """未注入会话仓储的离线模式仍只发送本次用户消息。"""
         fake = FakeProvider([
             ModelReply(
                 content="你好，我是 YanAgent。",

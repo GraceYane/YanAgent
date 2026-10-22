@@ -187,7 +187,10 @@ class AgentRuntime:
         content: list[str] = []
         completed = False
         try:
-            async for event in prepared.provider.stream([prepared.message], tools=[]):
+            messages = await self.application.begin_chat(
+                prepared, request_id=record.request_id,
+            )
+            async for event in prepared.provider.stream(messages, tools=[]):
                 if event.kind == "text_delta":
                     content.append(event.content)
                     record.append("delta", {"content": event.content})
@@ -199,6 +202,9 @@ class AgentRuntime:
                         raise UnexpectedToolCallError()
                     if event.reply.content != "".join(content):
                         raise ModelResponseError()
+                    await self.application.finish_chat(
+                        prepared, event.reply, request_id=record.request_id,
+                    )
                     record.append("done", {
                         "content": event.reply.content,
                         "finish_reason": event.reply.finish_reason,
@@ -207,8 +213,8 @@ class AgentRuntime:
             if not completed:
                 raise EmptyModelResponseError()
             LOGGER.info(
-                "[streaming.py][AgentRuntime._run_stream] 流任务完成，request_id=%s，输出字符数=%d",
-                record.request_id, len("".join(content)),
+                "[streaming.py][AgentRuntime._run_stream] 流任务完成且回答已持久化，request_id=%s，上下文消息数=%d，输出字符数=%d",
+                record.request_id, len(messages), len("".join(content)),
             )
         except asyncio.CancelledError:
             if not record.terminal:
