@@ -8,6 +8,7 @@ from pathlib import Path
 
 from yanagent.contracts import Message, ToolCall
 from yanagent.errors import (
+    MessageNotFoundError,
     SessionAlreadyExistsError,
     SessionNotFoundError,
     SessionStorageError,
@@ -97,6 +98,17 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(pinned.pinned)
         self.assertEqual(pinned.metadata, {"source": "test"})
 
+    async def test_upsert_title_creates_missing_session_and_preserves_messages(self) -> None:
+        """自动标题可先于首条消息创建会话，后续更新不会覆盖已有消息。"""
+        created = await self.store.upsert_title("early", "首轮标题")
+        self.assertEqual(created.title, "首轮标题")
+        self.assertEqual(created.metadata, {"created_by": "desktop-title"})
+        await self.store.append("early", [Message(role="user", content="你好")])
+        updated = await self.store.upsert_title("early", "修改后的标题")
+        self.assertEqual(updated.title, "修改后的标题")
+        self.assertEqual(updated.message_count, 1)
+        self.assertEqual((await self.store.history("early"))[0].message.content, "你好")
+
     async def test_append_round_trips_complete_tool_messages(self) -> None:
         """消息往返必须保留工具调用对象、调用关联、元数据和失败语义。"""
         await self.store.create("s")
@@ -136,6 +148,49 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
         older = await self.store.history("s", limit=2, before_sequence=recent[0].sequence)
         self.assertEqual([item.sequence for item in recent], [3, 4])
         self.assertEqual([item.sequence for item in older], [1, 2])
+
+    async def test_desktop_history_can_expand_to_target_user_message(self) -> None:
+        """桌面历史可从当前页一次扩展到包含指定序号的更早页面。"""
+        await self.store.create("s")
+        await self.store.append(
+            "s", [Message(role="user", content=f"消息-{index}") for index in range(7)]
+        )
+        recent = await self.store.history_page("s", page=1, page_size=2)
+        expanded = await self.store.history_page(
+            "s", page=1, page_size=2, until_sequence=1,
+        )
+        self.assertEqual([item.sequence for item in recent.messages], [5, 6])
+        self.assertEqual([item.sequence for item in expanded.messages], [1, 2, 3, 4, 5, 6])
+        self.assertEqual(expanded.page, 3)
+        self.assertTrue(expanded.has_more)
+
+    async def test_user_index_and_turn_deletion_rules(self) -> None:
+        """用户索引只含用户消息，单轮删除与级联截断遵守明确边界。"""
+        await self.store.create("s")
+        await self.store.append("s", [
+            Message(role="user", content="第一问"),
+            Message(role="assistant", content="第一答"),
+            Message(role="user", content="第二问"),
+            Message(role="assistant", content="第二答"),
+            Message(role="user", content="第三问"),
+            Message(role="assistant", content="第三答"),
+        ])
+        index = await self.store.user_message_index("s")
+        self.assertEqual([item.sequence for item in index], [0, 2, 4])
+
+        deleted = await self.store.delete_turn("s", 2, cascade=False)
+        self.assertEqual(deleted, 2)
+        self.assertEqual(
+            [item.sequence for item in await self.store.history("s")], [0, 1, 4, 5]
+        )
+        deleted = await self.store.delete_turn("s", 4, cascade=True)
+        self.assertEqual(deleted, 2)
+        self.assertEqual(
+            [item.sequence for item in await self.store.history("s")], [0, 1]
+        )
+        self.assertEqual((await self.store.get("s")).message_count, 2)
+        with self.assertRaises(MessageNotFoundError):
+            await self.store.delete_turn("s", 1)
 
     async def test_append_failure_rolls_back_entire_batch(self) -> None:
         """批次第二条消息写入失败时，第一条和消息计数也必须回滚。"""

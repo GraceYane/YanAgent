@@ -281,7 +281,15 @@ class ApiClient {
        *  the conversation, this only changes who answers. */
       speakerAgentId?: string
     }
-  ): Promise<{ status: string; request_id: string; stream: boolean; inline_reply?: string; speaker?: string }> {
+  ): Promise<{
+    status: string
+    request_id: string
+    stream: boolean
+    inline_reply?: string
+    speaker?: string
+    user_seq?: number
+    bot_seq?: number
+  }> {
     // Route to a specific Agent when asked, else the active one. Empty (legacy
     // single-Agent) omits agent_id entirely, so the backend uses its default.
     const agentId = opts?.agentId || this.activeAgentId

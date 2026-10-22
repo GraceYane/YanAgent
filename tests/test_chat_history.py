@@ -71,6 +71,7 @@ class ChatHistoryTests(unittest.TestCase):
         )
 
         self.assertEqual(result["inline_reply"], "你叫张三。")
+        self.assertEqual((result["user_seq"], result["bot_seq"]), (2, 3))
         second_context = fake.calls[1].messages
         self.assertEqual(
             [(message.role, message.content) for message in second_context],
@@ -277,6 +278,7 @@ class ChatHistoryHttpTests(unittest.TestCase):
                 if line.startswith("data: ")
             ]
         self.assertEqual(events[-1]["type"], "done")
+        self.assertEqual((events[-1]["user_seq"], events[-1]["bot_seq"]), (0, 1))
 
         second = self._post({
             "session_id": "desktop-history",

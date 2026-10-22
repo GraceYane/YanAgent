@@ -131,6 +131,13 @@ class SessionStorageError(AgentError):
     retryable = True
 
 
+class MessageNotFoundError(AgentError):
+    """标识目标消息不存在、不是用户消息或不属于当前会话作用域。"""
+
+    code = "message_not_found"
+    message = "目标消息不存在或不属于当前会话。"
+
+
 class UnexpectedToolCallError(AgentError):
     """标识普通聊天收到工具请求，但工具循环尚未进入本阶段。"""
 

@@ -789,7 +789,13 @@ export const useChatStore = create<ChatState>((set, get) => {
           patchSession(sid, { requestId: res.request_id })
           attachStream(sid, res.request_id, botId)
         } else if (res.inline_reply) {
-          updateMsg(sid, botId, (m) => ({ ...m, content: res.inline_reply || '', isStreaming: false }))
+          updateMsg(sid, userMsg.id, (m) => ({ ...m, userSeq: res.user_seq ?? m.userSeq }))
+          updateMsg(sid, botId, (m) => ({
+            ...m,
+            content: res.inline_reply || '',
+            isStreaming: false,
+            botSeq: res.bot_seq ?? m.botSeq,
+          }))
           patchSession(sid, { isStreaming: false })
         } else {
           updateMsg(sid, botId, (m) => ({ ...m, error: 'send failed', isStreaming: false }))

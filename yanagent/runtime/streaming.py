@@ -7,19 +7,21 @@ import concurrent.futures
 import logging
 import threading
 import time
+from collections.abc import Coroutine
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeVar
 
 from yanagent.chat import PreparedChat, YanAgentApplication
 from yanagent.errors import (
     AgentError, EmptyModelResponseError, ModelResponseError, ModelTimeoutError,
-    UnexpectedToolCallError,
+    SessionStorageError, UnexpectedToolCallError,
 )
 from yanagent.events import ClientEventType, RunEvent
 
 
 LOGGER = logging.getLogger("yanagent.runtime")
 MAX_RUN_EVENTS = 20_000
+ResultType = TypeVar("ResultType")
 
 
 @dataclass
@@ -161,6 +163,25 @@ class AgentRuntime:
             future.cancel()
             raise ModelTimeoutError() from None
 
+    def execute(
+        self,
+        operation: Coroutine[Any, Any, ResultType],
+        *,
+        timeout: float = 10.0,
+    ) -> ResultType:
+        """在常驻循环执行短异步控制操作，供线程化 HTTP 会话接口复用。"""
+        try:
+            self._ensure_open()
+        except Exception:
+            operation.close()
+            raise
+        future = asyncio.run_coroutine_threadsafe(operation, self._loop)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise SessionStorageError() from None
+
     def start_stream(self, payload: dict[str, Any], *, request_id: str) -> dict[str, Any]:
         """校验后登记运行并调度流任务，立即返回供桌面端订阅的 request_id。"""
         self._ensure_open()
@@ -187,10 +208,10 @@ class AgentRuntime:
         content: list[str] = []
         completed = False
         try:
-            messages = await self.application.begin_chat(
+            context = await self.application.begin_chat(
                 prepared, request_id=record.request_id,
             )
-            async for event in prepared.provider.stream(messages, tools=[]):
+            async for event in prepared.provider.stream(context.messages, tools=[]):
                 if event.kind == "text_delta":
                     content.append(event.content)
                     record.append("delta", {"content": event.content})
@@ -202,19 +223,21 @@ class AgentRuntime:
                         raise UnexpectedToolCallError()
                     if event.reply.content != "".join(content):
                         raise ModelResponseError()
-                    await self.application.finish_chat(
+                    assistant_sequence = await self.application.finish_chat(
                         prepared, event.reply, request_id=record.request_id,
                     )
                     record.append("done", {
                         "content": event.reply.content,
                         "finish_reason": event.reply.finish_reason,
                         "usage": event.reply.usage,
+                        "user_seq": context.user_sequence,
+                        "bot_seq": assistant_sequence,
                     })
             if not completed:
                 raise EmptyModelResponseError()
             LOGGER.info(
                 "[streaming.py][AgentRuntime._run_stream] 流任务完成且回答已持久化，request_id=%s，上下文消息数=%d，输出字符数=%d",
-                record.request_id, len(messages), len("".join(content)),
+                record.request_id, len(context.messages), len("".join(content)),
             )
         except asyncio.CancelledError:
             if not record.terminal:

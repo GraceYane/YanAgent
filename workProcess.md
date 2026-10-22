@@ -861,3 +861,80 @@ Electron/React chatStore
 - 下一项严格执行 P02-04：将 `/api/sessions`、`/api/history` 和新建/打开/重命名/置顶/删除接到桌面真实界面，并明确单条删除和重新生成规则。
 - P02-05/P05 处理同 Session 并发串行、未结束 Run 的中断恢复和取消记录；当前并发请求可能读取彼此写入前的历史快照。
 - P05-04 才实现 Token 预算、完整轮次裁剪和摘要；当前 `SessionStore.context(token_budget=...)` 继续明确未实现，防止把“全部历史”伪装成安全预算上下文。
+
+## 2026-10-22：P02-04 桌面会话联调
+
+### 需求
+
+按照 `docs/DEVELOPMENT_REQUIREMENTS.md` 和最新 `AGENTS.md` 完成 P02-04：把复制桌面的会话列表、历史、用户消息索引、重命名、置顶、删除和自动标题接口接到 YanAgent 自己的 SQLite；明确单轮删除、重新生成和后续上下文之间的规则，并让刚完成的实时消息立即具有数据库序号。
+
+### 实际完成内容
+
+- 新增 `DesktopSessionService`，作为桌面 JSON 契约与内部 `SessionStore` 之间的适配层。会话列表返回标题、置顶、消息数、创建/最后活动时间和 default Agent 标识；SQLite 毫秒时间戳在接口边界转换为桌面使用的秒。
+- 将 `GET /api/sessions` 从固定空数组接到真实分页仓储，保留复制桌面发送的 `scope=all`；当前只允许 `agent_id=default`，不会把其他 Agent 标识静默映射到默认会话。
+- 接通 `GET /api/history`。页码从最新一页开始，页内仍按消息发生顺序排列；`until_seq` 会把响应一次扩展到包含目标序号的更早页面，并返回实际到达的页码，支持桌面时间线直接跳转旧消息。
+- 接通 `GET /api/history/user_messages`，只返回 User Message 的稳定序号、折叠空白后的预览和时间，避免为导航时间线传输全部 Assistant 正文。
+- 接通 `PUT /api/sessions/{id}` 的重命名/置顶和 `DELETE /api/sessions/{id}` 的会话删除。删除前请求取消该 Session 的活动 Run，数据库依赖复合外键级联删除消息。
+- 接通 `POST /api/sessions/{id}/generate_title`。标题从首条用户消息确定性生成，不额外消耗模型调用；`upsert_title()` 使用立即事务处理“标题请求先到、聊天建会话后到”的真实竞态，后续聊天不会覆盖标题。
+- 接通 `POST /api/messages/delete`。目标必须是 User Message 的 `_seq`：`cascade=false` 删除这一轮，保留下一条 User 开始的后续轮次；`cascade=true` 从目标 User 截断到末尾。复制桌面的删除与重新生成都使用级联规则，避免保留已经受被删输入影响的后续回答。
+- 普通和流式聊天现在保存 User 后记录 `user_seq`，保存 Assistant 后记录 `bot_seq`；成功普通响应和 SSE `done` 均在消息落库后返回两个真实序号。刚生成的气泡无需先刷新历史即可准确执行删除/重新生成。
+- Assistant 的 Usage 同步放入消息元数据，历史适配层可恢复 `usage`；已有 ToolCall 继续按完整内部对象还原。P03/P04 未实现前没有声称能执行新工具调用。
+- 新增会话/消息不存在的稳定错误映射：错误用户序号或用 Assistant 序号删除返回 `message_not_found` 与 HTTP 404；非法分页/字段返回 400；仓储故障不回显 SQL 或正文。
+- 新增 `docs/P02_04_DESKTOP_SESSIONS.md`，记录接口、分页示例、自动标题竞态、删除/重新生成规则和未完成边界；同步 README、需求、路线和岗位映射，P02-04 标记完成，下一项为 P02-05。
+
+### 涉及文件
+
+- 桌面会话接口：`app.py`
+- 桌面契约适配：`yanagent/sessions/desktop.py`、`yanagent/sessions/__init__.py`
+- 会话分页、索引、自动标题与删除事务：`yanagent/sessions/store.py`
+- 实时消息序号与 Usage：`yanagent/chat.py`、`yanagent/runtime/streaming.py`、`desktop/src/renderer/src/api/client.ts`、`desktop/src/renderer/src/store/chatStore.ts`
+- 统一错误：`yanagent/errors.py`
+- 自动化测试：`tests/test_session_store.py`、`tests/test_desktop_sessions.py`、`tests/test_chat_history.py`
+- 实现说明：`docs/P02_04_DESKTOP_SESSIONS.md`
+- 状态与导航：`README.md`、`docs/DEVELOPMENT_REQUIREMENTS.md`、`docs/IMPLEMENTATION_ROADMAP.md`、`docs/TARGET_ROLES.md`
+- 开发记录：`workProcess.md`
+
+### 验证结果
+
+- 定向执行仓储、桌面 HTTP、聊天历史、聊天接口和流式 Runtime 共 40 项测试，全部通过。
+- 新增 6 项独立测试：3 项仓储行为、3 项真实回环 HTTP 桌面联调；另在已有历史测试增加普通响应和 SSE `done` 的落库序号断言。
+- 会话列表测试验证真实消息数、秒时间戳和桌面字段；历史测试验证 6 条消息的最新页 `[4,5]`、`until_seq=0` 扩展为 `[0..5]`、响应页码为 3；用户索引只返回序号 `[0,2,4]`。
+- 管理动作测试验证重命名、置顶、标题先创建空 Session、整会话删除及删除后的 404；消息删除测试验证从序号 2 级联删除 4 条，只留下 `[0,1]`，并验证 Assistant 序号拒绝为 `message_not_found`。
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m unittest discover -s tests -q`：最终全量 130 项测试通过，本次最终运行 8.142 秒；耗时仅为本机单次记录，不作为性能结论。测试只使用本机线程和 `127.0.0.1` 回环，不访问公网。
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m compileall -q -f app.py yanagent tests examples scripts`：通过；`git diff --check`：通过，仅提示 Windows 工作区既有 LF→CRLF 转换信息。
+- `desktop/npm run build`：通过，Renderer 共转换 2152 个模块且 Main TypeScript 编译成功。Vite 提示既有字体在运行时解析、Browserslist 数据较旧、主 chunk 较大；这些是非阻断警告，本次没有据此声称前端性能已优化。
+- 最初在受限沙箱内执行 Windows asyncio 测试时卡在创建本机 socketpair；在允许本机回环资源的受控环境复跑后定向和全量测试均通过。该现象是测试执行环境限制，不作为产品功能缺陷或通过证据跳过。
+
+### 开发难点与评分
+
+整体难度：**8/10**。本阶段表面是补几个 HTTP 接口，真实难点是同时对齐桌面的分页方向、实时消息序号、自动标题竞态和删除后的上下文因果关系，并保持所有操作仍走同一份 SessionStore。
+
+| 难点 | 难度 | 容易出现的问题 | 实现方式与证据 |
+|---|---:|---|---|
+| 历史分页与时间线跳转 | 7/10 | 数据库按升序存储，界面却把第 1 页定义为最新；翻页时重复消息；跳到旧消息只加载目标页导致中间断层 | Store 先确定最新页边界，再恢复页内升序；`until_seq` 计算目标所在的最新向前页并返回连续区间；`[4,5]` 与 `[0..5]` HTTP 测试验证 |
+| 删除/重新生成的上下文一致性 | 8/10 | 只删屏幕气泡不删数据库；删掉中间问题却保留受它影响的后续回答；用数组下标误删 | 使用稳定 User `_seq` 定位；明确单轮与级联两种事务规则；桌面删除/重新生成统一级联；消息数量同事务扣减并用数据库历史断言 |
+| 实时响应与数据库序号关联 | 7/10 | 新消息只有临时 UI ID，刷新前无法删除；在 Assistant 落库前就发 `done`，返回虚假序号 | `begin_chat` 返回 User 序号，`finish_chat` 返回 Assistant 序号；落库成功后普通/SSE 才回写；两条历史测试分别验证 `(0,1)` 和 `(2,3)` |
+| 首轮自动标题竞态 | 7/10 | 桌面标题请求先于聊天建会话而 404；两条创建路径互相覆盖标题或消息 | `INSERT ... ON CONFLICT DO UPDATE` 放在立即事务；缺失时建空会话，存在时只更新标题；测试证明随后追加消息和再次改标题不丢数据 |
+| 线程 HTTP 与异步仓储桥接 | 6/10 | 每个请求使用 `asyncio.run` 建不同循环；关闭时产生悬空任务；控制接口卡死无期限等待 | `AgentRuntime.execute()` 把短控制协程提交到进程唯一常驻循环，设置有限等待并统一映射仓储错误；全量 HTTP/Runtime 回归通过 |
+
+### 岗位要求关联与实践证据
+
+- **小米职责1～2（任务接入、上下文管理、结果回写、Sessions/Gateway 思路）**：本阶段形成桌面请求→HTTP 校验→常驻 Runtime→SessionStore→桌面 JSON 的真实会话管理链路，并解决标题竞态、历史分页和实时序号；仍是单机 default Agent，没有云端 Runtime、多 Agent Gateway 或生产认证。
+- **小米职责6～7（稳定性、可观测性、成本与维护性）**：确定性标题避免额外模型 Token；删除与计数同事务；错误码和中文文件/函数日志支持定位；未做生产压测、成本仪表盘或性能提升测量。
+- **小米要求3（上下文管理、Verification Loop 实践）**：可讲述为什么重新生成必须截断受旧输入影响的后续上下文，以及如何用真实 HTTP→SQLite 断言验证；Token 预算、摘要、同 Session 排队仍未实现。
+- **字节用户增长职责1～2、质量 Agent 职责2～3（任务链路、上下文准确、执行管控和可复用框架）**：稳定序号、历史扩页、删除语义、统一适配服务和 130 项回归是工程化证据；没有自规划、任务拆解、多工具编排、需求到代码生成或亿级用户规模证据。
+- **腾讯职责2～3及要求1～2/6（Memory、质量保障、系统思维）**：实现的是同 Session 短期 Memory 的产品读取/修改闭环，并用竞态、分页、错误和删除测试保障；不等于长期 Memory、Reflection、RAG、系统 Benchmark 或性能成本体系。
+- **岗位通用 Coding Agent 实践**：本阶段在保持既有桌面 TypeScript 契约不变的情况下补 Python 后端，使用专项文档、确定性 Fake/SQLite/HTTP 测试和全量回归构成 Verification Loop；没有修改或声称贡献 Claude Code/Codex/Cursor 本身。
+
+### 面试可讲事实与边界
+
+- 可以表述：为自研 Agent Runtime 接通桌面 Session 管理，支持真实 SQLite 会话列表、最新页历史分页、用户消息索引、重命名、置顶、删除和自动标题；设计 `until_seq` 连续扩页支持时间线跳转。
+- 可以表述：用稳定消息序号实现单轮删除和级联截断；桌面重新生成先删除目标问题及后续上下文再重发，避免保留已受旧输入影响的回答；普通/SSE 完成事件携带真实落库序号。
+- 可以表述：处理首轮标题与聊天建会话的并发先后问题，使用原子 upsert；通过真实回环 HTTP 和全量 130 项测试验证接口到数据库闭环。
+- 不可以表述：已经完成多租户认证、同 Session 串行调度、未结束 Run 崩溃恢复、Token 压缩、长期记忆、工具循环、Multi-Agent 或生产性能优化；这些属于 P02-05、P03～P05、P09～P10。
+
+### 后续事项
+
+- 下一项严格执行 P02-05：加强 `user_id + agent_id + session_id` 的接口级归属验证，验证并发写入边界，并在启动时将上次未结束的 Run 标记为 interrupted。
+- P05-02 再实现同一 Session 默认排队、不同 Session 并行的完整 Bridge 策略；P02-04 的存储事务不等于 Run 调度已经串行。
+- P05-04 实现 Token 预算、完整轮次裁剪和摘要；P02-04 历史接口始终展示完整记录，不用物理删除冒充上下文压缩。

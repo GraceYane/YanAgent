@@ -9,18 +9,20 @@ import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, cast
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from yanagent.chat import ProviderFactory, YanAgentApplication, ensure_application_ready
 from yanagent.config import ConfigStore
 from yanagent.errors import (
     AgentError, AuthenticationError, ConfigurationError, InvalidRequestError,
+    MessageNotFoundError,
     ModelConnectionError, ModelNotFoundError, ModelRefusalError, ModelResponseError,
     ModelServerError, ModelTimeoutError, PermissionDeniedError, RateLimitError,
-    RequestValidationError, UnexpectedToolCallError,
+    RequestValidationError, SessionAlreadyExistsError, SessionNotFoundError,
+    SessionStorageError, SessionValidationError, UnexpectedToolCallError,
 )
 from yanagent.runtime import AgentRuntime
-from yanagent.sessions import SessionStore
+from yanagent.sessions import DesktopSessionService, SessionStore
 from yanagent.storage import Database
 
 
@@ -37,7 +39,7 @@ def health_payload() -> dict[str, str]:
 
 
 def empty_sessions_payload() -> dict[str, Any]:
-    """返回 P02-04 桌面 Session API 接入前使用的空会话分页结构。"""
+    """为未注入数据库的离线测试模式返回空会话分页结构。"""
     return {
         "status": "success", "sessions": [], "total": 0, "page": 1,
         "page_size": 50, "has_more": False, "group_mode": "time", "project_order": [],
@@ -46,14 +48,18 @@ def empty_sessions_payload() -> dict[str, Any]:
 
 def _http_status(error: AgentError) -> HTTPStatus:
     """将内部稳定错误类型映射为 HTTP 状态，正文仍使用统一错误对象。"""
-    if isinstance(error, (RequestValidationError, ConfigurationError, InvalidRequestError)):
+    if isinstance(error, (
+        RequestValidationError, ConfigurationError, InvalidRequestError, SessionValidationError,
+    )):
         return HTTPStatus.BAD_REQUEST
     if isinstance(error, AuthenticationError):
         return HTTPStatus.UNAUTHORIZED
     if isinstance(error, PermissionDeniedError):
         return HTTPStatus.FORBIDDEN
-    if isinstance(error, ModelNotFoundError):
+    if isinstance(error, (ModelNotFoundError, MessageNotFoundError, SessionNotFoundError)):
         return HTTPStatus.NOT_FOUND
+    if isinstance(error, SessionAlreadyExistsError):
+        return HTTPStatus.CONFLICT
     if isinstance(error, RateLimitError):
         return HTTPStatus.TOO_MANY_REQUESTS
     if isinstance(error, ModelTimeoutError):
@@ -64,6 +70,8 @@ def _http_status(error: AgentError) -> HTTPStatus:
         ModelConnectionError, ModelResponseError, ModelServerError, UnexpectedToolCallError,
     )):
         return HTTPStatus.BAD_GATEWAY
+    if isinstance(error, SessionStorageError):
+        return HTTPStatus.INTERNAL_SERVER_ERROR
     return HTTPStatus.INTERNAL_SERVER_ERROR
 
 
@@ -79,6 +87,11 @@ class YanAgentHTTPServer(ThreadingHTTPServer):
         """保存应用和数据库服务，并启动唯一常驻异步运行环境。"""
         self.application = application
         self.database = database
+        self.session_service = (
+            DesktopSessionService(application.session_store)
+            if application.session_store is not None
+            else None
+        )
         super().__init__(server_address, YanAgentHandler)
         self.runtime = AgentRuntime(application)
 
@@ -103,6 +116,67 @@ class YanAgentHandler(BaseHTTPRequestHandler):
     def runtime(self) -> AgentRuntime:
         """获取该进程唯一的常驻异步运行环境。"""
         return cast(YanAgentHTTPServer, self.server).runtime
+
+    @property
+    def session_service(self) -> DesktopSessionService | None:
+        """获取桌面会话适配服务；无数据库测试模式下返回空。"""
+        return cast(YanAgentHTTPServer, self.server).session_service
+
+    def _query_text(
+        self,
+        query: dict[str, list[str]],
+        field: str,
+        *,
+        required: bool = False,
+        maximum: int = 256,
+    ) -> str | None:
+        """读取单值查询参数，拒绝重复、空必填值和异常长度。"""
+        values = query.get(field, [])
+        if not values:
+            if required:
+                raise RequestValidationError(reason="missing", field=field)
+            return None
+        if len(values) != 1 or not values[0] or len(values[0]) > maximum:
+            raise RequestValidationError(reason="invalid", field=field)
+        return values[0]
+
+    def _query_int(
+        self,
+        query: dict[str, list[str]],
+        field: str,
+        *,
+        default: int | None = None,
+        minimum: int = 0,
+    ) -> int | None:
+        """读取十进制整数查询参数，拒绝重复值和越界值。"""
+        value = self._query_text(query, field)
+        if value is None:
+            return default
+        try:
+            parsed = int(value)
+        except ValueError:
+            raise RequestValidationError(reason="invalid", field=field) from None
+        if str(parsed) != value or parsed < minimum:
+            raise RequestValidationError(reason="invalid", field=field)
+        return parsed
+
+    def _validate_agent(self, value: Any, *, field: str = "agent_id") -> None:
+        """限制桌面请求只能访问当前阶段唯一的 default Agent。"""
+        if value not in (None, "", "default"):
+            raise RequestValidationError(reason="unsupported", field=field)
+
+    def _session_id_from_path(self, path: str, *, suffix: str = "") -> str:
+        """从会话资源路径解码标识，并拒绝空标识或多余子路径。"""
+        prefix = "/api/sessions/"
+        if not path.startswith(prefix) or (suffix and not path.endswith(suffix)):
+            raise RequestValidationError(reason="invalid", field="session_id")
+        raw = path[len(prefix):]
+        if suffix:
+            raw = raw[:-len(suffix)]
+        value = unquote(raw)
+        if not value or "/" in value:
+            raise RequestValidationError(reason="invalid", field="session_id")
+        return value
 
     def log_message(self, fmt: str, *args: object) -> None:
         """将标准库访问日志统一为包含文件和函数的中文可检索格式。"""
@@ -196,7 +270,7 @@ class YanAgentHandler(BaseHTTPRequestHandler):
         self._json({"status": "ok"})
 
     def do_GET(self) -> None:  # noqa: N802 - 标准库处理器约定的方法名
-        """处理 SSE、健康、模型配置及仍为骨架状态的只读接口。"""
+        """处理 SSE、健康、模型配置以及桌面会话和历史只读接口。"""
         parsed = urlparse(self.path)
         path = parsed.path
         try:
@@ -220,13 +294,51 @@ class YanAgentHandler(BaseHTTPRequestHandler):
                 })
                 return
             if path == "/api/sessions":
-                self._json(empty_sessions_payload())
+                if self.session_service is None:
+                    self._json(empty_sessions_payload())
+                    return
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                self._validate_agent(self._query_text(query, "agent_id"))
+                scope = self._query_text(query, "scope")
+                if scope not in (None, "all"):
+                    raise RequestValidationError(reason="unsupported", field="scope")
+                page = self._query_int(query, "page", default=1, minimum=1)
+                page_size = self._query_int(query, "page_size", default=50, minimum=1)
+                self._json(self.runtime.execute(self.session_service.list_sessions(
+                    page=cast(int, page), page_size=cast(int, page_size),
+                )))
+                return
+            if path == "/api/history/user_messages":
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                session_id = self._query_text(query, "session_id", required=True)
+                self._validate_agent(self._query_text(query, "agent_id"))
+                if self.session_service is None:
+                    self._json({"status": "success", "messages": [], "total": 0})
+                    return
+                self._json(self.runtime.execute(
+                    self.session_service.user_messages(cast(str, session_id))
+                ))
                 return
             if path == "/api/history":
-                self._json({
-                    "status": "success", "messages": [], "total": 0, "page": 1,
-                    "page_size": 20, "has_more": False,
-                })
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                session_id = self._query_text(query, "session_id", required=True)
+                self._validate_agent(self._query_text(query, "agent_id"))
+                page = self._query_int(query, "page", default=1, minimum=1)
+                page_size = self._query_int(query, "page_size", default=20, minimum=1)
+                until_sequence = self._query_int(query, "until_seq", minimum=0)
+                if self.session_service is None:
+                    self._json({
+                        "status": "success", "messages": [], "total": 0,
+                        "page": cast(int, page), "page_size": cast(int, page_size),
+                        "has_more": False,
+                    })
+                    return
+                self._json(self.runtime.execute(self.session_service.history(
+                    cast(str, session_id),
+                    page=cast(int, page),
+                    page_size=cast(int, page_size),
+                    until_sequence=until_sequence,
+                )))
                 return
             if path == "/api/menu":
                 self._json({"status": "success", "menu": None})
@@ -259,7 +371,7 @@ class YanAgentHandler(BaseHTTPRequestHandler):
             self._error(error)
 
     def do_POST(self) -> None:  # noqa: N802 - 标准库处理器约定的方法名
-        """处理配置保存、模型动作、普通/流式消息及取消请求。"""
+        """处理配置、模型、聊天、取消以及桌面标题和消息删除请求。"""
         path = urlparse(self.path).path
         request_id: str | None = None
         try:
@@ -276,6 +388,54 @@ class YanAgentHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/models":
                 self._json(self.application.save_model_action(payload))
+                return
+            if path.startswith("/api/sessions/") and path.endswith("/generate_title"):
+                if self.session_service is None:
+                    raise SessionStorageError()
+                allowed = {"user_message", "assistant_reply", "agent_id"}
+                if any(type(key) is not str or key not in allowed for key in payload):
+                    raise RequestValidationError(reason="unknown_field", field="body")
+                self._validate_agent(payload.get("agent_id"))
+                user_message = payload.get("user_message")
+                if (
+                    type(user_message) is not str
+                    or not user_message.strip()
+                    or len(user_message) > 200_000
+                ):
+                    raise RequestValidationError(reason="invalid", field="user_message")
+                assistant_reply = payload.get("assistant_reply")
+                if assistant_reply is not None and type(assistant_reply) is not str:
+                    raise RequestValidationError(reason="invalid", field="assistant_reply")
+                session_id = self._session_id_from_path(path, suffix="/generate_title")
+                self._json(self.runtime.execute(self.session_service.generate_title(
+                    session_id, user_message,
+                )))
+                return
+            if path == "/api/messages/delete":
+                if self.session_service is None:
+                    raise SessionStorageError()
+                allowed = {"session_id", "user_seq", "delete_user", "cascade", "agent_id"}
+                if any(type(key) is not str or key not in allowed for key in payload):
+                    raise RequestValidationError(reason="unknown_field", field="body")
+                self._validate_agent(payload.get("agent_id"))
+                session_id = payload.get("session_id")
+                user_sequence = payload.get("user_seq")
+                delete_user = payload.get("delete_user", True)
+                cascade = payload.get("cascade", False)
+                if type(session_id) is not str or not session_id or len(session_id) > 256:
+                    raise RequestValidationError(reason="invalid", field="session_id")
+                if type(user_sequence) is not int or user_sequence < 0:
+                    raise RequestValidationError(reason="invalid", field="user_seq")
+                if type(delete_user) is not bool:
+                    raise RequestValidationError(reason="invalid", field="delete_user")
+                if type(cascade) is not bool:
+                    raise RequestValidationError(reason="invalid", field="cascade")
+                self._json(self.runtime.execute(self.session_service.delete_messages(
+                    session_id,
+                    user_sequence,
+                    delete_user=delete_user,
+                    cascade=cascade,
+                )))
                 return
             if path == "/poll":
                 self._json({"status": "success", "has_content": False})
@@ -307,6 +467,68 @@ class YanAgentHandler(BaseHTTPRequestHandler):
             }, HTTPStatus.NOT_IMPLEMENTED)
         except AgentError as error:
             self._error(error, request_id=request_id)
+
+    def do_PUT(self) -> None:  # noqa: N802 - 标准库处理器约定的方法名
+        """处理桌面会话重命名和置顶状态修改。"""
+        path = urlparse(self.path).path
+        try:
+            if not path.startswith("/api/sessions/") or path.endswith("/generate_title"):
+                self._json({
+                    "status": "not_implemented",
+                    "message": f"Scaffold endpoint not implemented: PUT {path}",
+                }, HTTPStatus.NOT_IMPLEMENTED)
+                return
+            if self.session_service is None:
+                raise SessionStorageError()
+            payload = self._body()
+            allowed = {"title", "pinned", "agent_id"}
+            if any(type(key) is not str or key not in allowed for key in payload):
+                raise RequestValidationError(reason="unknown_field", field="body")
+            self._validate_agent(payload.get("agent_id"))
+            has_title = "title" in payload
+            has_pinned = "pinned" in payload
+            if not has_title and not has_pinned:
+                raise RequestValidationError(reason="missing", field="body")
+            session_id = self._session_id_from_path(path)
+            result: dict[str, Any] = {"status": "success"}
+            if has_title:
+                title = payload["title"]
+                if type(title) is not str:
+                    raise RequestValidationError(reason="invalid", field="title")
+                result.update(self.runtime.execute(
+                    self.session_service.rename(session_id, title)
+                ))
+            if has_pinned:
+                pinned = payload["pinned"]
+                if type(pinned) is not bool:
+                    raise RequestValidationError(reason="invalid", field="pinned")
+                result.update(self.runtime.execute(
+                    self.session_service.set_pinned(session_id, pinned)
+                ))
+            self._json(result)
+        except AgentError as error:
+            self._error(error)
+
+    def do_DELETE(self) -> None:  # noqa: N802 - 标准库处理器约定的方法名
+        """取消会话活动运行后删除桌面会话及其全部持久化消息。"""
+        parsed = urlparse(self.path)
+        path = parsed.path
+        try:
+            if not path.startswith("/api/sessions/"):
+                self._json({
+                    "status": "not_implemented",
+                    "message": f"Scaffold endpoint not implemented: DELETE {path}",
+                }, HTTPStatus.NOT_IMPLEMENTED)
+                return
+            if self.session_service is None:
+                raise SessionStorageError()
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            self._validate_agent(self._query_text(query, "agent_id"))
+            session_id = self._session_id_from_path(path)
+            self.runtime.cancel(session_id=session_id)
+            self._json(self.runtime.execute(self.session_service.delete(session_id)))
+        except AgentError as error:
+            self._error(error)
 
 
 def create_server(
@@ -360,7 +582,7 @@ def main() -> None:
         database_info.path,
     )
     LOGGER.info(
-        "[app.py][main] 当前能力：P01 单模型聊天；P02-03 会话持久化与完整历史上下文"
+        "[app.py][main] 当前能力：P01 单模型聊天；P02-04 会话持久化、完整历史与桌面管理"
     )
     try:
         server.serve_forever(poll_interval=0.25)

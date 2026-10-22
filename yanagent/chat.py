@@ -40,6 +40,14 @@ class PreparedChat:
     provider: ModelProvider
 
 
+@dataclass(frozen=True)
+class ChatContext:
+    """本轮模型输入及已落库用户消息序号，供完成事件关联桌面气泡。"""
+
+    messages: list[Message]
+    user_sequence: int | None
+
+
 def _require_text(
     payload: dict[str, Any], field: str, *, maximum: int = 256, allow_multiline: bool = False,
 ) -> str:
@@ -270,14 +278,16 @@ class YanAgentApplication:
             prepared.config.model_provider,
             prepared.config.model or "<未配置>",
         )
-        messages = await self.begin_chat(prepared, request_id=request_id)
-        reply = await prepared.provider.complete(messages, tools=[])
+        context = await self.begin_chat(prepared, request_id=request_id)
+        reply = await prepared.provider.complete(context.messages, tools=[])
         if reply.tool_calls:
             raise UnexpectedToolCallError()
-        await self.finish_chat(prepared, reply, request_id=request_id)
+        assistant_sequence = await self.finish_chat(
+            prepared, reply, request_id=request_id,
+        )
         LOGGER.info(
             "[chat.py][YanAgentApplication.chat] 普通聊天请求完成，request_id=%s，上下文消息数=%d，输出字符数=%d",
-            request_id, len(messages), len(reply.content),
+            request_id, len(context.messages), len(reply.content),
         )
         return {
             "status": "success",
@@ -288,12 +298,14 @@ class YanAgentApplication:
             "received_session_id": prepared.session_id,
             "finish_reason": reply.finish_reason,
             "usage": reply.usage,
+            "user_seq": context.user_sequence,
+            "bot_seq": assistant_sequence,
         }
 
     async def begin_chat(
         self, prepared: PreparedChat, *, request_id: str
-    ) -> list[Message]:
-        """加载完整历史并先持久化用户消息，返回本轮发送给 Provider 的上下文。"""
+    ) -> ChatContext:
+        """加载完整历史并先持久化用户消息，返回模型上下文及用户消息序号。"""
         current = Message(
             role="user",
             content=prepared.message.content,
@@ -304,13 +316,13 @@ class YanAgentApplication:
                 "[chat.py][YanAgentApplication.begin_chat] 未注入会话仓储，使用无状态测试模式，request_id=%s",
                 request_id,
             )
-            return [current]
+            return ChatContext(messages=[current], user_sequence=None)
         # 生产持久化链路在落库前先拒绝缺失配置，避免留下从未调用模型的消息。
         # 无仓储的离线 Fake Provider 模式由 Provider 自己决定是否要求配置。
         prepared.config.require_model_ready()
         await self._ensure_session(prepared.session_id)
         stored = await self.session_store.complete_history(prepared.session_id)
-        await self.session_store.append(prepared.session_id, [current])
+        current_records = await self.session_store.append(prepared.session_id, [current])
         messages = [record.message for record in stored] + [current]
         LOGGER.info(
             "[chat.py][YanAgentApplication.begin_chat] 历史已装入模型上下文且用户消息已落库，request_id=%s，session_id=%s，历史消息数=%d",
@@ -318,22 +330,27 @@ class YanAgentApplication:
             prepared.session_id,
             len(stored),
         )
-        return messages
+        return ChatContext(
+            messages=messages,
+            user_sequence=current_records[0].sequence,
+        )
 
     async def finish_chat(
         self, prepared: PreparedChat, reply: ModelReply, *, request_id: str
-    ) -> None:
-        """在回答对外标记完成前保存完整 Assistant 消息。"""
+    ) -> int | None:
+        """在回答对外标记完成前保存完整 Assistant 消息并返回稳定序号。"""
         if self.session_store is None:
-            return
+            return None
         assistant = reply.to_message()
         assistant.metadata["request_id"] = request_id
-        await self.session_store.append(prepared.session_id, [assistant])
+        assistant.metadata["usage"] = reply.usage
+        records = await self.session_store.append(prepared.session_id, [assistant])
         LOGGER.info(
             "[chat.py][YanAgentApplication.finish_chat] Assistant 完整回答已落库，request_id=%s，session_id=%s",
             request_id,
             prepared.session_id,
         )
+        return records[0].sequence
 
     async def _ensure_session(self, session_id: str) -> None:
         """保证目标会话存在，并处理并发首次创建造成的重复竞态。"""

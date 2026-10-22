@@ -15,6 +15,7 @@ from typing import Any
 from yanagent.contracts import ContractValidationError, Message
 from yanagent.errors import (
     AgentError,
+    MessageNotFoundError,
     SessionAlreadyExistsError,
     SessionNotFoundError,
     SessionStorageError,
@@ -66,6 +67,17 @@ class StoredMessage:
     sequence: int
     created_at: int
     message: Message
+
+
+@dataclass(frozen=True, slots=True)
+class MessagePage:
+    """桌面历史分页结果；第一页是最近消息，页内保持时间升序。"""
+
+    messages: list[StoredMessage]
+    total: int
+    page: int
+    page_size: int
+    has_more: bool
 
 
 def _identifier(value: str) -> str:
@@ -178,6 +190,14 @@ class SessionStore:
             int(pinned),
         )
 
+    async def upsert_title(self, session_id: str, title: str) -> SessionRecord:
+        """写入首轮自动标题；会话尚未创建时原子建立空会话。"""
+        return await asyncio.to_thread(
+            self._upsert_title_sync,
+            _identifier(session_id),
+            _title(title, allow_empty=False),
+        )
+
     async def append(
         self, session_id: str, messages: Sequence[Message]
     ) -> list[StoredMessage]:
@@ -234,6 +254,60 @@ class SessionStore:
             len(records),
         )
         return records
+
+    async def history_page(
+        self,
+        session_id: str,
+        *,
+        page: int = 1,
+        page_size: int = 20,
+        until_sequence: int | None = None,
+    ) -> MessagePage:
+        """读取桌面历史页；可一次扩展到包含指定消息序号的更早页面。"""
+        selected_id = _identifier(session_id)
+        if type(page) is not int or page < 1:
+            raise SessionValidationError()
+        if type(page_size) is not int or not 1 <= page_size <= MAX_PAGE_SIZE:
+            raise SessionValidationError()
+        if until_sequence is not None and (
+            type(until_sequence) is not int or until_sequence < 0
+        ):
+            raise SessionValidationError()
+        return await asyncio.to_thread(
+            self._history_page_sync,
+            selected_id,
+            page,
+            page_size,
+            until_sequence,
+        )
+
+    async def user_message_index(self, session_id: str) -> list[StoredMessage]:
+        """读取全部用户消息的轻量索引来源，供桌面时间线定位。"""
+        return await asyncio.to_thread(
+            self._user_message_index_sync,
+            _identifier(session_id),
+        )
+
+    async def delete_turn(
+        self,
+        session_id: str,
+        user_sequence: int,
+        *,
+        delete_user: bool = True,
+        cascade: bool = False,
+    ) -> int:
+        """按用户消息删除当前轮；级联模式同时删除其后的全部上下文。"""
+        if type(user_sequence) is not int or user_sequence < 0:
+            raise SessionValidationError()
+        if type(delete_user) is not bool or type(cascade) is not bool:
+            raise SessionValidationError()
+        return await asyncio.to_thread(
+            self._delete_turn_sync,
+            _identifier(session_id),
+            user_sequence,
+            delete_user,
+            cascade,
+        )
 
     async def context(self, session_id: str, *, token_budget: int) -> list[Message]:
         """P05-04 才实现 Token 预算裁剪；P02-03 使用完整历史组装模型输入。"""
@@ -342,6 +416,37 @@ class SessionStore:
             "[store.py][SessionStore._update_session_sync] 会话属性已更新，session_id=%s，field=%s",
             session_id,
             field,
+        )
+        return self._session_from_row(row)
+
+    def _upsert_title_sync(self, session_id: str, title: str) -> SessionRecord:
+        """原子写入自动标题，并兼容标题请求早于首条消息落库的竞态。"""
+        timestamp = self._timestamp()
+        try:
+            with self.database.transaction(immediate=True) as connection:
+                connection.execute(
+                    "INSERT INTO sessions("
+                    "user_id, agent_id, session_id, title, pinned, created_at, updated_at, "
+                    "metadata_json, message_count) VALUES (?, ?, ?, ?, 0, ?, ?, ?, 0) "
+                    "ON CONFLICT(user_id, agent_id, session_id) DO UPDATE SET "
+                    "title = excluded.title, updated_at = excluded.updated_at",
+                    (
+                        self.user_id,
+                        self.agent_id,
+                        session_id,
+                        title,
+                        timestamp,
+                        timestamp,
+                        _json_object({"created_by": "desktop-title"}),
+                    ),
+                )
+                row = self._select_session(connection, session_id)
+        except sqlite3.Error as error:
+            self._log_storage_error("_upsert_title_sync", error)
+            raise SessionStorageError() from None
+        LOGGER.info(
+            "[store.py][SessionStore._upsert_title_sync] 会话标题已写入，session_id=%s",
+            session_id,
         )
         return self._session_from_row(row)
 
@@ -457,6 +562,146 @@ class SessionStore:
             len(records),
         )
         return records
+
+    def _history_page_sync(
+        self,
+        session_id: str,
+        page: int,
+        page_size: int,
+        until_sequence: int | None,
+    ) -> MessagePage:
+        """同步读取桌面历史；页码从最新一页起算，返回内容仍按序号升序。"""
+        try:
+            with self.database.connection() as connection:
+                if self._select_session(connection, session_id) is None:
+                    raise SessionNotFoundError()
+                rows = connection.execute(
+                    "SELECT * FROM messages WHERE user_id = ? AND agent_id = ? "
+                    "AND session_id = ? ORDER BY sequence ASC",
+                    (self.user_id, self.agent_id, session_id),
+                ).fetchall()
+        except AgentError:
+            raise
+        except sqlite3.Error as error:
+            self._log_storage_error("_history_page_sync", error)
+            raise SessionStorageError() from None
+
+        total = len(rows)
+        effective_page = page
+        if until_sequence is not None:
+            target_index = next(
+                (index for index, row in enumerate(rows) if int(row["sequence"]) == until_sequence),
+                None,
+            )
+            if target_index is not None:
+                messages_after_target = total - target_index - 1
+                target_page = messages_after_target // page_size + 1
+                effective_page = max(page, target_page)
+
+        newest_exclusive = max(0, total - (page - 1) * page_size)
+        oldest_inclusive = max(0, total - effective_page * page_size)
+        selected = rows[oldest_inclusive:newest_exclusive]
+        records = [self._message_from_row(row) for row in selected]
+        LOGGER.info(
+            "[store.py][SessionStore._history_page_sync] 桌面历史读取完成，session_id=%s，请求页=%d，返回至页=%d，消息数量=%d",
+            session_id,
+            page,
+            effective_page,
+            len(records),
+        )
+        return MessagePage(
+            messages=records,
+            total=total,
+            page=effective_page,
+            page_size=page_size,
+            has_more=oldest_inclusive > 0,
+        )
+
+    def _user_message_index_sync(self, session_id: str) -> list[StoredMessage]:
+        """同步读取会话内全部用户消息，供桌面导航时间线使用。"""
+        try:
+            with self.database.connection() as connection:
+                if self._select_session(connection, session_id) is None:
+                    raise SessionNotFoundError()
+                rows = connection.execute(
+                    "SELECT * FROM messages WHERE user_id = ? AND agent_id = ? "
+                    "AND session_id = ? AND role = 'user' ORDER BY sequence ASC",
+                    (self.user_id, self.agent_id, session_id),
+                ).fetchall()
+        except AgentError:
+            raise
+        except sqlite3.Error as error:
+            self._log_storage_error("_user_message_index_sync", error)
+            raise SessionStorageError() from None
+        return [self._message_from_row(row) for row in rows]
+
+    def _delete_turn_sync(
+        self,
+        session_id: str,
+        user_sequence: int,
+        delete_user: bool,
+        cascade: bool,
+    ) -> int:
+        """同步删除目标用户轮次；级联时截断该轮及其后的完整对话。"""
+        try:
+            with self.database.transaction(immediate=True) as connection:
+                if self._select_session(connection, session_id) is None:
+                    raise SessionNotFoundError()
+                target = connection.execute(
+                    "SELECT role FROM messages WHERE user_id = ? AND agent_id = ? "
+                    "AND session_id = ? AND sequence = ?",
+                    (self.user_id, self.agent_id, session_id, user_sequence),
+                ).fetchone()
+                if target is None or str(target["role"]) != "user":
+                    raise MessageNotFoundError()
+
+                start_sequence = user_sequence if delete_user else user_sequence + 1
+                parameters: list[Any] = [
+                    self.user_id,
+                    self.agent_id,
+                    session_id,
+                    start_sequence,
+                ]
+                end_clause = ""
+                if not cascade:
+                    next_user = connection.execute(
+                        "SELECT MIN(sequence) FROM messages WHERE user_id = ? AND agent_id = ? "
+                        "AND session_id = ? AND role = 'user' AND sequence > ?",
+                        (self.user_id, self.agent_id, session_id, user_sequence),
+                    ).fetchone()[0]
+                    if next_user is not None:
+                        end_clause = " AND sequence < ?"
+                        parameters.append(int(next_user))
+                cursor = connection.execute(
+                    "DELETE FROM messages WHERE user_id = ? AND agent_id = ? "
+                    "AND session_id = ? AND sequence >= ?" + end_clause,
+                    parameters,
+                )
+                deleted = max(0, cursor.rowcount)
+                connection.execute(
+                    "UPDATE sessions SET message_count = message_count - ?, updated_at = ? "
+                    "WHERE user_id = ? AND agent_id = ? AND session_id = ?",
+                    (
+                        deleted,
+                        self._timestamp(),
+                        self.user_id,
+                        self.agent_id,
+                        session_id,
+                    ),
+                )
+        except AgentError:
+            raise
+        except sqlite3.Error as error:
+            self._log_storage_error("_delete_turn_sync", error)
+            raise SessionStorageError() from None
+        LOGGER.info(
+            "[store.py][SessionStore._delete_turn_sync] 消息轮次已删除，session_id=%s，user_sequence=%d，cascade=%s，删除数量=%d",
+            session_id,
+            user_sequence,
+            cascade,
+            deleted,
+        )
+        return deleted
 
     def _delete_sync(self, session_id: str) -> None:
         """同步删除会话并依赖外键级联清理消息。"""
