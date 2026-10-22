@@ -83,3 +83,4 @@ docker/agent-mail-data/
 /.config.json.*.tmp
 /.yan-config-test-*/
 /.yan-config-demo-*/
+/.yan-db-test-*/

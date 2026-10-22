@@ -646,3 +646,70 @@ Electron/React chatStore
 
 - 本次没有修改运行逻辑或测试逻辑，P01 状态不变。
 - 下一项业务开发仍按照需求文档进入 P02-01 数据库基础。
+
+## 2026-10-22：P02-01 数据库基础
+
+### 需求
+
+按照 `docs/DEVELOPMENT_REQUIREMENTS.md` 和最新 `AGENTS.md` 完成 P02-01：确定 YanAgent 独立数据目录，使用 SQLite，建立 `sessions`、`messages`、`runs` 和 `schema_migrations`，从第一版记录 Schema 版本；技术实现参考 CowAgentByYan 的 ConversationStore 数据归属、稳定序号和 WAL 取舍，但不复制其历次兼容迁移或提前实现 P02-02 业务。
+
+### 实际完成内容
+
+- 新增 `yanagent.storage` 模块。默认数据目录为用户主目录下 `.yanagent`，数据库文件为 `yanagent.db`；支持 `YANAGENT_DATA_DIR` 显式覆盖，只读取 YanAgent 专属变量，测试确认即使存在 `COW_DATA_DIR` 也不会进入 `.cow`。
+- 建立 Schema v1：`sessions` 保存 `user_id + agent_id + session_id` 复合归属、标题、置顶、时间和元数据；`messages` 保存稳定序号、角色、正文、工具消息预留字段和元数据；`runs` 保存请求身份、父 Run、受限状态、时间、结束原因、错误与 Usage；`schema_migrations` 保存版本、名称、迁移校验和与应用时间。
+- 数据库层启用外键、WAL、`synchronous=NORMAL` 和 `busy_timeout`。消息与 Run 使用复合外键指向所属 Session；同一归属会话内的消息序号唯一；角色、置顶值和 Run 状态使用 CHECK 约束。
+- 实现只向前的版本迁移器。`schema_migrations` 建表、业务 DDL、迁移登记和结构校验在同一个 `BEGIN IMMEDIATE` 事务中执行；SQL 或校验失败整体回滚。重复初始化核对迁移名称与 SHA-256 校验和并保留数据；数据库版本高于当前程序时拒绝旧程序写入。
+- 将数据库初始化接入 `app.py/main()`：后端监听端口前先完成 Schema 初始化，数据库对象注入 HTTP Server 供 P02-02 继续接入；新增包含文件、函数、版本的中文关键日志。
+- 新增 `docs/P02_01_DATABASE.md`，记录目录规则、四表字段用途、迁移流程、验证命令和能力边界；同步更新 README、需求状态、路线和岗位映射。P02 状态改为“进行中”，下一项为 P02-02。
+
+### 涉及文件
+
+- 数据库模块：`yanagent/storage/__init__.py`、`yanagent/storage/database.py`
+- 启动接入：`app.py`
+- 自动化测试：`tests/test_database.py`
+- 测试临时目录忽略：`.gitignore`
+- 实现说明：`docs/P02_01_DATABASE.md`
+- 状态与导航：`docs/DEVELOPMENT_REQUIREMENTS.md`、`docs/IMPLEMENTATION_ROADMAP.md`、`docs/TARGET_ROLES.md`、`README.md`
+- 开发记录：`workProcess.md`
+
+### 验证结果
+
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m unittest tests.test_database -v`：新增 8 项测试全部通过。
+- 首次初始化验证四张目标表、Schema v1、64 位迁移校验和、外键启用和 WAL；再次使用新 Database 实例打开同一文件，已有 Session 和唯一迁移记录均保留。
+- 数据库约束验证：孤立消息、同一归属会话重复序号和非法 Run 状态均触发 `sqlite3.IntegrityError`。
+- 版本与事务验证：高于当前程序的版本触发 `UnsupportedSchemaVersionError`；故意在第二条迁移 SQL 制造错误后，SQLite 中没有残留 `sessions` 或 `schema_migrations` 表。
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m unittest discover -s tests -q`：最终全量 108 项测试通过，本次运行 5.184 秒；原有 P01 的 100 项全部回归通过。该耗时仅是本机单次测试记录，不作为性能结论。由于 Windows `asyncio` 创建事件循环和回环 HTTP 需要本机 socket，该命令在允许本机 socket 的受控环境运行，不访问公网、不使用真实密钥。
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m compileall -q -f app.py yanagent tests examples scripts`：通过。
+- `git diff --check`：代码阶段检查通过；最终文档更新后再次检查。
+- 本次没有修改 Electron/TypeScript，因此未重复执行桌面生产构建；P01-06 的桌面构建证据保持不变。
+
+### 开发难点与评分
+
+整体难度：**6/10**。本次表面上是“建四张表”，真正难点是让第一版 Schema 能支撑后续归属隔离、消息顺序、工具消息和 Run 生命周期，同时保证迁移失败不会产生难以恢复的半成品数据库。
+
+| 难点 | 难度 | 容易出现的问题 | 实现方式与证据 |
+|---|---:|---|---|
+| 首版 Schema 的未来兼容性 | 6/10 | 只用 `session_id` 主键，后续加入用户和 Agent 时重建大表；消息无法保存工具配对；Run 状态可写入任意值 | 从 v1 使用 `user_id + agent_id + session_id` 复合归属；预留工具/Usage/元数据字段；角色、序号和状态使用约束；结构测试验证 |
+| 原子迁移与版本真实性 | 7/10 | `executescript` 或分段提交导致表建一半、版本却已记录；改写旧迁移后静默通过 | 手动 `BEGIN IMMEDIATE`，逐条执行并在同一事务登记；保存 SHA-256；失败回滚测试确认数据库无残留表 |
+| 独立数据目录 | 5/10 | 复制桌面壳后继续读取 `COW_DATA_DIR`，污染 CowAgent 的 `.cow` 数据 | 仅支持 `YANAGENT_DATA_DIR`，默认 `.yanagent`；专门用同时包含 `COW_DATA_DIR` 的测试做负向验证 |
+| SQLite 连接生命周期 | 5/10 | 误以为 `with sqlite3.connect()` 会关闭连接，Windows 临时库因句柄未释放无法删除 | 生产连接在 `finally` 关闭；测试使用 `contextlib.closing`；`-W error` 下无 ResourceWarning，全量测试通过 |
+| 沙箱内 asyncio 验收 | 4/10 | 把 Windows socketpair 被沙箱拦截误判为业务死锁 | 用 `faulthandler` 定位到 `socket.accept()`；在允许本机 socket、禁用公网依赖的环境重跑同一测试，108 项通过；没有修改业务逻辑绕过测试 |
+
+### 岗位要求关联与实践证据
+
+- **小米职责1～2、职责6～7及要求3、要求6**：本次属于 Session/Gateway 后端的持久化基础，体现独立数据目录、身份维度、Schema 迁移、失败回滚、日志和稳定性取舍。当前尚未实现上下文读取、云端 Runtime 或完整 Sessions API，不能宣称已满足完整链路。
+- **字节质量 Agent 职责2～3**：Schema 为运行轨迹、结果验证和可复用会话基础预留结构；8 项确定性数据库测试和 108 项回归属于工程质量证据，但不是 Agent 效果评测体系。
+- **腾讯职责2～3、要求1、要求6**：体现 Python/SQLite、状态建模、Memory/Session 基础和质量保障思维；这不是长期记忆检索、Reflection、Benchmark 或成本管控的完成证据。
+- **岗位通用结构化表达**：`docs/P02_01_DATABASE.md` 可用于面试说明“为什么从 v1 建迁移表、为什么使用复合归属键、为什么旧程序拒绝新数据库、如何验证事务回滚”。可以讲已实现和已测试的 SQLite 基础，不能把预留字段描述为已上线业务能力。
+
+### 面试可讲事实与边界
+
+- 可以表述：为自研 Agent Runtime 设计 SQLite Schema v1，覆盖 Session、Message、Run 和迁移记录；使用复合归属键、稳定消息序号、外键与状态约束，从数据库层为多会话隔离和运行恢复打基础。
+- 可以表述：实现带迁移名称与 SHA-256 的只向前迁移器，所有 DDL、版本登记和结构校验处于同一立即事务；通过故障注入证明中途失败整体回滚，通过未来版本测试防止旧程序错误写入。
+- 不可以表述：已经完成会话创建/分页/删除、消息持久化、多轮上下文恢复、并发业务写入、启动中断恢复、桌面历史联调或生产数据库性能优化；这些仍属于 P02-02～P02-05。
+
+### 后续事项
+
+- 下一项严格执行 P02-02：实现会话创建、分页、重命名、置顶、删除；事务追加消息；按稳定序号读取；保存时间、归属和元数据。
+- P02-02 需要决定 SessionStore 的同步/异步边界和写事务策略，并复用本次 `Database.connection()`；不能绕过复合归属字段直接按裸 `session_id` 查询。
+- P02-03 前聊天 Provider 仍只收到本次用户消息；数据库文件存在不代表当前聊天已经具有多轮记忆。

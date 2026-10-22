@@ -9,6 +9,7 @@ YanAgent 是从 CowAgent 的桌面产品外壳中抽出的学习脚手架。项�
 - 启动 Python 骨架服务并通过 `/api/health` 健康检查。
 - 启动 CowAgent 风格的 Electron/React 桌面界面。
 - 配置 OpenAI-compatible 模型后，在聊天框发送消息并流式显示真实回答，也可停止生成。
+- 启动后自动初始化独立的 `~/.yanagent/yanagent.db` 和 Schema v1。
 - 阅读各核心模块的接口、TODO 和验收条件，逐步替换占位实现。
 - 使用 Python 普通/流式 Provider 或离线 Fake Provider；配置、SSE、取消和错误已接到桌面 HTTP 契约。
 
@@ -18,7 +19,7 @@ YanAgent 是从 CowAgent 的桌面产品外壳中抽出的学习脚手架。项�
 |---|---|---|
 | Agent 执行循环 | `yanagent/runtime/agent_loop.py` | 接口保留，实现为空 |
 | 运行时调度 Bridge | `yanagent/runtime/bridge.py` | 接口保留，实现为空 |
-| Session 与上下文 | `yanagent/sessions/store.py` | 接口保留，实现为空 |
+| Session 与上下文 | `yanagent/storage/`、`yanagent/sessions/store.py` | P02-01 数据库与迁移已完成；Session CRUD 和上下文仍为空 |
 | 模型适配层 | `yanagent/models/openai_compatible.py`、`yanagent/chat.py` | P01-05 已接通普通与流式桌面消息、增量组装和安全错误 |
 | 最小流式 Runtime | `yanagent/runtime/streaming.py`、`yanagent/events.py`、`app.py` | 常驻事件循环、Run 隔离、SSE 回放、基本取消与终态清理已完成 |
 | 工具系统 | `yanagent/tools/manager.py` | 接口保留，实现为空 |
@@ -86,7 +87,7 @@ npm run dev
 6. P06～P10：多模型、完整工具、Skills、MCP、记忆知识库和 Multi-Agent。
 7. P11～P12：Web、多渠道、定时、桌面交付与功能对照验收。
 
-P01-01～P01-06 均已完成。阶段验收见 [P01 验证与文档](docs/P01_06_VERIFICATION.md)：100 项测试、真实 DeepSeek 普通/流式调用、Electron 桌面流式显示、基本取消和并发隔离均有证据。当前下一项任务是 **P02-01：数据库基础**；多轮历史和工具循环分别属于 P02、P03～P04。
+P01-01～P01-06 和 P02-01 均已完成。P01 阶段验收见 [P01 验证与文档](docs/P01_06_VERIFICATION.md)；数据库设计与边界见 [P02-01 数据库基础](docs/P02_01_DATABASE.md)。当前共 108 项测试通过，下一项任务是 **P02-02：会话与消息存储**；桌面历史、多轮上下文和工具循环仍分别属于 P02-03～P02-04、P03～P04。
 
 可在项目根目录运行本次配置演示（使用无效测试密钥，不请求网络）：
 

@@ -20,6 +20,7 @@ from yanagent.errors import (
     RequestValidationError, UnexpectedToolCallError,
 )
 from yanagent.runtime import AgentRuntime
+from yanagent.storage import Database
 
 
 LOGGER = logging.getLogger("yanagent.http")
@@ -72,9 +73,11 @@ class YanAgentHTTPServer(ThreadingHTTPServer):
 
     def __init__(
         self, server_address: tuple[str, int], application: YanAgentApplication,
+        database: Database | None = None,
     ) -> None:
-        """保存应用服务并启动唯一常驻异步运行环境。"""
+        """保存应用和数据库服务，并启动唯一常驻异步运行环境。"""
         self.application = application
+        self.database = database
         super().__init__(server_address, YanAgentHandler)
         self.runtime = AgentRuntime(application)
 
@@ -312,8 +315,9 @@ def create_server(
     application: YanAgentApplication | None = None,
     config_store: ConfigStore | None = None,
     provider_factory: ProviderFactory | None = None,
+    database: Database | None = None,
 ) -> YanAgentHTTPServer:
-    """根据生效配置创建服务；测试可注入临时配置和 Fake Provider。"""
+    """根据生效配置创建服务；数据库在 P02-01 起可由启动入口注入。"""
     if application is not None and (config_store is not None or provider_factory is not None):
         raise ValueError("application 与 config_store/provider_factory 不能同时传入")
     app = application or YanAgentApplication(config_store, provider_factory=provider_factory)
@@ -321,13 +325,15 @@ def create_server(
     config = app.load_config()
     bind_host = config.host if host is None else host
     bind_port = config.port if port is None else port
-    return YanAgentHTTPServer((bind_host, bind_port), app)
+    return YanAgentHTTPServer((bind_host, bind_port), app, database)
 
 
 def main() -> None:
     """启动本地服务并在 SIGTERM 或 Ctrl+C 时关闭监听。"""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    server = create_server()
+    database = Database()
+    database_info = database.initialize()
+    server = create_server(database=database)
 
     def stop_server(_signum: int, _frame: object) -> None:
         """处理桌面父进程终止信号，关闭监听并退出主循环。"""
@@ -338,7 +344,12 @@ def main() -> None:
     signal.signal(signal.SIGTERM, stop_server)
     host, port = server.server_address[:2]
     LOGGER.info("[app.py][main] YanAgent 后端已启动：http://%s:%s", host, port)
-    LOGGER.info("[app.py][main] 当前能力：P01 单模型普通/流式聊天、错误反馈与基本取消")
+    LOGGER.info(
+        "[app.py][main] P02 数据库基础已就绪：schema_version=%d，文件=%s",
+        database_info.schema_version,
+        database_info.path,
+    )
+    LOGGER.info("[app.py][main] 当前能力：P01 单模型聊天；P02-01 SQLite 与迁移基础")
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
