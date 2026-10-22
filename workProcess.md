@@ -608,3 +608,41 @@ Electron/React chatStore
 - 下一项按需求文档执行 P02-01 数据库基础：确定 YanAgent 独立数据目录，使用 SQLite，建立 `sessions`、`messages`、`runs`、`schema_migrations` 并记录 Schema 版本。
 - P02 完成前，桌面看到的旧界面内容不能当作后端 Session 持久化证据；当前后端 `/api/history` 仍返回空结构，Run 只在进程内短期保留。
 - P03～P04 才实现工具注册、Schema/权限/执行和 Agent Loop；P01 只解析模型 ToolCall 并拒绝执行。
+
+## 2026-10-22：并发交错与 request_id 隔离说明文档
+
+### 需求
+
+将本轮关于流式请求交错执行、两个回答如何隔离、桌面端如何人工观察并发、固定 `request_id` 的后果、重复 ID 判断与锁的运行方式，以及对应源码位置的问答整理为一份中文 Markdown 文档。
+
+### 实际完成内容
+
+- 新增 `docs/REQUEST_ID_CONCURRENCY_GUIDE.md`，按现象、运行原理、桌面人工验证、固定 ID 风险、字典重复判断、锁的原子保护、自动化并发测试和源码索引进行整理。
+- 明确区分“后端执行时间交错”和“同一回答内容混合”：前者是正常异步并发，后者是错误串流。
+- 说明当前实现遇到重复 ID 会拒绝第二个请求；同时分析删除重复检查后可能产生的覆盖、错误订阅和错误取消风险，避免把所有问题笼统描述成逐字混合。
+- 记录从 `POST /message` 生成 UUID，到 `RunRecord` 登记、Provider 增量写入、SSE 按 ID 查询，以及并发测试排他断言的完整链路。
+
+### 涉及文件
+
+- 说明文档：`docs/REQUEST_ID_CONCURRENCY_GUIDE.md`
+- 开发记录：`workProcess.md`
+
+### 验证结果
+
+- 对照 `app.py`、`yanagent/runtime/streaming.py`、`desktop/src/renderer/src/components/ChatInput.tsx`、`desktop/src/renderer/src/api/client.ts` 和 `tests/test_chat_integration.py` 核对函数名称、关键语句和源码位置。
+- 文档没有写入 API Key、Token、密码或配置原文，也没有将人工观察描述成确定性的并发测试证据。
+
+### 开发难点与评分
+
+整体难度：**2/10**。本次为已有实现的说明整理，主要难点是准确区分重复 ID 被拒绝、字典映射被覆盖和真正共享同一 `RunRecord` 三种不同后果，并明确人工界面观察与自动化并发测试的证据边界。
+
+### 岗位要求关联与实践证据
+
+- **小米职责1、职责6～7及要求3**：文档可以作为解释任务接入、流式执行、request_id 隔离、并发稳定性和验证回路的学习材料；它记录的是个人项目机制与测试证据，不代表生产规模经验。
+- **字节质量 Agent 职责2～3**：体现执行管控、结果回写、调试验证和通用运行协议的结构化表达；本次没有新增任务规划或多工具编排。
+- **腾讯职责1、要求2及要求6**：能够结合源码说明异步执行、请求路由和隔离机制；本次仅新增说明文档，没有新增 Multi-Agent、Memory、Planning 或 Reflection 能力。
+
+### 后续事项
+
+- 本次没有修改运行逻辑或测试逻辑，P01 状态不变。
+- 下一项业务开发仍按照需求文档进入 P02-01 数据库基础。
