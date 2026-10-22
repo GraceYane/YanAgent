@@ -212,7 +212,7 @@ class YanAgentHandler(BaseHTTPRequestHandler):
                 self._json({
                     "status": "success", "default_agent_id": "default",
                     "agents": [{"id": "default", "name": "YanAgent", "enabled": True}],
-                    "channel_instances": [], "revision": "p01-05",
+                    "channel_instances": [], "revision": "p01-complete",
                 })
                 return
             if path == "/api/sessions":
@@ -338,7 +338,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, stop_server)
     host, port = server.server_address[:2]
     LOGGER.info("[app.py][main] YanAgent 后端已启动：http://%s:%s", host, port)
-    LOGGER.info("[app.py][main] 当前能力：P01-05 普通聊天、SSE 流式输出与基本取消")
+    LOGGER.info("[app.py][main] 当前能力：P01 单模型普通/流式聊天、错误反馈与基本取消")
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:

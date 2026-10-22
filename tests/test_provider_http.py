@@ -10,7 +10,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from yanagent.config import AppConfig
 from yanagent.contracts import Message
-from yanagent.errors import AuthenticationError, ModelResponseError, RateLimitError
+from yanagent.errors import (
+    AuthenticationError, EmptyModelResponseError, ModelNotFoundError,
+    ModelResponseError, RateLimitError,
+)
 from yanagent.models import OpenAICompatibleProvider
 
 
@@ -25,6 +28,16 @@ class LocalHandler(BaseHTTPRequestHandler):
         data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.server.received.append((self.path, dict(self.headers), data))
         model = data["model"]
+        status = {"auth": 401, "missing": 404, "limited": 429}.get(model, 200)
+        if status != 200:
+            payload = {"error": {"message": "test-secret-do-not-echo"}}
+            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
         if model == "redirect":
             self.send_response(307)
             self.send_header("Location", "/redirected")
@@ -35,15 +48,17 @@ class LocalHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.end_headers()
-            first = {"choices": [{"index": 0, "delta": {
-                "role": "assistant", "content": "本地",
-            }, "finish_reason": None}]}
-            first_event = "data: " + json.dumps(first, ensure_ascii=False) + "\n\n"
-            self.wfile.write(first_event.encode("utf-8"))
-            self.wfile.flush()
+            if model != "empty-stream":
+                first = {"choices": [{"index": 0, "delta": {
+                    "role": "assistant", "content": "本地",
+                }, "finish_reason": None}]}
+                first_event = "data: " + json.dumps(first, ensure_ascii=False) + "\n\n"
+                self.wfile.write(first_event.encode("utf-8"))
+                self.wfile.flush()
             if model == "slow-stream":
                 self.server.release_slow.wait(2)
-            final = {"choices": [{"index": 0, "delta": {"content": "流回复"},
+            final_content = "" if model == "empty-stream" else "流回复"
+            final = {"choices": [{"index": 0, "delta": {"content": final_content},
                                    "finish_reason": "stop"}],
                      "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}}
             try:
@@ -53,13 +68,12 @@ class LocalHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
             return
-        status = {"auth": 401, "limited": 429}.get(model, 200)
-        if status != 200:
-            payload = {"error": {"message": "test-secret-do-not-echo"}}
-        elif model == "tool":
+        if model == "tool":
             payload = {"choices": [{"message": {"role": "assistant", "content": None,
                 "tool_calls": [{"id": "c1", "type": "function", "function": {
-                    "name": "calculator", "arguments": '{"x": 1}'}}]}, "finish_reason": "tool_calls"}]}
+                    "name": "calculator", "arguments": '{"x": 1}'}}]},
+                "finish_reason": "tool_calls",
+            }]}
         else:
             payload = {"choices": [{"message": {"role": "assistant", "content": "本地测试回复：你好"},
                                     "finish_reason": "stop"}],
@@ -155,6 +169,27 @@ class LocalHttpTests(unittest.IsolatedAsyncioTestCase):
                 await self.provider(model).complete([Message("user", "hi")])
             self.assertNotIn("test-secret", str(caught.exception))
         self.assertEqual(len(self.server.received), 2)
+
+    async def test_real_http_stream_errors_are_classified_without_body_leak(self) -> None:
+        """流式握手的 401/404/429 也必须安全分类，且每种只请求一次。"""
+        cases = (
+            ("auth", AuthenticationError),
+            ("missing", ModelNotFoundError),
+            ("limited", RateLimitError),
+        )
+        for model, error_type in cases:
+            with self.subTest(model=model):
+                with self.assertRaises(error_type) as caught:
+                    async for _event in self.provider(model).stream([Message("user", "hi")]):
+                        pass
+                self.assertNotIn("test-secret", str(caught.exception))
+        self.assertEqual(len(self.server.received), len(cases))
+
+    async def test_real_http_empty_stream_is_recognizable(self) -> None:
+        """供应商正常结束但没有文本或工具时，应得到专用空响应错误。"""
+        with self.assertRaises(EmptyModelResponseError):
+            async for _event in self.provider("empty-stream").stream([Message("user", "hi")]):
+                pass
 
     async def test_redirect_is_not_followed(self) -> None:
         """携带密钥的请求遇到重定向后停止，不请求第二个地址。"""

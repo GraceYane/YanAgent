@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import tempfile
 import threading
@@ -16,7 +17,8 @@ from yanagent.chat import DEFAULT_API_BASE, PROVIDER_ID, YanAgentApplication
 from yanagent.config import ConfigStore, MASKED_SECRET
 from yanagent.contracts import ModelReply, ToolCall
 from yanagent.errors import (
-    AuthenticationError, ConfigurationError, RequestValidationError, UnexpectedToolCallError,
+    AuthenticationError, ConfigurationError, ModelNotFoundError, ModelTimeoutError,
+    RateLimitError, RequestValidationError, UnexpectedToolCallError,
 )
 from yanagent.events import ModelStreamEvent
 from yanagent.models import FakeProvider
@@ -44,6 +46,26 @@ class BlockingHttpProvider:
             await asyncio.Event().wait()
         finally:
             self.cancelled.set()
+
+
+class EchoStreamProvider:
+    """逐字符返回本次输入，用于确认并发 HTTP/SSE 不会串到另一个 Run。"""
+
+    name = "echo-stream"
+
+    async def complete(self, messages, *, tools=()):
+        """返回本次用户输入；并发验收只使用流式入口。"""
+        return ModelReply(content=messages[0].content, finish_reason="stop")
+
+    async def stream(self, messages, *, tools=()):
+        """交错产出每个请求自身的字符，并以同一完整正文结束。"""
+        content = messages[0].content
+        for char in content:
+            await asyncio.sleep(0.003)
+            yield ModelStreamEvent(kind="text_delta", content=char)
+        yield ModelStreamEvent(
+            kind="completed", reply=ModelReply(content=content, finish_reason="stop"),
+        )
 
 
 class ChatApplicationTests(unittest.TestCase):
@@ -345,6 +367,135 @@ class ChatCancelHttpTests(unittest.TestCase):
         events = [json.loads(line[6:]) for line in lines if line.startswith("data: ")]
         self.assertEqual([event["type"] for event in events][-2:], ["cancelled", "done"])
         self.assertTrue(self.provider.cancelled.wait(1))
+
+
+class ChatStreamingErrorHttpTests(unittest.TestCase):
+    """覆盖桌面 SSE 能识别的配置、认证、模型、限流、超时和空响应错误。"""
+
+    def setUp(self) -> None:
+        """为每类错误准备一条独立流，启动真实回环 HTTP 服务。"""
+        self.temporary = tempfile.TemporaryDirectory()
+        store = ConfigStore(Path(self.temporary.name) / "config.json", environ={})
+        store.save({
+            "api_base": "https://example.invalid/v1", "model": "fake", "api_key": "safe-key",
+        })
+        errors = [
+            ConfigurationError(reason="missing_key", field="api_key"),
+            AuthenticationError(),
+            ModelNotFoundError(),
+            ModelTimeoutError(),
+            RateLimitError(),
+        ]
+        self.expected_codes = [error.code for error in errors] + ["empty_model_response"]
+        self.fake = FakeProvider(
+            [], stream_outcomes=[[error] for error in errors] + [[]],
+        )
+        application = YanAgentApplication(store, provider_factory=lambda _config: self.fake)
+        self.server = create_server("127.0.0.1", 0, application=application)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def tearDown(self) -> None:
+        """关闭回环服务并删除临时配置。"""
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=3)
+        self.temporary.cleanup()
+
+    def _post_message(self, index: int) -> dict[str, object]:
+        """创建一条流式消息并返回 JSON，不在请求中携带测试密钥。"""
+        request = Request(
+            self.base_url + "/message",
+            data=json.dumps({
+                "session_id": f"error-{index}", "message": "触发受控错误", "stream": True,
+            }, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urlopen(request, timeout=3) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _read_events(self, request_id: str) -> list[dict[str, object]]:
+        """读取某个 request_id 的全部 SSE JSON 事件。"""
+        with urlopen(self.base_url + f"/stream?request_id={request_id}", timeout=3) as response:
+            lines = response.read().decode("utf-8").splitlines()
+        return [json.loads(line[6:]) for line in lines if line.startswith("data: ")]
+
+    def test_all_required_stream_errors_are_safe_and_recognizable(self) -> None:
+        """六类验收错误都返回稳定 code，SSE 中不出现本地配置凭据。"""
+        for index, expected in enumerate(self.expected_codes):
+            with self.subTest(error_code=expected):
+                created = self._post_message(index)
+                events = self._read_events(str(created["request_id"]))
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["type"], "error")
+                self.assertEqual(events[0]["code"], expected)
+                self.assertNotIn("safe-key", json.dumps(events, ensure_ascii=False))
+
+
+class ChatParallelHttpTests(unittest.TestCase):
+    """通过两个并发桌面请求验证 request_id 和 SSE 内容端到端隔离。"""
+
+    def setUp(self) -> None:
+        """启动共享 Echo Provider 的真实回环服务。"""
+        self.temporary = tempfile.TemporaryDirectory()
+        store = ConfigStore(Path(self.temporary.name) / "config.json", environ={})
+        application = YanAgentApplication(
+            store, provider_factory=lambda _config: EchoStreamProvider(),
+        )
+        self.server = create_server("127.0.0.1", 0, application=application)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def tearDown(self) -> None:
+        """关闭并发验收服务及临时目录。"""
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=3)
+        self.temporary.cleanup()
+
+    def _create_run(self, session_id: str, content: str) -> str:
+        """发送桌面格式的流式消息并返回独立 request_id。"""
+        request = Request(
+            self.base_url + "/message",
+            data=json.dumps({
+                "session_id": session_id, "message": content, "stream": True,
+            }, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urlopen(request, timeout=3) as response:
+            return str(json.loads(response.read().decode("utf-8"))["request_id"])
+
+    def _read_content(self, request_id: str) -> tuple[str, str]:
+        """读取一个 Run 的增量拼接文本和最终文本。"""
+        with urlopen(self.base_url + f"/stream?request_id={request_id}", timeout=3) as response:
+            lines = response.read().decode("utf-8").splitlines()
+        events = [json.loads(line[6:]) for line in lines if line.startswith("data: ")]
+        deltas = "".join(
+            str(event.get("content", "")) for event in events if event["type"] == "delta"
+        )
+        done = [event for event in events if event["type"] == "done"]
+        return deltas, str(done[0]["content"])
+
+    def test_two_simultaneous_http_streams_do_not_mix(self) -> None:
+        """两条交错运行的增量和 done 都只包含各自输入。"""
+        first_text = "甲请求-AAAA"
+        second_text = "乙请求-BBBB"
+        first_id = self._create_run("session-a", first_text)
+        second_id = self._create_run("session-b", second_text)
+        self.assertNotEqual(first_id, second_id)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            first_future = executor.submit(self._read_content, first_id)
+            second_future = executor.submit(self._read_content, second_id)
+            first = first_future.result(timeout=3)
+            second = second_future.result(timeout=3)
+        self.assertEqual(first, (first_text, first_text))
+        self.assertEqual(second, (second_text, second_text))
+        self.assertNotIn("乙请求", first[0])
+        self.assertNotIn("甲请求", second[0])
 
 
 if __name__ == "__main__":

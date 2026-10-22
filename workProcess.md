@@ -532,3 +532,79 @@ Electron/React chatStore
 - 下一项 P01-06：使用用户本地有效配置做真实模型和桌面人工联调，覆盖流式错误、停止生成、两请求隔离及阶段验收记录；凭据不得进入 Git 或文档。
 - P02 实现 Session 与持久化后，done/cancelled/error 才能形成可恢复历史；当前 Run 只保存在进程内 60 秒。
 - P03～P04 才消费已经正确组装的 ToolCall，加入 Schema、权限、执行、结果回写和循环；本次不能把“解析工具调用”描述成“会调用工具”。
+
+## 2026-10-22：P01-06 验证与文档
+
+### 需求
+
+按照 `docs/DEVELOPMENT_REQUIREMENTS.md` 和最新 `AGENTS.md` 完成 P01-06：覆盖配置、普通/流式调用、流式错误、停止生成和两次请求隔离；使用真实外部模型及 Electron 桌面端完成阶段验收；同步更新需求状态、验收文档和开发记录。技术链路继续以 CowAgentByYan 的桌面消息/SSE 使用效果为参考，不提前实现 P02 的持久化或 P03～P04 的工具循环。
+
+### 实际完成内容
+
+- 扩展真实回环 Provider 测试。测试服务现在能在流式握手阶段返回 401、404、429，验证 `authentication_error`、`model_not_found`、`rate_limit` 的分类；错误正文故意包含测试秘密，断言异常与 SSE 不回显。另增加正常结束但没有文本或工具的真实 SSE，确认产生 `empty_model_response`。
+- 新增桌面 HTTP/SSE 错误矩阵：缺少密钥、错误密钥、无效模型、超时、限流和空响应均通过真实 `/message` 创建 Run，再经 `/stream` 得到唯一、稳定、安全的 `error` 事件；事件中不存在本地配置凭据。
+- 新增两请求端到端隔离验收。`EchoStreamProvider` 让两个请求逐字符交错，两个线程同时订阅各自 SSE；断言 request_id 不同，各自 delta 拼接与 done 完整文本只含本请求内容。
+- 保留并复用 P01-05 的停止生成真实 HTTP 测试：阻塞 Provider 发出首块后等待，桌面同契约 `/cancel` 返回取消数量 1，取消进入 Provider 的 `finally`，SSE 有限结束为 `cancelled + done(finish_reason=cancelled)`。
+- 新增 `scripts.verify_p01_real_api`。脚本只从 Git 忽略配置或环境读取凭据，输出 Provider、API 主机、模型、超时、耗时、回答、增量数与 Usage，不输出 API Key、Authorization 或配置原文；统一错误只显示安全 code/message。
+- 2026-10-21 使用本地 DeepSeek 配置完成真实验证：模型 `deepseek-flash`，API 主机 `api.deepseek.com`。非流式回答“普通调用通过”，1.999 秒，Usage 45/53/98；流式回答“流式调用通过”，1.144 秒、4 个文本增量，Usage 46/51/97。密钥未进入终端输出、代码、测试或文档。
+- 2026-10-22 从源码启动 Electron 桌面端，输入固定验收提示词，观察到消息进入时间线、等待气泡、停止按钮、流式完成后的 Assistant 气泡“桌面流式通过”，以及输入框/发送按钮恢复。
+- 桌面长输出验收中，停止按钮可见并执行点击；DeepSeek 输出在人工确认取消反馈前快速完成，因此没有把该次外部 socket 写成“确定已被中断”。后台取消结论来自可控阻塞 Provider 的真实 HTTP 测试，明确区分人工观察与确定性自动化证据。
+- 新增 `docs/P01_06_VERIFICATION.md`，沉淀验收矩阵、真实 API 命令、真实模型结果、桌面步骤、取消证据边界和阶段能力边界。
+- 更新后端能力版本、README、需求文档、路线和岗位映射。P01-01～P01-06 均标记完成，P01 阶段改为“已完成”，下一项严格按需求文档进入 P02-01 数据库基础。
+
+### 涉及文件
+
+- 验收脚本：`scripts/__init__.py`、`scripts/verify_p01_real_api.py`
+- 行为测试：`tests/test_provider_http.py`、`tests/test_chat_integration.py`
+- 后端能力标识与日志：`app.py`
+- 验收文档：`docs/P01_06_VERIFICATION.md`
+- 状态与导航：`docs/DEVELOPMENT_REQUIREMENTS.md`、`docs/IMPLEMENTATION_ROADMAP.md`、`docs/TARGET_ROLES.md`、`README.md`
+- 开发记录：`workProcess.md`
+- 本地忽略配置：`config.json` 仅被读取用于实测，没有写入 Git，也没有在记录中保存凭据
+
+### 验证结果
+
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m unittest discover -s tests -q`：100 项测试通过；P01-05 的 96 项全部回归通过，本次新增 4 项聚合验收测试。
+- 新增 Provider 证据：真实回环流式 401/404/429 各只请求一次并安全分类；空 SSE 正常结束得到专用空响应错误；错误正文中的测试秘密不出现在异常。
+- 新增应用证据：六类要求错误均成为桌面可识别的 SSE 错误码；两条同时运行的 HTTP/SSE 请求逐字符交错但内容、request_id 和 done 不混淆。
+- 停止生成证据：真实回环 `/message → /cancel → /stream` 确认取消传到阻塞 Provider，最终事件为 `cancelled + done`，不会在终态后继续写入 Run。
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m compileall -q -f app.py yanagent tests examples scripts`：通过。
+- `desktop\npm run build`：Vite renderer 和 TypeScript main 构建通过；字体路径、Browserslist、动态/静态 import 与大 chunk 为已有警告。
+- `scripts.verify_p01_real_api`：真实 DeepSeek 普通和流式调用均通过，实际结果已在上文及 `docs/P01_06_VERIFICATION.md` 记录。
+- Electron 桌面人工验收：真实流式回答正确进入聊天气泡，生成/结束控制状态可见；取消的确定性后台结论由自动化测试补足。
+- `git diff --check` 和敏感值扫描在最终文档更新后执行；本记录不包含任何 API Key、Token 或 Authorization 值。
+
+### 开发难点与评分
+
+整体难度：**7/10**。本次主要难点不是新增聊天功能，而是建立“每项结论对应哪一层证据”的验收体系，尤其要避免用 Fake、真实回环、外部 API 或桌面截图中的任意一种去冒充另外三种。
+
+| 难点 | 难度 | 容易出现的问题 | 实现方式与证据 |
+|---|---:|---|---|
+| 错误矩阵跨层验证 | 7/10 | 只测试错误类构造却声称桌面可识别；流式握手错误被 200 SSE 分支吞掉；上游正文进入日志 | 回环服务在 SSE 前返回真实 HTTP 状态；六类错误从 `/message` 经 Runtime 到 `/stream`；测试正文放入秘密并做负向断言 |
+| 并发隔离的端到端证明 | 7/10 | Runtime 单测通过但 HTTP request_id 或 SSE URL 仍可能串流；两个请求顺序执行无法暴露竞态 | Echo Provider 逐字符让出事件循环；两个请求先启动再用两个线程并发订阅；分别断言 delta、done 和排他文本 |
+| 真实凭据与可复现证据兼顾 | 7/10 | 为了复现把 Key 写脚本/日志；只说“调通”却没有模型、模式、Usage；异常 traceback 泄密 | 验收脚本仅从忽略配置读取；输出白名单摘要；AgentError 安全化；记录模型、主机、耗时、增量、Usage，不保存凭据 |
+| 桌面取消竞态的诚实结论 | 8/10 | 模型快速完成后仍把点击停止写成后台取消成功；只验证按钮却没验证 Provider 收到取消 | 桌面记录只声明观察到的 UI；后台取消使用阻塞 Provider 的真实 HTTP 测试确认；文档明确外部 socket 本次未独立证明 |
+| 阶段状态收口 | 5/10 | 测试数与文档状态不一致；P01 完成后下一任务名称写错；把后续能力提前算入成果 | 同步 README/需求/路线/岗位映射/能力日志；按原需求准确指向 P02-01 数据库基础；列出未实现边界 |
+
+### 岗位要求关联与实践证据
+
+- **XM-职责1（任务接入、上下文管理、执行编排、结果回写完整链路）**：本阶段可证明单轮任务从 Electron 输入、HTTP 接入、Run 登记、Provider 调用、SSE 回写到气泡显示；上下文管理仅有本轮 `Message` 和配置快照，不具备多轮恢复，因此不能声称完整满足该条款。
+- **XM-职责6～7（可用性、稳定性、可观测性、性能、Token 成本与维护性）**：统一错误、超时、响应上限、无自动重试、取消、并发隔离、关键中文日志和 Usage 记录属于基础实践；只记录单次真实耗时和 Token，不推导生产性能或成本提升比例。
+- **XM-要求2、要求5～6**：代码体现 Python 异步/线程/HTTP/SSE 与 TypeScript 桌面契约，项目可运行且文档/复盘完整。没有据此扩大学历、出勤或团队推广经历。
+- **DYQ-职责2～3（核心链路、执行管控、结果验证、调试评测）**：P01 建立了 request_id、流式结果汇总校验、停止控制和可重复错误/并发验证；仍没有任务规划、多工具调用、缺陷发现或系统性 Agent Benchmark。
+- **DYQ-加分1（个人项目/开源/博客）**：形成可演示个人项目和完整阶段验收文档；除非后续真实公开仓库或文章，不能写成开源贡献或技术博客事实。
+- **TX-职责1、职责3与要求1～2、要求6**：体现 Python/TypeScript、模型调用、运行隔离、取消和质量保障思维；Planning、Memory、Tool Use 执行、Reflection 和评测/成本体系仍是后续差距。
+- **DYG-职责1、职责4及要求2～5**：已完成一个基于 LLM 的单模型端到端工程链路并能结构化解释；没有复杂产品需求理解、自规划、任务拆解、Multi-Agent、人类经验学习或亿级业务证据。
+
+### 面试可讲事实与边界
+
+- 可以表述：为自研 Agent Runtime 完成第一阶段单模型链路，以统一契约连接 Electron、线程 HTTP、常驻 asyncio Runtime 和 OpenAI-compatible Provider；实现普通/流式调用、SSE、统一错误、基本取消和并发 Run 隔离；用 100 项测试、真实回环 HTTP/SSE、真实 DeepSeek 普通/流式请求与桌面人工验收收口。
+- 可以表述：专门设计了安全真实 API 验收脚本，记录模式、耗时、增量和 Usage，同时保证凭据不进入源码、Git、日志或文档；对桌面取消的快速完成竞态采用受控阻塞 Provider 给出确定性证据，而没有夸大外部 socket 结果。
+- 不可以表述：已经实现多轮 Session、持久化、Agent Loop、工具执行、MCP、Skills、Memory、Multi-Agent、Sandbox、本地/云双 Runtime、企业系统集成或生产级 SLA。
+- 本次没有性能优化前后对照、线上用户量、并发吞吐、成功率或成本下降数据，不写百分比成果。
+
+### 后续事项
+
+- 下一项按需求文档执行 P02-01 数据库基础：确定 YanAgent 独立数据目录，使用 SQLite，建立 `sessions`、`messages`、`runs`、`schema_migrations` 并记录 Schema 版本。
+- P02 完成前，桌面看到的旧界面内容不能当作后端 Session 持久化证据；当前后端 `/api/history` 仍返回空结构，Run 只在进程内短期保留。
+- P03～P04 才实现工具注册、Schema/权限/执行和 Agent Loop；P01 只解析模型 ToolCall 并拒绝执行。
