@@ -13,6 +13,7 @@ YanAgent 是从 CowAgent 的桌面产品外壳中抽出的学习脚手架。项�
 - 后端已能创建、分页、重命名、置顶和删除会话，并以事务保存完整消息历史。
 - 普通与流式聊天会自动落库；同一 Session 的下一轮模型调用会携带先前完整历史。
 - 桌面会话列表、历史分页、用户消息时间线、重命名、置顶、删除和重新生成已接到 SQLite。
+- Session/Message/Run 强制使用用户、Agent 和 Session 归属；并发消息写入保持唯一序号，启动时恢复遗留 Run 为中断状态。
 - 阅读各核心模块的接口、TODO 和验收条件，逐步替换占位实现。
 - 使用 Python 普通/流式 Provider 或离线 Fake Provider；配置、SSE、取消和错误已接到桌面 HTTP 契约。
 
@@ -22,7 +23,7 @@ YanAgent 是从 CowAgent 的桌面产品外壳中抽出的学习脚手架。项�
 |---|---|---|
 | Agent 执行循环 | `yanagent/runtime/agent_loop.py` | 接口保留，实现为空 |
 | 运行时调度 Bridge | `yanagent/runtime/bridge.py` | 接口保留，实现为空 |
-| Session 与上下文 | `yanagent/storage/`、`yanagent/sessions/`、`yanagent/chat.py` | P02-04 已完成聊天落库、重启恢复、完整历史输入和桌面会话管理；隔离恢复待 P02-05 |
+| Session 与上下文 | `yanagent/storage/`、`yanagent/sessions/`、`yanagent/chat.py` | P02 已完成聊天落库、重启恢复、完整历史、桌面管理、强归属和 Run 中断恢复 |
 | 模型适配层 | `yanagent/models/openai_compatible.py`、`yanagent/chat.py` | P01-05 已接通普通与流式桌面消息、增量组装和安全错误 |
 | 最小流式 Runtime | `yanagent/runtime/streaming.py`、`yanagent/events.py`、`app.py` | 常驻事件循环、Run 隔离、SSE 回放、基本取消与终态清理已完成 |
 | 工具系统 | `yanagent/tools/manager.py` | 接口保留，实现为空 |
@@ -90,7 +91,7 @@ npm run dev
 6. P06～P10：多模型、完整工具、Skills、MCP、记忆知识库和 Multi-Agent。
 7. P11～P12：Web、多渠道、定时、桌面交付与功能对照验收。
 
-P01-01～P01-06、P02-01～P02-04 均已完成。P01 阶段验收见 [P01 验证与文档](docs/P01_06_VERIFICATION.md)；P02 实现见 [数据库基础](docs/P02_01_DATABASE.md)、[会话与消息存储](docs/P02_02_SESSION_STORE.md)、[历史与上下文接通](docs/P02_03_HISTORY_CONTEXT.md)和[桌面会话联调](docs/P02_04_DESKTOP_SESSIONS.md)。当前共 130 项测试通过，下一项任务是 **P02-05：隔离与恢复**；Token 预算和工具循环仍分别属于 P05、P03～P04。
+P01-01～P01-06、P02-01～P02-05 均已完成。P01 阶段验收见 [P01 验证与文档](docs/P01_06_VERIFICATION.md)；P02 实现见 [数据库基础](docs/P02_01_DATABASE.md)、[会话与消息存储](docs/P02_02_SESSION_STORE.md)、[历史与上下文接通](docs/P02_03_HISTORY_CONTEXT.md)、[桌面会话联调](docs/P02_04_DESKTOP_SESSIONS.md)和[隔离与恢复](docs/P02_05_ISOLATION_RECOVERY.md)。当前共 137 项测试通过，下一项任务是 **P03-01：工具注册与 Schema**；Token 预算仍属于 P05。
 
 可在项目根目录运行本次配置演示（使用无效测试密钥，不请求网络）：
 

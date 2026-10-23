@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import uuid
@@ -12,6 +13,7 @@ from typing import Any
 from yanagent.config import AppConfig, ConfigStore, MASKED_SECRET
 from yanagent.contracts import Message, ModelReply
 from yanagent.errors import (
+    AgentError,
     ConfigurationError,
     RequestValidationError,
     SessionAlreadyExistsError,
@@ -19,7 +21,8 @@ from yanagent.errors import (
     UnexpectedToolCallError,
 )
 from yanagent.models import ModelProvider, OpenAICompatibleProvider
-from yanagent.sessions import SessionStore
+from yanagent.sessions import RunStore, SessionStore
+from yanagent.sessions.runs import TerminalRunStatus
 
 
 LOGGER = logging.getLogger("yanagent.chat")
@@ -84,13 +87,15 @@ class YanAgentApplication:
         *,
         provider_factory: ProviderFactory | None = None,
         session_store: SessionStore | None = None,
+        run_store: RunStore | None = None,
     ) -> None:
-        """注入配置、Provider 和会话仓储；仓储为空时保留离线无状态测试模式。"""
+        """注入配置、Provider、会话与 Run 仓储；仓储为空时保留离线测试模式。"""
         self.config_store = config_store if config_store is not None else ConfigStore()
         self.provider_factory = (
             provider_factory if provider_factory is not None else OpenAICompatibleProvider
         )
         self.session_store = session_store
+        self.run_store = run_store
         self._config_lock = threading.RLock()
 
     def load_config(self) -> AppConfig:
@@ -279,12 +284,51 @@ class YanAgentApplication:
             prepared.config.model or "<未配置>",
         )
         context = await self.begin_chat(prepared, request_id=request_id)
-        reply = await prepared.provider.complete(context.messages, tools=[])
-        if reply.tool_calls:
-            raise UnexpectedToolCallError()
-        assistant_sequence = await self.finish_chat(
-            prepared, reply, request_id=request_id,
-        )
+        run_started = await self.start_run(prepared, request_id=request_id)
+        try:
+            reply = await prepared.provider.complete(context.messages, tools=[])
+            if reply.tool_calls:
+                raise UnexpectedToolCallError()
+            assistant_sequence = await self.finish_chat(
+                prepared, reply, request_id=request_id,
+            )
+            if run_started:
+                await self.finish_run(
+                    request_id,
+                    prepared.session_id,
+                    status="completed",
+                    finish_reason=reply.finish_reason,
+                    usage=reply.usage,
+                )
+        except asyncio.CancelledError:
+            if run_started:
+                await self.finish_run(
+                    request_id,
+                    prepared.session_id,
+                    status="cancelled",
+                    finish_reason="cancelled",
+                )
+            raise
+        except AgentError as error:
+            if run_started:
+                await self.finish_run(
+                    request_id,
+                    prepared.session_id,
+                    status="failed",
+                    finish_reason="error",
+                    error_code=error.code,
+                )
+            raise
+        except Exception:
+            if run_started:
+                await self.finish_run(
+                    request_id,
+                    prepared.session_id,
+                    status="failed",
+                    finish_reason="error",
+                    error_code="unexpected_error",
+                )
+            raise
         LOGGER.info(
             "[chat.py][YanAgentApplication.chat] 普通聊天请求完成，request_id=%s，上下文消息数=%d，输出字符数=%d",
             request_id, len(context.messages), len(reply.content),
@@ -301,6 +345,66 @@ class YanAgentApplication:
             "user_seq": context.user_sequence,
             "bot_seq": assistant_sequence,
         }
+
+    async def start_run(self, prepared: PreparedChat, *, request_id: str) -> bool:
+        """在用户消息落库后创建运行记录；无 RunStore 的离线模式返回 False。"""
+        if self.run_store is None:
+            return False
+        await self.run_store.create(
+            request_id,
+            prepared.session_id,
+            status="running",
+            metadata={
+                "provider": prepared.config.model_provider,
+                "model": prepared.config.model,
+            },
+        )
+        return True
+
+    async def finish_run(
+        self,
+        request_id: str,
+        session_id: str,
+        *,
+        status: TerminalRunStatus,
+        finish_reason: str | None = None,
+        error_code: str | None = None,
+        usage: dict[str, int | None] | None = None,
+    ) -> bool:
+        """保存 Run 终态；重复完成返回 False，并留下可定位的中文日志。"""
+        if self.run_store is None:
+            return False
+        try:
+            changed = await self.run_store.finish(
+                request_id,
+                session_id,
+                status=status,
+                finish_reason=finish_reason,
+                error_code=error_code,
+                usage={} if usage is None else usage,
+            )
+        except AgentError as error:
+            if status == "completed":
+                raise
+            LOGGER.error(
+                "[chat.py][YanAgentApplication.finish_run] 失败路径的 Run 终态保存失败，request_id=%s，error_code=%s",
+                request_id,
+                error.code,
+            )
+            return False
+        if not changed:
+            LOGGER.warning(
+                "[chat.py][YanAgentApplication.finish_run] Run 不存在或已进入终态，request_id=%s，目标状态=%s",
+                request_id,
+                status,
+            )
+        return changed
+
+    def recover_runs_on_startup(self) -> int:
+        """在 HTTP 接流量前中断上次进程遗留的活动 Run。"""
+        if self.run_store is None:
+            return 0
+        return self.run_store.recover_unfinished_on_startup()
 
     async def begin_chat(
         self, prepared: PreparedChat, *, request_id: str

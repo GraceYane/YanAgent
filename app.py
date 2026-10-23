@@ -18,11 +18,12 @@ from yanagent.errors import (
     MessageNotFoundError,
     ModelConnectionError, ModelNotFoundError, ModelRefusalError, ModelResponseError,
     ModelServerError, ModelTimeoutError, PermissionDeniedError, RateLimitError,
-    RequestValidationError, SessionAlreadyExistsError, SessionNotFoundError,
+    RequestValidationError, RunAlreadyExistsError, SessionAlreadyExistsError,
+    SessionNotFoundError,
     SessionStorageError, SessionValidationError, UnexpectedToolCallError,
 )
 from yanagent.runtime import AgentRuntime
-from yanagent.sessions import DesktopSessionService, SessionStore
+from yanagent.sessions import DesktopSessionService, RunStore, SessionStore
 from yanagent.storage import Database
 
 
@@ -58,7 +59,7 @@ def _http_status(error: AgentError) -> HTTPStatus:
         return HTTPStatus.FORBIDDEN
     if isinstance(error, (ModelNotFoundError, MessageNotFoundError, SessionNotFoundError)):
         return HTTPStatus.NOT_FOUND
-    if isinstance(error, SessionAlreadyExistsError):
+    if isinstance(error, (RunAlreadyExistsError, SessionAlreadyExistsError)):
         return HTTPStatus.CONFLICT
     if isinstance(error, RateLimitError):
         return HTTPStatus.TOO_MANY_REQUESTS
@@ -91,6 +92,11 @@ class YanAgentHTTPServer(ThreadingHTTPServer):
             DesktopSessionService(application.session_store)
             if application.session_store is not None
             else None
+        )
+        self.recovered_runs = application.recover_runs_on_startup()
+        LOGGER.info(
+            "[app.py][YanAgentHTTPServer.__init__] 启动 Run 恢复完成，中断数量=%d",
+            self.recovered_runs,
         )
         super().__init__(server_address, YanAgentHandler)
         self.runtime = AgentRuntime(application)
@@ -548,10 +554,16 @@ def create_server(
         if application is None and database is not None
         else None
     )
+    run_store = (
+        RunStore(database, user_id="local", agent_id="default")
+        if application is None and database is not None
+        else None
+    )
     app = application or YanAgentApplication(
         config_store,
         provider_factory=provider_factory,
         session_store=session_store,
+        run_store=run_store,
     )
     ensure_application_ready(app)
     config = app.load_config()
@@ -582,7 +594,11 @@ def main() -> None:
         database_info.path,
     )
     LOGGER.info(
-        "[app.py][main] 当前能力：P01 单模型聊天；P02-04 会话持久化、完整历史与桌面管理"
+        "[app.py][main] 启动恢复已将遗留 Run 标记为中断：数量=%d",
+        server.recovered_runs,
+    )
+    LOGGER.info(
+        "[app.py][main] 当前能力：P01 单模型聊天；P02 会话持久化、完整归属与中断恢复"
     )
     try:
         server.serve_forever(poll_interval=0.25)

@@ -17,7 +17,7 @@ from yanagent.contracts import Message, ModelReply, ToolCall
 from yanagent.errors import AuthenticationError
 from yanagent.events import ModelStreamEvent
 from yanagent.models import FakeProvider
-from yanagent.sessions import SessionStore
+from yanagent.sessions import RunStore, SessionStore
 from yanagent.storage import Database
 
 
@@ -302,6 +302,15 @@ class ChatHistoryHttpTests(unittest.TestCase):
         self.assertEqual([item.message.role for item in history], [
             "user", "assistant", "user", "assistant",
         ])
+        runs = RunStore(self.database, user_id="local", agent_id="default")
+        first_run = _run(runs.get(str(first["request_id"]), "desktop-history"))
+        second_run = _run(runs.get(str(second["request_id"]), "desktop-history"))
+        self.assertEqual(first_run.status, "completed")
+        self.assertEqual(second_run.status, "completed")
+        self.assertEqual(first_run.session_id, "desktop-history")
+        self.assertEqual(second_run.session_id, "desktop-history")
+        self.assertIsNotNone(first_run.finished_at)
+        self.assertIsNotNone(second_run.finished_at)
 
 
 if __name__ == "__main__":

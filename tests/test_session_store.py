@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -209,6 +210,36 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(await duplicate_ids.history("s"), [])
         self.assertEqual((await duplicate_ids.get("s")).message_count, 0)
+
+    async def test_concurrent_writers_allocate_unique_sequences(self) -> None:
+        """多个仓储并发追加时，事务仍分配唯一连续序号并保持准确计数。"""
+        await self.store.create("concurrent")
+        second = SessionStore(
+            self.database,
+            user_id="user-a",
+            agent_id="agent-a",
+            clock=self.clock,
+        )
+
+        async def append_one(index: int):
+            """交替使用两个仓储连接写入一条可识别消息。"""
+            selected = self.store if index % 2 == 0 else second
+            return await selected.append(
+                "concurrent", [Message(role="user", content=f"并发消息-{index}")]
+            )
+
+        batches = await asyncio.gather(*(append_one(index) for index in range(20)))
+        records = await self.store.complete_history("concurrent")
+
+        self.assertEqual(
+            sorted(batch[0].sequence for batch in batches), list(range(20))
+        )
+        self.assertEqual([record.sequence for record in records], list(range(20)))
+        self.assertEqual(
+            {record.message.content for record in records},
+            {f"并发消息-{index}" for index in range(20)},
+        )
+        self.assertEqual((await self.store.get("concurrent")).message_count, 20)
 
     async def test_delete_cascades_without_crossing_user_scope(self) -> None:
         """删除只影响当前用户会话，并级联删除其消息。"""

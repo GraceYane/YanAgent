@@ -17,6 +17,7 @@ from yanagent.errors import (
     SessionStorageError, UnexpectedToolCallError,
 )
 from yanagent.events import ClientEventType, RunEvent
+from yanagent.sessions.runs import TerminalRunStatus
 
 
 LOGGER = logging.getLogger("yanagent.runtime")
@@ -207,8 +208,12 @@ class AgentRuntime:
         """消费 Provider 增量，组装桌面事件，并把异常或取消转换为稳定终态。"""
         content: list[str] = []
         completed = False
+        run_started = False
         try:
             context = await self.application.begin_chat(
+                prepared, request_id=record.request_id,
+            )
+            run_started = await self.application.start_run(
                 prepared, request_id=record.request_id,
             )
             async for event in prepared.provider.stream(context.messages, tools=[]):
@@ -226,6 +231,14 @@ class AgentRuntime:
                     assistant_sequence = await self.application.finish_chat(
                         prepared, event.reply, request_id=record.request_id,
                     )
+                    if run_started:
+                        await self.application.finish_run(
+                            record.request_id,
+                            prepared.session_id,
+                            status="completed",
+                            finish_reason=event.reply.finish_reason,
+                            usage=event.reply.usage,
+                        )
                     record.append("done", {
                         "content": event.reply.content,
                         "finish_reason": event.reply.finish_reason,
@@ -240,6 +253,13 @@ class AgentRuntime:
                 record.request_id, len(context.messages), len("".join(content)),
             )
         except asyncio.CancelledError:
+            if run_started:
+                await self._finish_run_after_error(
+                    record.request_id,
+                    prepared.session_id,
+                    status="cancelled",
+                    finish_reason="cancelled",
+                )
             if not record.terminal:
                 record.append("cancelled", {"content": "".join(content)})
                 record.append("done", {
@@ -250,6 +270,14 @@ class AgentRuntime:
                 record.request_id,
             )
         except AgentError as error:
+            if run_started:
+                await self._finish_run_after_error(
+                    record.request_id,
+                    prepared.session_id,
+                    status="failed",
+                    finish_reason="error",
+                    error_code=error.code,
+                )
             if not record.terminal:
                 record.append("error", {
                     "message": error.message, "code": error.code, "reason": error.code,
@@ -259,6 +287,14 @@ class AgentRuntime:
                 record.request_id, error.code,
             )
         except Exception:
+            if run_started:
+                await self._finish_run_after_error(
+                    record.request_id,
+                    prepared.session_id,
+                    status="failed",
+                    finish_reason="error",
+                    error_code="unexpected_error",
+                )
             if not record.terminal:
                 error = ModelResponseError()
                 record.append("error", {
@@ -267,6 +303,31 @@ class AgentRuntime:
             LOGGER.exception(
                 "[streaming.py][AgentRuntime._run_stream] 流任务出现未分类异常，request_id=%s",
                 record.request_id,
+            )
+
+    async def _finish_run_after_error(
+        self,
+        request_id: str,
+        session_id: str,
+        *,
+        status: TerminalRunStatus,
+        finish_reason: str,
+        error_code: str | None = None,
+    ) -> None:
+        """错误或取消路径尽力保存 Run 终态，失败时不覆盖原始流错误。"""
+        try:
+            await self.application.finish_run(
+                request_id,
+                session_id,
+                status=status,
+                finish_reason=finish_reason,
+                error_code=error_code,
+            )
+        except AgentError as error:
+            LOGGER.error(
+                "[streaming.py][AgentRuntime._finish_run_after_error] Run 终态保存失败，request_id=%s，error_code=%s",
+                request_id,
+                error.code,
             )
 
     def wait_events(

@@ -22,6 +22,8 @@ from yanagent.errors import (
 )
 from yanagent.events import ModelStreamEvent
 from yanagent.models import FakeProvider
+from yanagent.sessions import RunStore
+from yanagent.storage import Database
 
 
 class BlockingHttpProvider:
@@ -322,13 +324,20 @@ class ChatCancelHttpTests(unittest.TestCase):
     def setUp(self) -> None:
         """启动使用阻塞 Provider 的独立回环服务。"""
         self.temporary = tempfile.TemporaryDirectory()
-        store = ConfigStore(Path(self.temporary.name) / "config.json", environ={})
+        root = Path(self.temporary.name)
+        store = ConfigStore(root / "config.json", environ={})
         store.save({
             "api_base": "https://example.invalid/v1", "model": "fake", "api_key": "fake-key",
         })
+        self.database = Database(data_dir=root / "data", environ={})
         self.provider = BlockingHttpProvider()
-        application = YanAgentApplication(store, provider_factory=lambda _config: self.provider)
-        self.server = create_server("127.0.0.1", 0, application=application)
+        self.server = create_server(
+            "127.0.0.1",
+            0,
+            config_store=store,
+            provider_factory=lambda _config: self.provider,
+            database=self.database,
+        )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
@@ -367,6 +376,10 @@ class ChatCancelHttpTests(unittest.TestCase):
         events = [json.loads(line[6:]) for line in lines if line.startswith("data: ")]
         self.assertEqual([event["type"] for event in events][-2:], ["cancelled", "done"])
         self.assertTrue(self.provider.cancelled.wait(1))
+        runs = RunStore(self.database, user_id="local", agent_id="default")
+        stored = asyncio.run(runs.get(str(created["request_id"]), "cancel-session"))
+        self.assertEqual(stored.status, "cancelled")
+        self.assertEqual(stored.finish_reason, "cancelled")
 
 
 class ChatStreamingErrorHttpTests(unittest.TestCase):

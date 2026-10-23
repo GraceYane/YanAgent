@@ -938,3 +938,77 @@ Electron/React chatStore
 - 下一项严格执行 P02-05：加强 `user_id + agent_id + session_id` 的接口级归属验证，验证并发写入边界，并在启动时将上次未结束的 Run 标记为 interrupted。
 - P05-02 再实现同一 Session 默认排队、不同 Session 并行的完整 Bridge 策略；P02-04 的存储事务不等于 Run 调度已经串行。
 - P05-04 实现 Token 预算、完整轮次裁剪和摘要；P02-04 历史接口始终展示完整记录，不用物理删除冒充上下文压缩。
+
+## 2026-10-22：P02-05 隔离、并发写入与 Run 恢复
+
+### 需求
+
+按照 `docs/DEVELOPMENT_REQUIREMENTS.md` 和最新 `AGENTS.md` 完成 P02-05：所有 Session/Message/Run 查询与更新强制校验 `user_id + agent_id + session_id` 完整归属；验证同一 Session 并发写入不会产生重复序号或错误计数；后端启动接流量前将上次进程遗留的 `queued/running` Run 标记为 `interrupted`。同时接通普通聊天、SSE、取消和模型错误的真实 Run 终态，避免 `runs` 表继续只是空 Schema。
+
+### 实际完成内容
+
+- 新增 `yanagent/sessions/runs.py`，实现绑定可信用户/Agent 作用域的 `RunStore` 和不可变 `StoredRun`。Run 创建时在 `BEGIN IMMEDIATE` 事务内验证目标 Session 完整归属，读取和终态更新同时匹配 `request_id + user_id + agent_id + session_id`。
+- Run 只允许 `queued/running` 原子转换到 `completed/failed/cancelled/interrupted` 一次；重复完成、错误 Session、错误用户或错误 Agent 均返回未修改，不会覆盖既有终态。
+- 普通聊天和 SSE 在用户消息落库后创建 `running` Run；模型回答和 Assistant 消息保存成功后写 `completed + finish_reason + usage`；统一模型错误写 `failed + error_code`；显式停止写 `cancelled`。
+- `YanAgentHTTPServer` 在开始接受请求前执行启动恢复：当前可信作用域内遗留的 `queued/running` 被写为 `interrupted`，同时记录 `process_restarted`、`run_interrupted` 和完成时间；其他作用域与已有终态不变。
+- 新增 `RunAlreadyExistsError` 并映射为 HTTP 409，防止重复 `request_id` 覆盖或复用原 Run。日志只记录 ID、状态和稳定错误码，不保存消息正文、API Key、Usage 明细或原始数据库异常。
+- 保留 SessionStore 已有 `BEGIN IMMEDIATE` 写事务，并增加两个独立仓储并发追加 20 条消息的测试：返回序号、数据库序号均严格为 `0..19`，正文无覆盖，`message_count=20`。
+- 增加绕过 UI 的真实 HTTP 越权测试：数据库存在另一个用户的 `hidden-only` 会话和隐藏正文，但默认桌面列表不展示，直接请求历史得到 404，错误响应不包含隐藏内容。
+- 普通与流式成功请求、流式取消和模型认证失败现在均检查 `runs` 表真实终态；新增 Server 构造测试确认恢复发生在服务接流量前，而不是只存在一个未调用的辅助函数。
+- 新增 `docs/P02_05_ISOLATION_RECOVERY.md`，同步 README、需求文档 v1.7、路线图、岗位映射和启动能力日志；P02-05 与整个 P02 标记完成，下一项为 P03-01。
+
+### 涉及文件
+
+- Run 仓储与导出：`yanagent/sessions/runs.py`、`yanagent/sessions/__init__.py`
+- 聊天与流式生命周期：`yanagent/chat.py`、`yanagent/runtime/streaming.py`
+- 服务启动恢复与错误映射：`app.py`、`yanagent/errors.py`
+- 自动化测试：`tests/test_run_store.py`、`tests/test_session_store.py`、`tests/test_desktop_sessions.py`、`tests/test_chat_history.py`、`tests/test_chat_integration.py`
+- 实现说明：`docs/P02_05_ISOLATION_RECOVERY.md`
+- 状态与导航：`README.md`、`docs/DEVELOPMENT_REQUIREMENTS.md`、`docs/IMPLEMENTATION_ROADMAP.md`、`docs/TARGET_ROLES.md`
+- 开发记录：`workProcess.md`
+
+### 验证结果
+
+- P02-05 定向测试：Run 生命周期、失败、取消、启动恢复、普通/SSE 成功持久化和三元归属测试通过。
+- 并发写入：两个 `SessionStore` 同时追加 20 条消息，所有序号唯一连续，正文集合完整，会话计数准确。
+- 归属隔离：错误 user、agent 或 session 均不能读取或结束目标 Run；绕过桌面直接访问其他用户 Session 得到 404 且不泄露正文。
+- 恢复幂等：默认作用域活动 Run 在 Server 构造时转为 `interrupted`；已完成和其他作用域的 Run 保持原状态；第二次恢复数量为 0。
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m unittest discover -s tests -p "test_*.py"`：全量 137 项测试通过；测试只使用本机 SQLite、线程和 `127.0.0.1` 回环，不访问公网。
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m compileall -q -f app.py yanagent tests examples scripts`：通过。
+- `desktop/npm run build`：通过，Renderer 转换 2152 个模块且 Main TypeScript 编译成功；字体运行时解析、Browserslist 数据和大 chunk 为既有非阻断警告，本阶段没有据此声称前端性能已优化。
+- `git diff --check`：通过，仅提示 Windows 工作区既有 LF→CRLF 转换信息。
+- Windows 受限沙箱内的回环 HTTP 测试仍会阻塞；在允许本机回环资源的受控环境复跑定向与全量测试通过。该限制没有被当作功能失败，也没有跳过测试。
+
+### 开发难点与评分
+
+整体难度：**8/10**。难点不是把一行状态写入数据库，而是让完整归属、消息事务、普通/流式/取消/错误四条终态路径和进程恢复使用同一套可验证语义，同时不把数据库串行写误写成已经实现 Bridge 调度。
+
+| 难点 | 难度 | 容易出现的问题 | 实现方式与证据 |
+|---|---:|---|---|
+| 完整归属与非泄露错误 | 8/10 | 只凭 `session_id` 或 `request_id` 查询；猜中 ID 后读到别人历史；错误响应回显隐藏正文 | Store 构造时绑定 user/agent，Session/Run 操作再强制匹配 session；跨用户/Agent/Session 单测与真实 HTTP 404 非泄露测试验证 |
+| 并发序号和计数事务 | 8/10 | 两个写入都读取同一最大序号；一条覆盖或冲突；消息插入成功但计数丢失 | `BEGIN IMMEDIATE` 中完成读取最大序号、整批插入和计数更新；两个仓储并发 20 写验证 `0..19`、正文集合和计数 |
+| 多入口 Run 终态一致性 | 8/10 | SSE 已发 done 但终态未保存；取消被记录为失败；错误终态保存异常覆盖原模型错误；重复完成覆盖结果 | 普通和 SSE 均在成功对外返回前完成 Assistant 与 Run；取消、AgentError、未知异常分别映射；活动状态条件保证一次转换；对应数据库断言通过 |
+| 启动恢复与作用域 | 7/10 | 所有历史 running 永久悬挂；恢复误伤别的用户；已完成记录被再次改写；服务先接流量再恢复 | Server 初始化阶段按可信 user/agent 原子更新活动 Run；终态/异作用域/幂等测试验证，恢复数量写中文日志 |
+| P02 与 P05 边界 | 6/10 | 把 SQLite 写锁当成同 Session 模型任务已经排队；崩溃后盲目重放可能有副作用的请求 | 文档明确本阶段只保证数据事务与状态收口；同 Session 默认排队、不同 Session 并行、续跑/幂等策略留给 P05 Bridge |
+
+### 岗位要求关联与实践证据
+
+- **小米职责1～2（上下文管理、执行编排、本地 Runtime、Sessions）**：实现从桌面消息到 Session、Run 创建、模型调用、结果回写和启动恢复的可追踪链路，完整归属和遗留状态收口可作为 Sessions/Runtime 工程证据；当前没有云端 Runtime、Gateway 多 Agent 路由或生产认证。
+- **小米职责6～7（稳定性、合规、可观测性、维护性）**：越权不泄露、事务写入、确定性终态、启动恢复和中文安全日志属于稳定性与数据边界实践；没有生产压测、SLA、成本仪表盘或合规审计结论。
+- **小米要求3（上下文、子 Agent 委派、Verification Loop）**：本阶段可讲述如何用 Fake Provider、真实 HTTP/SSE、SQLite 状态和 137 项回归构成 Verification Loop，以及为何数据库事务不等于调度；没有实现子 Agent 委派。
+- **字节职责1～2、质量 Agent 职责2～3（任务执行、多 Agent 流转、执行管控和调试评测）**：Run 状态机基础、错误/取消/重启路径和确定性回归属于任务执行管控基础；尚无自规划、任务拆解、多 Agent 流转、需求到代码生成或亿级规模证据。
+- **腾讯职责1～3及要求1～2/6（调度基础、Memory、质量保障、系统思维）**：用 Python/SQLite 实现短期会话 Memory 的归属、并发一致性和 Run 账本，并建立隔离/恢复测试；不等于完成 Planning、Reflection、完整调度引擎、长期 Memory、RAG 或系统 Benchmark。
+- **岗位通用工程表达**：`docs/P02_05_ISOLATION_RECOVERY.md` 明确状态转换、事务边界、失败语义和未实现范围，可以复现并验证，不把计划项包装成完成项。
+
+### 面试可讲事实与边界
+
+- 可以表述：为自研 Agent Runtime 实现完整 Session/Run 数据归属，所有操作以用户、Agent、Session 作为作用域；通过直接 HTTP 越权测试确认猜中 Session ID 也不能读取数据。
+- 可以表述：使用 SQLite 立即事务保证并发消息序号与计数一致，用两个独立仓储 20 路并发写验证没有重复、覆盖或丢失。
+- 可以表述：接通普通、SSE、取消和错误的 Run 生命周期，并在服务接流量前将上次遗留活动 Run 原子标记为 interrupted；通过真实回环 HTTP 和数据库断言验证。
+- 不可以表述：已经完成远程多租户认证、同 Session 请求队列、跨 Session 调度、崩溃自动续跑、生产并发压测、工具循环、长期记忆或 Multi-Agent。这些分别属于 P05、P03～P04、P09～P11。
+
+### 后续事项
+
+- 下一项严格执行 P03-01：完善工具定义、唯一名称、描述、参数 JSON Schema、风险、并行标记和作用范围，并导出统一模型工具 Schema。
+- P05-02 再实现同 Session 默认排队、不同 Session 并行、追加指令和背压；本阶段仅证明 SQLite 数据写入正确。
+- P05 设计恢复策略时必须处理“User Message 已落库但 Run 尚未创建”的崩溃窗口，并区分可安全重试与可能产生副作用的任务。

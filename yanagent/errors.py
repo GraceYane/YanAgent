@@ -138,6 +138,13 @@ class MessageNotFoundError(AgentError):
     message = "目标消息不存在或不属于当前会话。"
 
 
+class RunAlreadyExistsError(AgentError):
+    """标识全局 request_id 已存在，防止重试入口覆盖原 Run。"""
+
+    code = "run_already_exists"
+    message = "该运行标识已存在，请重新发起任务。"
+
+
 class UnexpectedToolCallError(AgentError):
     """标识普通聊天收到工具请求，但工具循环尚未进入本阶段。"""
 

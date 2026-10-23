@@ -45,6 +45,11 @@ class DesktopSessionHttpTests(unittest.TestCase):
             Message(role="user", content="第三问"),
             Message(role="assistant", content="第三答"),
         ]))
+        hidden = SessionStore(self.database, user_id="other", agent_id="default")
+        _run(hidden.create("hidden-only", title="其他用户会话"))
+        _run(hidden.append(
+            "hidden-only", [Message(role="user", content="不可泄露的内容")]
+        ))
         self.server = create_server(
             "127.0.0.1",
             0,
@@ -156,6 +161,17 @@ class DesktopSessionHttpTests(unittest.TestCase):
         )
         self.assertEqual(missing_status, 404)
         self.assertEqual(missing["error"]["code"], "message_not_found")
+
+    def test_http_cannot_read_another_users_session(self) -> None:
+        """即使猜中 session_id，桌面接口也不能列出或读取其他用户的数据。"""
+        _, sessions = self._request("/api/sessions?page=1&page_size=50&scope=all")
+        self.assertNotIn(
+            "hidden-only", [item["session_id"] for item in sessions["sessions"]]
+        )
+        status, result = self._request("/api/history?session_id=hidden-only")
+        self.assertEqual(status, 404)
+        self.assertEqual(result["error"]["code"], "session_not_found")
+        self.assertNotIn("不可泄露的内容", json.dumps(result, ensure_ascii=False))
 
 
 if __name__ == "__main__":
