@@ -1012,3 +1012,79 @@ Electron/React chatStore
 - 下一项严格执行 P03-01：完善工具定义、唯一名称、描述、参数 JSON Schema、风险、并行标记和作用范围，并导出统一模型工具 Schema。
 - P05-02 再实现同 Session 默认排队、不同 Session 并行、追加指令和背压；本阶段仅证明 SQLite 数据写入正确。
 - P05 设计恢复策略时必须处理“User Message 已落库但 Run 尚未创建”的崩溃窗口，并区分可安全重试与可能产生副作用的任务。
+
+## 2026-10-23：P03-01 工具注册与统一 Schema
+
+### 需求
+
+按照 `docs/DEVELOPMENT_REQUIREMENTS.md` 和最新 `AGENTS.md` 完成 P03-01：完善 `ToolDefinition`，支持唯一名称、说明、参数 JSON Schema、风险等级、是否允许并行和作用范围；实现可发现的线程安全注册表，并导出 ModelProvider 可直接使用的供应商无关 Schema。严格保持阶段边界，不提前把注册功能写成工具已经可执行。
+
+### 实际完成内容
+
+- 将 `yanagent/tools/manager.py` 从空骨架实现为工具定义和注册基础。新增严格 `ToolDefinition`，包含 `name / description / parameters / handler / risk_level / parallel_safe / scope / requires_confirmation`。
+- 工具名与现有 Provider 协议保持一致，只接受 1～64 位 ASCII 字母、数字、下划线或连字符；说明必须非空且限制长度；handler 必须可调用。
+- 风险等级固定为 `low / medium / high`，作用范围固定为 `global / user / agent / session / workspace`，并行与确认标记必须为真正布尔值，避免 `1` 等隐式值进入权限和调度逻辑。
+- 参数 Schema 只接受严格 JSON：拒绝循环引用、非字符串键、非有限数字和 Python 私有对象；顶层必须是 object，`properties` 必须是对象，`required` 只能引用已声明属性且不能重复。
+- 顶层 `additionalProperties` 默认补为 `false`，显式允许未知字段会被拒绝。这样模型看到的 Schema 与后续 P03-03“未知参数拒绝”目标一致，不会出现模型被允许发送、执行层又拒绝的契约冲突。
+- `ToolManager.register()` 在锁内执行名称唯一检查，同名工具明确抛 `ToolAlreadyRegisteredError`，不允许后注册实现静默覆盖 handler。注册前再次复制定义，避免调用方后改原 Schema 污染注册表。
+- 新增 `get()`、`names()`、`schemas()` 和 `catalog()`：读取与导出均返回独立快照；工具按名称排序，确保注册先后不改变模型请求和测试结果。
+- `schemas()` 只向模型输出 `name + description + parameters`；`catalog()` 才包含风险、并行、范围和确认元数据。安全策略字段不会作为未知 Provider 字段发送给模型。
+- 导出的统一 Schema 已通过现有 `openai_compatible.prepare_request()` 验证，可继续由 Provider 适配层包装为 Chat Completions 的 function tool 格式。
+- `execute()` 继续明确抛出未实现错误；P03-01 没有执行 handler，没有接入聊天，也没有把风险元数据冒充权限控制。时间/计算器、参数执行和权限分别留给 P03-02～P03-04。
+- 参考 CowAgentByYan `BaseTool` 的 `name / description / params / parallel_safe` 和 ToolManager 注册概念，但没有复制其插件装载、MCP 生命周期或完整执行器；YanAgent 使用自己的显式定义、快照和阶段化边界。
+- 新增 `docs/P03_01_TOOL_REGISTRY.md`，同步 README、需求文档 v1.8、路线图、P01 Provider 说明和岗位映射；P03-01 标记完成，下一项为 P03-02。
+
+### 涉及文件
+
+- 工具定义与注册：`yanagent/tools/manager.py`
+- 工具公开接口：`yanagent/tools/__init__.py`
+- 自动化测试：`tests/test_tool_registry.py`
+- 实现说明：`docs/P03_01_TOOL_REGISTRY.md`
+- 状态与导航：`README.md`、`docs/DEVELOPMENT_REQUIREMENTS.md`、`docs/IMPLEMENTATION_ROADMAP.md`、`docs/P01_03_PROVIDER.md`、`docs/TARGET_ROLES.md`
+- 开发记录：`workProcess.md`
+
+### 验证结果
+
+- P03-01 新增 11 项定向测试：合法定义规范化、非法名称/元数据/Schema、输入与输出快照隔离、重名不覆盖、并发唯一注册、稳定排序、内部元数据隔离和 Provider 兼容均通过。
+- 并发注册测试用两个线程同时注册 `calculator`，结果严格为一个 `registered`、一个 `duplicate`，注册表最终只有一项。
+- Schema 适配测试将 `ToolManager.schemas()` 直接交给 `prepare_request()`，成功生成 Chat Completions function tool 包装；模型 Schema 不含风险、范围或 handler。
+- 修改调用方原始 Schema、`get()` 返回定义或 `schemas()` 返回字典不会污染注册表中的保存快照。
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m unittest tests.test_tool_registry -v`：11 项定向测试通过。
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m unittest discover -s tests -p "test_*.py"`：全量 148 项测试通过，本次最终运行 12.403 秒；耗时仅为本机单次记录，不作为性能结论。
+- `.\.venv\Scripts\python.exe -X utf8 -W error -m compileall -q -f app.py yanagent tests examples scripts`：通过。
+- `git diff --check`：通过，仅提示 Windows 工作区既有 LF→CRLF 转换信息。
+- 定向测试最初用 `asyncio.run()` 验证未实现入口时，在 Windows 受限沙箱卡在事件循环初始化；改为直接推进协程到首个异常后，测试不再依赖 socketpair。全量含 HTTP/asyncio 测试仍在允许本机回环的受控环境通过。
+
+### 开发难点与评分
+
+整体难度：**7/10**。核心难点是同时定义模型可理解的 Schema、内部安全元数据和后续执行边界，既不能让坏定义进入系统，也不能在 P03-01 过度实现完整 JSON Schema 或权限执行。
+
+| 难点 | 难度 | 容易出现的问题 | 实现方式与证据 |
+|---|---:|---|---|
+| 内部元数据与模型 Schema 分层 | 7/10 | 把 risk、scope、handler 发送给 Provider 导致协议拒绝；或模型 Schema 与执行定义分成两份后漂移 | 单一 ToolDefinition 保存全部信息；`model_schema()` 只投影三字段，`catalog_entry()` 导出内部字段；Provider 适配测试验证 |
+| Schema 安全子集 | 7/10 | 循环对象导致递归崩溃；NaN 无法严格编码；required 引用不存在字段；允许未知字段与后续执行策略冲突 | 递归严格 JSON 复制、活动对象检测、封闭 object Schema、required 一致性检查；8 类坏 Schema 测试验证 |
+| 注册唯一性和快照隔离 | 7/10 | 两线程同时检查后都注册成功；后注册工具替换原 handler；外部字典修改导致运行中的工具定义漂移 | 唯一检查和写入放在同一 RLock；重复明确失败；构造、注册、读取和导出多次复制；并发和污染测试验证 |
+| 风险、并行与范围语义 | 6/10 | 用任意字符串导致后续策略分支失控；把“parallel_safe=True”误解为当前已经并行执行 | 使用固定 Literal/运行时白名单和严格 bool；文档明确当前只保存元数据，P03-04/P04 才消费 |
+| 阶段边界 | 5/10 | 注册表完成后顺手执行 handler，从而跳过参数校验、权限和超时；或保留全部空实现导致 P03-01 没有真实业务价值 | 完成定义/注册/发现/适配，`execute()` 保持显式未实现并有测试；后续编号和边界写入专项文档 |
+
+### 岗位要求关联与实践证据
+
+- **小米职责1、职责3（Agent 完整链路、Tooling/MCP 信息打通）**：本阶段实现统一工具描述、唯一注册和 Provider Schema 边界，是内置工具与未来 MCP 工具共享入口的协议基础；没有实现 MCP Client/Server、企业数据/监控/CI 接入或真实工具执行。
+- **小米职责6～7（安全、稳定性、可维护性）**：封闭参数 Schema、风险/范围元数据、重名拒绝、线程安全注册和中文定位日志属于安全与维护基础；没有权限 UI、生产压测、成本或性能指标。
+- **字节质量 Agent 职责2～3（多工具编排、可复用框架、工具协议规范）**：统一 ToolDefinition、稳定 Schema 和确定性注册测试可作为工具协议规范证据；没有多工具调用编排、测试生成、代码评审或结果汇总验证。
+- **腾讯职责1～2及要求2/4（工具调用执行引擎、Tool Use、工具描述）**：实现了 Tool Use 的定义和发现层，可解释模型 Schema 与内部安全字段为何分离；尚未实现执行引擎、Planning、Reflection 或真实 Prompt 工具选择效果。
+- **小米要求4、腾讯要求3/5（开源机制拆解和技术选型）**：实际对照 CowAgentByYan `BaseTool`/ToolManager 的字段与并行标记，选择显式数据定义而不是类扫描；这只是一个开源项目的局部机制拆解，不等于熟悉 OpenClaw、LangGraph、AutoGen、CrewAI 或 MetaGPT。
+- **Verification Loop 实践**：用坏 Schema、重复/并发注册、快照污染和 Provider 转换构成确定性验证；这是工程回归，不等于 Agent 自主验证和修复闭环。
+
+### 面试可讲事实与边界
+
+- 可以表述：为自研 Agent Runtime 设计供应商无关 ToolDefinition，统一名称、说明、封闭 JSON Schema、风险、并行安全和数据作用范围，并由 Provider 适配层转换厂商格式。
+- 可以表述：实现线程安全的唯一注册和多层快照隔离，用并发测试证明同名工具只有一个注册成功，用适配测试证明 Schema 能直接进入现有模型请求链路。
+- 可以表述：参考 CowAgent 工具基类和管理器后，刻意分离模型可见 Schema 与内部权限/调度元数据，避免协议耦合并为 MCP 复用入口预留边界。
+- 不可以表述：Agent 已经能调用计算器/时间工具、已完成参数校验、权限确认、超时截断、多工具循环、MCP、Sandbox 或工具并行执行。这些属于 P03-02～P04、P06 和 P08。
+
+### 后续事项
+
+- 下一项严格执行 P03-02：实现 `current_time` 和安全计算器；计算器使用受限解析，禁止 `eval/exec` 和任意函数、属性或导入。
+- P03-03 再实现真实 ToolCall 参数类型校验、未知工具、统一 ToolResult、超时、异常和输出截断；当前参数 Schema 只定义接口。
+- P03-04 将风险、范围和 `requires_confirmation` 与 `deny / ask / allow` 结合；在确认 UI 接通前，需要确认的工具默认拒绝。

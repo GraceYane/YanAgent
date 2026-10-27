@@ -51,7 +51,7 @@ tools = [{
 }]
 ```
 
-转换为供应商的 `{"type":"function","function":{...}}` 包装。工具名称要求 1～64 个 ASCII 字母、数字、下划线或连字符，禁止重名；顶层参数类型要求 object，内部值要求标准 JSON。完整 JSON Schema 合法性及真实调用参数校验在 P03 工具系统实现。
+转换为供应商的 `{"type":"function","function":{...}}` 包装。工具名称要求 1～64 个 ASCII 字母、数字、下划线或连字符，禁止重名；顶层参数类型要求 object，内部值要求标准 JSON。P03-01 已实现工具定义、封闭对象 Schema 和唯一注册；真实调用参数校验仍在 P03-03 实现。
 
 - system/user/assistant 的正文按原文发送；内部 `metadata` 不发送。
 - Assistant 的 `ToolCall.arguments` 从对象转为 JSON 字符串，保留 ID 与名称；纯工具调用时 content 为 null。
