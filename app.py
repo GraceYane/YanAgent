@@ -356,7 +356,7 @@ class YanAgentHandler(BaseHTTPRequestHandler):
                 self._json(self.application.config_payload())
                 return
             if path == "/api/tools":
-                self._json({"status": "success", "tools": []})
+                self._json(self.application.tools_payload())
                 return
             if path == "/api/skills":
                 self._json({"status": "success", "skills": []})
@@ -598,7 +598,7 @@ def main() -> None:
         server.recovered_runs,
     )
     LOGGER.info(
-        "[app.py][main] 当前能力：P01 单模型聊天；P02 会话持久化、完整归属与中断恢复"
+        "[app.py][main] 当前能力：P01 单模型聊天；P02 会话持久化；P03 工具与权限基础"
     )
     try:
         server.serve_forever(poll_interval=0.25)

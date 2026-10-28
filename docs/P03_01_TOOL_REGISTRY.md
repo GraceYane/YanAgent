@@ -2,7 +2,7 @@
 
 状态：已完成  
 完成日期：2026-10-23  
-后续状态：P03-02～P03-04 已完成；下一项为 P03-05 测试与接口
+后续状态：P03-02～P03-05 已完成；下一项为 P04-01 Prompt 与上下文组装
 
 ## 1. 本阶段交付
 
@@ -94,5 +94,5 @@ ToolManager.register
 - `current_time` 和受限计算器已由 P03-02 实现；详见 [安全示例工具](P03_02_SAFE_TOOLS.md)。
 - `ToolCall.arguments`、未知工具、超时、异常和大结果已由 P03-03 处理；详见 [统一工具执行](P03_03_TOOL_EXECUTION.md)。
 - `risk_level`、`scope` 和 `requires_confirmation` 已由 P03-04 接入权限决策，详见 [工具权限基础](P03_04_PERMISSION_FOUNDATION.md)。
-- 尚无桌面或 HTTP 工具列表接口；P03-05 接通。
+- 桌面 `/api/tools` 目录已由 P03-05 接通，详见 [工具列表与阶段验收](P03_05_TOOL_INTERFACE.md)。
 - 尚未把工具 Schema 注入真实聊天，也没有模型→工具→模型循环；P04 完成。

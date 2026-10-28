@@ -23,6 +23,7 @@ from yanagent.errors import (
 from yanagent.models import ModelProvider, OpenAICompatibleProvider
 from yanagent.sessions import RunStore, SessionStore
 from yanagent.sessions.runs import TerminalRunStatus
+from yanagent.tools import ToolManager, register_safe_example_tools
 
 
 LOGGER = logging.getLogger("yanagent.chat")
@@ -88,15 +89,34 @@ class YanAgentApplication:
         provider_factory: ProviderFactory | None = None,
         session_store: SessionStore | None = None,
         run_store: RunStore | None = None,
+        tool_manager: ToolManager | None = None,
     ) -> None:
-        """注入配置、Provider、会话与 Run 仓储；仓储为空时保留离线测试模式。"""
+        """注入配置、Provider、仓储和工具注册表；缺省注册 P03 安全示例工具。"""
         self.config_store = config_store if config_store is not None else ConfigStore()
         self.provider_factory = (
             provider_factory if provider_factory is not None else OpenAICompatibleProvider
         )
         self.session_store = session_store
         self.run_store = run_store
+        if tool_manager is None:
+            tool_manager = ToolManager()
+            register_safe_example_tools(tool_manager)
+        elif not isinstance(tool_manager, ToolManager):
+            raise TypeError("tool_manager 必须是 ToolManager")
+        self.tool_manager = tool_manager
         self._config_lock = threading.RLock()
+
+    def tools_payload(self) -> dict[str, Any]:
+        """返回桌面工具页使用的注册目录，不暴露 handler、参数或权限内部字段。"""
+        tools = [
+            {"name": item["name"], "description": item["description"]}
+            for item in self.tool_manager.catalog()
+        ]
+        LOGGER.info(
+            "[chat.py][YanAgentApplication.tools_payload] 已生成工具列表，数量=%d",
+            len(tools),
+        )
+        return {"status": "success", "tools": tools}
 
     def load_config(self) -> AppConfig:
         """读取一次经过文件和环境覆盖后的不可变配置快照。"""
