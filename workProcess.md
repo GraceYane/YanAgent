@@ -1088,3 +1088,71 @@ Electron/React chatStore
 - 下一项严格执行 P03-02：实现 `current_time` 和安全计算器；计算器使用受限解析，禁止 `eval/exec` 和任意函数、属性或导入。
 - P03-03 再实现真实 ToolCall 参数类型校验、未知工具、统一 ToolResult、超时、异常和输出截断；当前参数 Schema 只定义接口。
 - P03-04 将风险、范围和 `requires_confirmation` 与 `deny / ask / allow` 结合；在确认 UI 接通前，需要确认的工具默认拒绝。
+
+## 2026-10-27：P03-02 安全示例工具
+
+### 需求
+
+按照 `docs/DEVELOPMENT_REQUIREMENTS.md` 和最新 `AGENTS.md` 完成 P03-02：实现 `current_time` 与计算器；计算器必须使用受限解析，不能执行任意 Python 代码。保持阶段边界，不提前把独立 handler 描述成统一工具执行器或模型工具循环。
+
+### 实际完成内容
+
+- 新增 `yanagent/tools/examples.py`，实现 `current_time_info()` 与异步 `current_time_handler()`。工具按需读取本机时间，返回日期、时间、中文星期、UTC 偏移和 ISO 8601 的严格 JSON 文本，不访问网络或用户私有数据。
+- 时间辅助函数支持注入带时区的固定 `datetime`，让星期和偏移测试与真实时钟、测试机器地区解耦；无参数 handler 对未知字段明确失败，不静默忽略模型输入。
+- 实现 `calculate_expression()` 与异步 `calculator_handler()`。表达式先由 `ast.parse(mode="eval")` 解析，再由自有递归函数对白名单节点求值；没有使用 `eval / exec / compile / shell`。
+- 计算器仅允许整数、有限小数、括号、加减乘除、整除、取余、有限次幂和单目正负号；拒绝名称、调用、导入、属性、下标、容器、布尔值、复数、位运算、比较及条件表达式。
+- 增加表达式 256 字符、64 个 AST 节点、16 层求值深度、指数绝对值 100、结果绝对值 `10^100` 五类上限，避免把“没有任意代码执行”误当成“不会被资源滥用”。
+- handler 防御性校验精确参数集合：时间工具必须为空对象，计算器必须且只能包含字符串 `expression`；统一 JSON Schema 验证仍按计划留给 P03-03。
+- 新增 `current_time_definition()`、`calculator_definition()`、`safe_example_definitions()` 和 `register_safe_example_tools()`。两个工具均标记为低风险、全局范围、并行安全且无需确认，统一经过 P03-01 `ToolManager` 注册和 Schema 导出。
+- 关键路径增加包含文件名和函数名的中文日志；计算器日志只记录表达式长度、拒绝原因和结果类型，不回显完整表达式。
+- 参考 CowAgentByYan 把准确时间放在按需工具而非长期 Prompt 的产品边界；计算器采用 YanAgent 自己的 AST 白名单设计，没有引入参考项目的插件、执行器或文件/进程能力。
+- 新增 `docs/P03_02_SAFE_TOOLS.md`，同步 README、需求文档 v1.9、路线图、P03-01 后续状态和岗位映射；P03-02 标记完成，下一项为 P03-03。
+
+### 涉及文件
+
+- 安全示例工具：`yanagent/tools/examples.py`
+- 工具公开接口：`yanagent/tools/__init__.py`
+- 自动化测试：`tests/test_safe_tools.py`
+- 实现说明：`docs/P03_02_SAFE_TOOLS.md`
+- 状态与导航：`README.md`、`docs/DEVELOPMENT_REQUIREMENTS.md`、`docs/IMPLEMENTATION_ROADMAP.md`、`docs/P03_01_TOOL_REGISTRY.md`、`docs/P02_04_DESKTOP_SESSIONS.md`、`docs/P02_05_ISOLATION_RECOVERY.md`、`docs/TARGET_ROLES.md`
+- 开发记录：`workProcess.md`
+
+### 验证结果
+
+- P03-02 新增 11 项测试：固定时间、时间 JSON、无参数边界、运算正确性、结果格式、不使用 `eval`、危险语法拒绝、资源限制、参数精确性、安全元数据和统一注册均通过。
+- 通过实际替换 `builtins.eval` 为抛错函数后计算 `(2 + 3) * 4`，结果仍为 20，证明正常计算路径不依赖 Python `eval`。
+- `__import__('os').system(...)`、`open(...)`、变量、属性、下标、列表、位移、布尔值、除零、复数、巨大指数和非有限浮点等输入均得到受控 `SafeToolError`，没有执行副作用。
+- `register_safe_example_tools()` 注册后名称稳定为 `calculator / current_time`，模型 Schema 继续封闭未知字段，内部风险元数据不混入 Provider Schema。
+- `tests.test_safe_tools + tests.test_tool_registry` 共 22 项定向测试通过。
+- `python -m compileall`、全量 159 项回归和 `git diff --check` 在最终代码与文档更新后通过。
+
+### 开发难点与评分
+
+整体难度：**7/10**。难点不是四则运算本身，而是确保解析器没有代码执行入口，同时限制合法但可能消耗大量 CPU/内存的数学表达式，并保持 P03-02 与后续统一执行、权限阶段的边界。
+
+| 难点 | 难度 | 容易出现的问题 | 实现方式与证据 |
+|---|---:|---|---|
+| 受限解析而非代码执行 | 8/10 | 直接 `eval` 可访问导入、文件、对象属性；简单字符串替换容易绕过 | `ast.parse(mode="eval")` 只解析，递归求值仅接收 Constant、指定 BinOp/UnaryOp；危险语法矩阵和禁用 `eval` 测试验证 |
+| 资源滥用边界 | 7/10 | `2**超大指数`、超长或超深表达式虽不是任意代码，也可能耗尽资源 | 在求值前后限制字符、节点、深度、指数和数值绝对值；巨大指数、复杂表达式和非有限结果测试验证 |
+| 工具本体与统一执行器分层 | 6/10 | handler 可调用后误称工具循环已完成；或把 P03-03 的所有校验提前写进单个工具 | handler 只做必要防御和业务计算，注册定义可供 Provider 使用；`ToolManager.execute()` 仍显式未实现，文档列出 ToolResult/超时/截断边界 |
+| 时间与测试确定性 | 5/10 | 测试依赖当前秒数和机器时区，跨机器不稳定；Prompt 中固定时钟会过期 | 时间按需读取；辅助函数允许注入 aware datetime；固定 +08:00 用例验证中文星期、偏移和 ISO 8601 |
+
+### 岗位要求关联与实践证据
+
+- **小米职责1、职责3和职责6（Agent 链路、Tooling、安全稳定性）**：两个真实工具通过统一定义和注册表暴露，计算器具备代码执行隔离与资源上限；当前没有接入 MCP、企业系统、权限 UI 或操作系统 Sandbox。
+- **字节质量 Agent 职责2～3（多工具调用、执行管控、可复用框架）**：工具本体与定义分离、统一注册、稳定 Schema 和恶意输入测试属于可复用 Tooling 基础；没有完成模型多工具编排、结果汇总或质量业务工作流。
+- **腾讯职责1～2及要求1～2/4（执行引擎、Tool Use、Python 与工具描述）**：用 Python AST 实现白名单解释器，并为模型提供清晰的能力/限制描述；尚未完成统一执行引擎、Planning、Reflection 或 ToolResult 生命周期。
+- **Verification Loop 实践**：先列出允许/拒绝语法和资源上限，再用 11 项行为测试验证，且全量回归保持通过；这是确定性工程验证，不等于 Agent 自主验证、修复和重试闭环。
+
+### 面试可讲事实与边界
+
+- 可以表述：为 Agent 实现低风险时间和计算工具；计算器不使用 `eval`，而是 AST 白名单解释，并对表达式规模、递归深度、指数和结果范围施加限制。
+- 可以表述：将工具业务 handler、模型 Schema 和内部安全元数据分层，通过注册表统一暴露；用恶意表达式矩阵和禁用 `eval` 测试证明代码执行路径被封闭。
+- 可以表述：参考开源 Agent 将实时信息做成按需工具，避免在长期 Prompt 中写入会过期的时钟，并用可注入时间保证测试确定性。
+- 不可以表述：模型已经能自动调用工具、所有 JSON Schema 已统一校验、错误已转换为 ToolResult、权限/确认/超时/截断已完成，或计算器等同操作系统 Sandbox。这些属于 P03-03～P04 或更强隔离层。
+
+### 后续事项
+
+- 下一项严格执行 P03-03：把 `ToolCall` 接到注册表 handler，统一校验必填、类型和未知字段，处理未知工具、损坏参数、超时、异常和输出截断，并始终返回关联原 `tool_call_id` 的 `ToolResult`。
+- P03-04 再实现 `deny / ask / allow` 和作用范围；尚未接入确认 UI 时，需要确认的操作默认拒绝。
+- P04 才把模型工具请求、Assistant 原始调用消息、Tool Result 和下一轮模型请求组成真正 Agent Loop。
