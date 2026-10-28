@@ -1156,3 +1156,75 @@ Electron/React chatStore
 - 下一项严格执行 P03-03：把 `ToolCall` 接到注册表 handler，统一校验必填、类型和未知字段，处理未知工具、损坏参数、超时、异常和输出截断，并始终返回关联原 `tool_call_id` 的 `ToolResult`。
 - P03-04 再实现 `deny / ask / allow` 和作用范围；尚未接入确认 UI 时，需要确认的操作默认拒绝。
 - P04 才把模型工具请求、Assistant 原始调用消息、Tool Result 和下一轮模型请求组成真正 Agent Loop。
+
+## 2026-10-28：P03-03 参数校验与统一工具结果
+
+### 需求
+
+按照 `docs/DEVELOPMENT_REQUIREMENTS.md` 和最新 `AGENTS.md` 完成 P03-03：校验工具必填参数、类型与未知字段，处理损坏参数和未知工具；通过 `ToolManager` 统一生成 `ToolResult`，处理单工具超时、handler 异常、返回类型和大输出截断。保持阶段边界，不把最小失败关闭闸门描述为完整权限系统，也不提前实现模型工具循环。
+
+### 实际完成内容
+
+- 新增 `yanagent/tools/validation.py`，实现显式 JSON Schema 子集：object、array、string、integer、number、boolean、null，以及 required、additionalProperties、enum、长度、数组数量和数值范围约束。
+- 参数类型严格匹配 JSON 语义，不把 bool 当作 integer/number；对象必填和未知字段在 handler 前检查；嵌套 Schema 最多校验 32 层，内部矛盾约束被识别为工具定义错误，而不是用户参数错误。
+- 参数校验成功后深复制再传给 handler，阻止工具修改后续需要持久化的原始 `ToolCall.arguments`。
+- 将 `ToolManager.execute()` 从占位实现替换为完整单调用执行链：验证 ToolCall、最小权限闸门、查找工具、校验参数、限时等待 handler、检查字符串结果、截断输出并生成结构化 `ToolResult`。
+- 成功、参数失败、未知工具、超时、受控失败、未知异常、错误返回类型和截断结果均保留原 `tool_call_id`；未知异常正文和模型原始参数不会写入结果或日志。
+- 新增 `ToolHandlerError`，内部 handler 只有显式使用该类型时才能向模型提供最多 500 字且无控制字符的公开错误；其他异常只返回固定“工具执行失败”。P03-02 `SafeToolError` 改为其子类。
+- `ToolManager` 默认单工具超时 30 秒、输出上限 20000 字符；超时允许 0～600 秒，输出允许 64～1000000 字符。大结果保留头部，并在总上限内追加原始字符数截断标记。
+- `asyncio.CancelledError` 不被普通异常分支吞掉，外层取消继续传播；协作式超时会取消 handler。文档明确事件循环阻塞或吞取消的 handler 无法被 Python 强制终止，阻塞工具必须另做线程/进程和底层期限。
+- 在 P03-04 完成前实施最小失败关闭：只有 `allow` 进入 handler，`deny / ask / 非法模式` 都不执行。尚未消费 risk、scope、requires_confirmation，也没有确认请求 ID，因此没有标记 P03-04 完成。
+- 删除 P03-01 中“execute 必须保持未实现”的过期测试，新增 13 项执行测试；同步 README、需求文档 v1.10、路线图、P03 前序说明和岗位映射，下一项更新为 P03-04。
+
+### 涉及文件
+
+- 工具执行与定义：`yanagent/tools/manager.py`
+- 参数校验：`yanagent/tools/validation.py`
+- 安全示例错误基类接入：`yanagent/tools/examples.py`
+- 工具公开接口：`yanagent/tools/__init__.py`
+- 自动化测试：`tests/test_tool_execution.py`、`tests/test_tool_registry.py`
+- 实现说明：`docs/P03_03_TOOL_EXECUTION.md`
+- 状态与导航：`README.md`、`docs/DEVELOPMENT_REQUIREMENTS.md`、`docs/IMPLEMENTATION_ROADMAP.md`、`docs/P03_01_TOOL_REGISTRY.md`、`docs/P03_02_SAFE_TOOLS.md`、`docs/P02_04_DESKTOP_SESSIONS.md`、`docs/P02_05_ISOLATION_RECOVERY.md`、`docs/TARGET_ROLES.md`
+- 开发记录：`workProcess.md`
+
+### 验证结果
+
+- P03-03 新增 13 项执行测试：成功关联调用 ID、参数前置拒绝、嵌套 Schema、参数副本、未知工具、最小权限闸门、超时、受控/未知异常、错误返回类型、截断、取消传播和配置边界全部通过。
+- 损坏 JSON 正常路径继续由 Provider 严格解析器拒绝；测试还绕过 `ToolCall` 构造校验模拟损坏对象进入执行边界，执行器再次校验并返回关联 `call-1` 的结构化失败，handler 执行次数保持 0。
+- 超时测试让 handler 等待 10 秒、管理器期限设为 0.01 秒，结果为超时失败且 handler 的 finally 收到取消；外层任务取消测试确认 `CancelledError` 继续传播。
+- 异常测试依次触发受控错误、含敏感占位正文的 RuntimeError 和成功；未知异常正文未进入 ToolResult，第三次调用仍返回 `recovered`，证明单次工具失败不使管理器失效。
+- 200 字符输出在 80 字符配置下被截断，结果包含“工具输出已截断”和原始字符数 200，最终内容长度不超过 80。
+- P03-01～P03-03 当前 34 项工具专项测试通过；全量 171 项测试通过。本机最终完整回归运行 9.711 秒，该单次耗时不作为性能结论。
+- `python -m compileall` 与 `git diff --check` 在最终代码和文档更新后通过；敏感值扫描未发现实际密钥或凭据。
+
+### 开发难点与评分
+
+整体难度：**8/10**。难点在于把模型提供的不可信参数、内部 Schema、异步生命周期和可持久化结果分层：失败必须发生在副作用前，异常不能泄露内部正文，超时不能吞掉外层取消，大输出又必须留下可解释的截断证据。
+
+| 难点 | 难度 | 容易出现的问题 | 实现方式与证据 |
+|---|---:|---|---|
+| 参数与副作用顺序 | 8/10 | 缺失/未知/错误类型仍进入 handler，产生文件或网络副作用；handler 修改原 ToolCall 破坏历史 | 统一 Schema 前置校验，成功后深复制；四类坏参数和嵌套修改测试证明 handler 未执行/原参数不变 |
+| 异步超时与取消语义 | 8/10 | 把外层取消转成普通失败；超时后误称所有代码都已强制停止；阻塞事件循环使期限失效 | `wait_for` 管理协作式 handler，Timeout 转结构化失败，CancelledError 向上传播；两类测试及限制文档验证 |
+| 安全错误与可诊断性 | 7/10 | 将异常正文、模型参数或凭据回显给模型/日志；全部固定错误又难以定位 | ToolHandlerError 只允许受控短文本；未知异常只记类型，日志保留文件/函数、call_id、tool 和 reason 分类；连续失败后成功测试验证服务继续 |
+| 输出截断一致性 | 7/10 | 直接切片没有标记，模型误以为内容完整；追加标记后超过配置上限 | 先计算含原始字符数的标记，再按剩余空间取头部；80 字符上限测试验证标记与总长度 |
+| Schema 支持边界 | 7/10 | 声称完整 JSON Schema 却漏掉组合、引用和 pattern；bool 被 Python 当作 int | 明确实现受控子集并递归校验常用类型/约束，严格 type 比较；文档列出能力，不宣称完整标准实现 |
+
+### 岗位要求关联与实践证据
+
+- **小米职责1、职责3、职责6～7（Agent 链路、Tooling、安全稳定性和可维护性）**：形成从不可信 ToolCall 到结构化结果的统一执行边界，包含副作用前校验、超时、取消、异常脱敏和截断；没有企业系统/MCP 接入、生产压测或 OS Sandbox。
+- **字节质量 Agent 职责2～3（多工具编排、执行管控、调试与评测）**：统一 Schema、结果和失败分类为后续多工具编排提供执行管控基础，34 项工具回归提供可复现证据；没有模型多轮编排、测试生成/评审业务流或效果评测。
+- **腾讯职责1～3及要求1～2/6（工具执行引擎、Tool Use、质量保障、系统思维）**：用 Python 实现递归参数验证、异步超时和安全错误边界，并验证取消传播与连续服务；尚未完成 Planning、Reflection、完整权限、Agent Loop 或系统 Benchmark。
+- **Verification Loop 实践**：从缺失/未知/类型/损坏参数到超时、异常、截断、取消建立失败矩阵，修复测试中发现的 ToolCall 构造期校验差异后复跑专项与全量；这是工程验证回路，不等于 Agent 自主修复闭环。
+
+### 面试可讲事实与边界
+
+- 可以表述：为自研 Agent Runtime 实现统一工具执行器，在 handler 副作用前做递归 Schema 校验，并用深复制保护模型原始调用；成功和失败都关联 tool_call_id。
+- 可以表述：将受控业务失败与未知异常分开，未知异常不回显正文；实现单工具超时、外层取消传播、返回类型校验和带原始长度的有界截断。
+- 可以表述：通过损坏参数、未知工具、嵌套类型、超时取消、连续异常恢复和大输出测试验证执行器边界，并明确异步协作取消不等于强制杀死阻塞代码。
+- 不可以表述：已完成完整 JSON Schema、ask 确认 UI、细粒度 scope/risk 权限、模型自动选工具、多工具并发、聊天工具卡片或 OS 级 Sandbox。这些属于 P03-04～P04 或更强隔离层。
+
+### 后续事项
+
+- 下一项严格执行 P03-04：定义 `deny / ask / allow` 的完整语义，结合 risk、scope 与 requires_confirmation，增加确认请求 ID 和批准/拒绝结果；确认 UI 未接通前 ask 默认拒绝。
+- P03-05 接通工具列表接口，并对 P03 阶段重复注册、非法参数、权限拒绝、超时和执行失败做综合接口验收。
+- P04 才将工具 Schema 注入模型请求，保存 Assistant 原始工具调用和 Tool Result，并驱动下一轮模型直到最终文本。

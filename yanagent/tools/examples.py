@@ -9,7 +9,7 @@ import operator
 from datetime import datetime
 from typing import Any
 
-from .manager import ToolDefinition, ToolManager
+from .manager import ToolDefinition, ToolHandlerError, ToolManager
 
 
 LOGGER = logging.getLogger("yanagent.tools")
@@ -30,7 +30,7 @@ _BINARY_OPERATORS = {
 _UNARY_OPERATORS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
 
 
-class SafeToolError(ValueError):
+class SafeToolError(ToolHandlerError):
     """表示安全示例工具收到非法输入或无法安全完成计算。"""
 
 

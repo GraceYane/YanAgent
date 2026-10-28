@@ -6,7 +6,7 @@ import concurrent.futures
 import math
 import unittest
 
-from yanagent.contracts import Message, ToolCall
+from yanagent.contracts import Message
 from yanagent.models.openai_compatible import prepare_request
 from yanagent.tools import (
     ToolAlreadyRegisteredError,
@@ -196,16 +196,6 @@ class ToolManagerTests(unittest.TestCase):
         """普通字典不能绕过 ToolDefinition 的校验直接进入注册表。"""
         with self.assertRaises(ToolDefinitionError):
             self.manager.register({"name": "unsafe"})
-
-    def test_execute_remains_outside_p03_01(self) -> None:
-        """注册完成不冒充执行完成，统一执行入口继续明确报未实现。"""
-        pending = self.manager.execute(
-            call=ToolCall(id="call-1", name="calculator", arguments={}),
-            permission_mode="deny",
-        )
-        with self.assertRaises(NotImplementedError):
-            pending.send(None)
-
 
 if __name__ == "__main__":
     unittest.main()

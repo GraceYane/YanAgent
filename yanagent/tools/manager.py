@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import math
@@ -11,7 +12,9 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from yanagent.contracts import ToolCall, ToolResult
+from yanagent.contracts import ContractValidationError, ToolCall, ToolResult
+
+from .validation import ToolArgumentError, ToolSchemaError, validate_tool_arguments
 
 
 LOGGER = logging.getLogger("yanagent.tools")
@@ -21,6 +24,11 @@ ToolScope = Literal["global", "user", "agent", "session", "workspace"]
 TOOL_NAME_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 TOOL_RISKS = frozenset({"low", "medium", "high"})
 TOOL_SCOPES = frozenset({"global", "user", "agent", "session", "workspace"})
+PERMISSION_MODES = frozenset({"deny", "ask", "allow"})
+DEFAULT_TOOL_TIMEOUT_SECONDS = 30.0
+DEFAULT_MAX_TOOL_OUTPUT_CHARS = 20_000
+MIN_TOOL_OUTPUT_CHARS = 64
+MAX_TOOL_OUTPUT_CHARS = 1_000_000
 
 
 class ToolDefinitionError(ValueError):
@@ -29,6 +37,19 @@ class ToolDefinitionError(ValueError):
 
 class ToolAlreadyRegisteredError(ToolDefinitionError):
     """表示注册表中已存在同名工具，避免后注册实现静默覆盖原工具。"""
+
+
+class ToolHandlerError(ValueError):
+    """表示 handler 主动返回可安全展示给模型的受控失败说明。"""
+
+    def __init__(self, message: str) -> None:
+        """限制公开错误长度和控制字符，避免 handler 将任意内容写入历史。"""
+        if type(message) is not str or not message.strip() or len(message) > 500:
+            raise ValueError("工具公开错误必须是 1～500 个字符")
+        if any(ord(character) < 32 or ord(character) == 127 for character in message):
+            raise ValueError("工具公开错误不允许包含非法控制字符")
+        self.public_message = message.strip()
+        super().__init__(self.public_message)
 
 
 def _is_async_callable(value: Any) -> bool:
@@ -151,8 +172,26 @@ class ToolDefinition:
 class ToolManager:
     """线程安全地注册和发现工具，并稳定导出供应商无关 Schema。"""
 
-    def __init__(self) -> None:
-        """创建空注册表；工具按名称保存，所有读写都受同一把锁保护。"""
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
+        max_output_chars: int = DEFAULT_MAX_TOOL_OUTPUT_CHARS,
+    ) -> None:
+        """创建带统一超时和输出上限的空注册表，所有定义读写受锁保护。"""
+        if (
+            type(timeout_seconds) not in (int, float)
+            or not math.isfinite(timeout_seconds)
+            or not 0 < timeout_seconds <= 600
+        ):
+            raise ValueError("工具超时必须是 0～600 秒之间的有限数字")
+        if (
+            type(max_output_chars) is not int
+            or not MIN_TOOL_OUTPUT_CHARS <= max_output_chars <= MAX_TOOL_OUTPUT_CHARS
+        ):
+            raise ValueError("工具输出上限必须是 64～1000000 之间的整数")
+        self.timeout_seconds = float(timeout_seconds)
+        self.max_output_chars = max_output_chars
         self._definitions: dict[str, ToolDefinition] = {}
         self._lock = threading.RLock()
 
@@ -232,6 +271,136 @@ class ToolManager:
                 for name in sorted(self._definitions)
             ]
 
+    def _failure(self, call_id: str, content: str) -> ToolResult:
+        """构造关联原调用 ID 的统一失败结果。"""
+        result = ToolResult(tool_call_id=call_id, content=content, is_error=True)
+        result.validate()
+        return result
+
+    def _truncate_output(self, content: str) -> tuple[str, bool]:
+        """按字符数截断工具输出，并把原始长度写入保留在上限内的标记。"""
+        if len(content) <= self.max_output_chars:
+            return content, False
+        marker = f"\n...[工具输出已截断，原始字符数={len(content)}]"
+        prefix_length = self.max_output_chars - len(marker)
+        return content[:prefix_length] + marker, True
+
     async def execute(self, call: ToolCall, *, permission_mode: str) -> ToolResult:
-        """预留统一执行入口；参数、权限、超时和结果处理在 P03-03～04 实现。"""
-        raise NotImplementedError("P03-03～04 将实现工具执行、参数校验与权限策略")
+        """校验并执行一次工具调用，把所有可预期失败转换为结构化 ToolResult。"""
+        if not isinstance(call, ToolCall):
+            raise TypeError("call 必须是 ToolCall")
+        if type(call.id) is not str or not call.id.strip():
+            raise ValueError("ToolCall.id 必须是非空字符串")
+        call_id = call.id
+        try:
+            call.validate()
+        except ContractValidationError:
+            LOGGER.warning(
+                "[manager.py][ToolManager.execute] 工具调用契约无效，call_id=%r",
+                call_id,
+            )
+            return self._failure(call_id, "工具调用格式不合法。")
+
+        if type(permission_mode) is not str or permission_mode not in PERMISSION_MODES:
+            LOGGER.warning(
+                "[manager.py][ToolManager.execute] 权限模式无效，call_id=%r",
+                call_id,
+            )
+            return self._failure(call_id, "工具权限模式不合法。")
+        if permission_mode != "allow":
+            LOGGER.info(
+                "[manager.py][ToolManager.execute] 当前模式不自动执行工具，"
+                "call_id=%r，tool=%r，mode=%s",
+                call_id,
+                call.name,
+                permission_mode,
+            )
+            return self._failure(call_id, "当前权限模式不允许自动执行工具。")
+
+        definition = self.get(call.name)
+        if definition is None:
+            LOGGER.warning(
+                "[manager.py][ToolManager.execute] 未找到工具，call_id=%r，tool=%r",
+                call_id,
+                call.name,
+            )
+            return self._failure(call_id, "工具不存在或当前不可用。")
+        try:
+            arguments = validate_tool_arguments(call.arguments, definition.parameters)
+        except ToolArgumentError as error:
+            LOGGER.info(
+                "[manager.py][ToolManager.execute] 工具参数校验失败，"
+                "call_id=%r，tool=%r，reason=%s",
+                call_id,
+                call.name,
+                error.reason,
+            )
+            return self._failure(call_id, str(error))
+        except ToolSchemaError:
+            LOGGER.error(
+                "[manager.py][ToolManager.execute] 工具 Schema 无法执行，"
+                "call_id=%r，tool=%r",
+                call_id,
+                call.name,
+            )
+            return self._failure(call_id, "工具定义不合法，无法执行。")
+
+        LOGGER.info(
+            "[manager.py][ToolManager.execute] 开始执行工具，call_id=%r，"
+            "tool=%r，timeout=%.3f",
+            call_id,
+            call.name,
+            self.timeout_seconds,
+        )
+        try:
+            content = await asyncio.wait_for(
+                definition.handler(arguments),
+                timeout=self.timeout_seconds,
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            LOGGER.warning(
+                "[manager.py][ToolManager.execute] 工具执行超时，call_id=%r，tool=%r",
+                call_id,
+                call.name,
+            )
+            return self._failure(call_id, "工具执行超时。")
+        except ToolHandlerError as error:
+            LOGGER.warning(
+                "[manager.py][ToolManager.execute] 工具受控失败，"
+                "call_id=%r，tool=%r，reason=%s",
+                call_id,
+                call.name,
+                error.public_message,
+            )
+            return self._failure(call_id, f"工具执行失败：{error.public_message}")
+        except Exception as error:
+            LOGGER.error(
+                "[manager.py][ToolManager.execute] 工具执行异常，"
+                "call_id=%r，tool=%r，exception=%s",
+                call_id,
+                call.name,
+                type(error).__name__,
+            )
+            return self._failure(call_id, "工具执行失败。")
+
+        if type(content) is not str:
+            LOGGER.error(
+                "[manager.py][ToolManager.execute] 工具返回类型错误，"
+                "call_id=%r，tool=%r，result_type=%s",
+                call_id,
+                call.name,
+                type(content).__name__,
+            )
+            return self._failure(call_id, "工具返回了不支持的结果类型。")
+        output, truncated = self._truncate_output(content)
+        result = ToolResult(tool_call_id=call_id, content=output, is_error=False)
+        result.validate()
+        LOGGER.info(
+            "[manager.py][ToolManager.execute] 工具执行完成，call_id=%r，"
+            "tool=%r，output_chars=%d，truncated=%s",
+            call_id,
+            call.name,
+            len(content),
+            truncated,
+        )
+        return result

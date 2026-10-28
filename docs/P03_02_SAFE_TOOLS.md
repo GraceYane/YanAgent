@@ -2,7 +2,7 @@
 
 状态：已完成  
 完成日期：2026-10-27  
-下一项：P03-03 参数与结果
+后续状态：P03-03 参数与结果已完成；下一项为 P03-04 权限基础
 
 ## 1. 本阶段交付
 
@@ -51,7 +51,7 @@ P03-02 在 P03-01 注册表之上增加两个可独立调用的异步 handler：
 | 指数绝对值 | 100 | 阻止极端幂运算 |
 | 结果绝对值 | `10^100` | 阻止巨大整数或浮点结果 |
 
-handler 自身还会检查参数必须精确为 `{"expression": "..."}`。这是工具本体的防御性检查；P03-03 仍会实现所有工具共享的 Schema 参数校验和错误转换。
+handler 自身还会检查参数必须精确为 `{"expression": "..."}`。这是工具本体的防御性检查；后续 P03-03 已实现所有工具共享的 Schema 参数校验和错误转换。
 
 ## 4. 注册和调用边界
 
@@ -65,7 +65,7 @@ register_safe_example_tools(ToolManager)
 模型可见 Schema / 内部安全目录
 ```
 
-当前可以直接调用 handler 验证工具本体，但 `ToolManager.execute()` 仍明确未实现。因此本阶段不宣称模型已经能在聊天中调用工具，也不生成最终 `ToolResult`。P03-03 将接通 `ToolCall → 参数校验 → handler → ToolResult`，P03-04 再消费风险与权限元数据。
+P03-03 已接通 `ToolCall → 参数校验 → handler → ToolResult`，可以通过统一执行器调用本阶段工具；详见 [统一工具执行](P03_03_TOOL_EXECUTION.md)。当前仍未接入真实聊天循环，P03-04 再完善风险与权限元数据的消费语义。
 
 ## 5. 与 CowAgentByYan 的参考关系
 
@@ -90,7 +90,7 @@ register_safe_example_tools(ToolManager)
 
 ## 7. 当前边界
 
-- 还没有通用 JSON Schema 参数验证、未知工具处理、结构化 `ToolResult`、超时、异常转换或输出截断；由 P03-03 完成。
+- 通用参数 Schema 子集、未知工具、结构化 `ToolResult`、超时、异常转换和输出截断已由 P03-03 完成。
 - 还没有 `deny / ask / allow` 权限决策或确认 UI；由 P03-04 完成。
 - 还没有 HTTP 工具列表；由 P03-05 完成。
 - 还没有模型选择工具、执行后回写再继续回答的 Agent Loop；由 P04 完成。
