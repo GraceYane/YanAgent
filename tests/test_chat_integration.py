@@ -57,11 +57,11 @@ class EchoStreamProvider:
 
     async def complete(self, messages, *, tools=()):
         """返回本次用户输入；并发验收只使用流式入口。"""
-        return ModelReply(content=messages[0].content, finish_reason="stop")
+        return ModelReply(content=messages[-1].content, finish_reason="stop")
 
     async def stream(self, messages, *, tools=()):
         """交错产出每个请求自身的字符，并以同一完整正文结束。"""
-        content = messages[0].content
+        content = messages[-1].content
         for char in content:
             await asyncio.sleep(0.003)
             yield ModelStreamEvent(kind="text_delta", content=char)
@@ -130,7 +130,7 @@ class ChatApplicationTests(unittest.TestCase):
         self.assertEqual(saved.api_base, DEFAULT_API_BASE)
 
     def test_chat_returns_inline_reply_and_records_only_current_turn(self) -> None:
-        """未注入会话仓储的离线模式仍只发送本次用户消息。"""
+        """无状态模式仍组装 System 与当前 User，并发送真实工具 Schema。"""
         fake = FakeProvider([
             ModelReply(
                 content="你好，我是 YanAgent。",
@@ -153,9 +153,14 @@ class ChatApplicationTests(unittest.TestCase):
         self.assertFalse(result["stream"])
         self.assertEqual(result["inline_reply"], "你好，我是 YanAgent。")
         self.assertTrue(result["request_id"].startswith("run-"))
-        self.assertEqual([item.role for item in fake.calls[0].messages], ["user"])
-        self.assertEqual(fake.calls[0].messages[0].content, "你好")
-        self.assertEqual(fake.calls[0].tools, [])
+        self.assertEqual(
+            [item.role for item in fake.calls[0].messages], ["system", "user"]
+        )
+        self.assertEqual(fake.calls[0].messages[-1].content, "你好")
+        self.assertEqual(
+            [tool["name"] for tool in fake.calls[0].tools],
+            ["calculator", "current_time"],
+        )
 
     def test_missing_model_configuration_fails_before_network(self) -> None:
         """未填写模型设置时，应用层应返回配置错误而不是尝试访问网络。"""
@@ -184,7 +189,7 @@ class ChatApplicationTests(unittest.TestCase):
         self.assertEqual(fake.calls, [])
 
     def test_chat_does_not_execute_unexpected_tool_call(self) -> None:
-        """P01-04 未启用工具时，模型异常返回工具请求必须显式失败。"""
+        """P04-01 只暴露工具上下文，P04-02 前不能提前执行模型工具请求。"""
         fake = FakeProvider([
             ModelReply(tool_calls=[ToolCall(id="call-1", name="shell", arguments={})])
         ])

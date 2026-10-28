@@ -1399,3 +1399,71 @@ Electron/React chatStore
 ### 尚未完成事项
 
 - 本次不实现 MCP 服务器的新增、保存、测试和运行管理；这里只修复当前空配置占位响应。
+
+## 2026-10-28：P04-01 Prompt 与上下文组装
+
+### 需求
+
+按照 `docs/DEVELOPMENT_REQUIREMENTS.md` 和最新 `AGENTS.md` 完成 P04-01：模型请求中加入可信身份、系统规则、工具使用说明、完整历史和当前输入，继续使用供应商无关的内部 `Message` 格式，并让普通与 SSE 流式入口使用同一上下文契约。本次不提前实现 P04-02 的工具执行循环。
+
+### 实际完成内容
+
+- 新增 `PromptContextBuilder`，将运行时身份、固定系统规则、工具说明、完整持久化历史和当前 User 输入稳定组装为 `System → 历史 → 当前 User`。System Message 只进入本轮模型请求，不写入 `messages` 表。
+- 新增不可变的 `RuntimeIdentity` 与 `ModelContext`。身份包含 `user_id / agent_id / session_id / request_id`，拒绝空值、超长值和控制字符；有 SessionStore 时身份从受信作用域取得，不接受用户正文覆盖。
+- 系统规则明确事实约束、凭据脱敏、回复语言、工具使用边界和运行时职责：模型只能选择本轮真实提供的工具，必须使用原生 ToolCall，缺少真实 Tool Result 时不得声称已经执行。
+- 复用统一 `Message` 契约复制历史和当前输入；模型请求前验证对话顺序及 Assistant ToolCall 与 Tool Result 的调用 ID 配对，拒绝持久化 System 注入和未完成工具轮次。
+- 从应用级 `ToolManager` 取得真实模型 Schema，并复制为本轮快照。工具重名、字段不完整、参数顶层不是对象或非标准 JSON 会失败关闭；没有工具时显式发送空列表。
+- 普通 `provider.complete(...)` 与流式 `provider.stream(...)` 现在都接收同一组 `context.messages / context.tools`，避免普通链路有 Prompt、流式链路仍使用旧格式。
+- 保留阶段边界：模型返回 ToolCall 时现有聊天入口仍抛出 `UnexpectedToolCallError`，不会假装工具已执行；真正的 `模型 → 工具 → 模型` 循环和 Assistant/Tool 消息回写留给 P04-02。
+- 修正测试 Echo Provider 对“首条一定是 User”的旧假设，改为读取最后一条当前 User 消息；否则新增 System Prompt 后会把长提示词逐字符流式回显并导致测试超时。
+- 新增 `docs/P04_01_PROMPT_CONTEXT.md`，同步 README、实施路线、需求文档 v1.13、P02/P03 后续状态和岗位映射。
+
+### 涉及文件
+
+- Prompt、身份与上下文快照：`yanagent/context.py`
+- 应用组装入口和普通 Provider 参数：`yanagent/chat.py`
+- SSE 流式 Provider 参数：`yanagent/runtime/streaming.py`
+- 自动化测试：`tests/test_prompt_context.py`、`tests/test_chat_history.py`、`tests/test_chat_integration.py`
+- 实现说明：`docs/P04_01_PROMPT_CONTEXT.md`
+- 状态与导航：`README.md`、`docs/DEVELOPMENT_REQUIREMENTS.md`、`docs/IMPLEMENTATION_ROADMAP.md`、`docs/P02_04_DESKTOP_SESSIONS.md`、`docs/P02_05_ISOLATION_RECOVERY.md`、`docs/P03_01_TOOL_REGISTRY.md`、`docs/P03_02_SAFE_TOOLS.md`、`docs/P03_03_TOOL_EXECUTION.md`、`docs/P03_04_PERMISSION_FOUNDATION.md`、`docs/P03_05_TOOL_INTERFACE.md`、`docs/TARGET_ROLES.md`
+- 开发记录：`workProcess.md`
+
+### 验证结果
+
+- 新增 6 项 P04-01 测试：稳定顺序、四类可信身份、系统规则和工具摘要、完整工具历史配对、消息/Schema 快照隔离、空工具，以及 System 注入、未完成工具轮次、非法身份和工具重名失败路径全部通过。
+- Prompt、历史和普通/流式聊天定向共 26 项测试通过；普通入口和 SSE Echo Provider 均验证首条为 System、末条为当前 User，并收到 `calculator / current_time` 的真实 Schema。
+- 全量 `unittest discover` 共 194 项自动化测试通过，本机单次运行耗时 11.063 秒；Python 编译和 `git diff --check` 通过。本次只修改 Python 后端、测试和文档，没有桌面源码变化，因此未重复执行 `npm run build`。
+- 本次没有外部网络请求、真实 API Key 或真实 DeepSeek 调用。既有 P01 的真实普通/流式模型证据继续保留，但不能据此宣称 P04-01 新 Prompt 已完成真实模型工具选择联调。
+
+### 开发难点与评分
+
+整体难度：**7/10**。核心不是拼一个字符串，而是建立模型输入与持久化历史之间的清晰边界，让身份、规则、工具 Schema 和工具调用关联在普通/流式两条路径上保持一致，同时不越过 P04-02 的执行范围。
+
+| 难点 | 难度 | 容易出现的问题 | 实现方式与证据 |
+|---|---:|---|---|
+| 身份与系统规则可信边界 | 7/10 | 从用户文本提取身份导致 Prompt 注入；换行破坏固定结构；历史 System 消息覆盖运行规则 | 身份由 SessionStore/Runtime 传入并校验控制字符；持久化 System 失败关闭；非法身份与注入测试验证 |
+| 持久化历史与模型上下文分层 | 8/10 | 每轮把 System Prompt 写入数据库；裁剪/改写历史污染真实记录；未完成 ToolCall 被下一条 User 掩盖 | System 只构建内存快照；历史/当前深复制；模型请求前检查完整工具配对，数据库仍保存原始业务消息 |
+| 普通与流式一致性 | 7/10 | 普通调用携带工具但 SSE 仍传空列表；不同链路使用不同 Prompt 顺序 | `begin_chat()` 统一生成 `ChatContext`，两条 Provider 入口直接消费同一 messages/tools；定向 26 项测试通过 |
+| 阶段边界 | 7/10 | 工具 Schema 已发送后直接在聊天入口临时执行，绕过权限、持久化和循环限制；或把 ToolCall 当普通文本 | 本次只开放模型选择能力，ToolCall 明确报错；P04-02 再统一接 ToolManager 和消息回写 |
+| 旧测试隐含假设 | 6/10 | Echo Provider 固定读取第一条消息，新增 System 后回显长 Prompt 并表现为 SSE 超时 | 改为读取末条当前 User；普通和流式测试同时断言 System/User 顺序及真实工具 Schema |
+
+### 岗位要求关联与实践证据
+
+- **小米/大模型应用方向的模型与 Prompt 接入（DYG-要求2～3、XM-职责7）**：建立供应商无关的 Prompt/Context 构建层，将身份、规则、工具描述和多轮历史统一传给 Provider，并验证普通/流式一致性；没有完成多模型路由、Prompt 效果评测或生产 A/B 指标。
+- **腾讯要求4与 Tool Use 工程基础**：模型现在收到严格的函数 Schema 和工具使用协议，为后续 ToolCall 提供稳定输入；本阶段没有执行工具、Planning、Reflection 或真实模型工具联调。
+- **字节质量 Agent 职责2的上下文构造基础**：保持完整工具请求/结果关联，拒绝半轮历史和 System 注入，并用快照隔离防止 Provider 污染仓储数据；没有质量业务知识注入、自动测试生成或评测平台。
+- **Skills 方向的可扩展点**：Context Builder 已形成统一系统信息入口，后续 P07 可以按优先级注入 Skill 指令；当前没有实现 SKILL.md 发现、解析、触发或版本管理，不能表述为 Skills 已接入。
+- **Verification Loop 实践**：将顺序、身份、Schema、工具配对、普通/流式一致性和失败路径固化为确定性测试；这是上下文契约验证，不等于模型自主修复或线上效果评测。
+
+### 面试可讲事实与边界
+
+- 可以表述：为自研 Agent Runtime 设计独立 Prompt/Context Builder，把可信身份、系统规则、完整历史、当前输入和工具 Schema 组装成统一内部消息，并供普通与流式 Provider 复用。
+- 可以表述：区分数据库完整历史与单次模型上下文，System Prompt 不落库，消息和 Schema 使用快照，工具调用历史必须按 ID 完整配对后才允许发起下一轮模型请求。
+- 可以表述：通过 6 项新增和 26 项定向测试验证 Prompt 注入拒绝、非法身份、工具重名、空工具和两条调用链一致性。
+- 不可以表述：模型已经能执行工具、桌面已经展示工具卡片、P04-01 新 Prompt 已完成真实 DeepSeek 工具选择验收、已有 Token 裁剪/摘要、Skills 或 MCP 注入。这些属于 P04-02～P04-05、P05、P07 和 P08。
+
+### 后续事项
+
+- 下一项严格执行 P04-02：先使用 Fake Provider 完成非流式 `模型 → 工具 → 模型`，保存 Assistant 原始 ToolCall 与对应 Tool Result，并验证下一轮输入顺序。
+- P04-03 再增加多调用、最大轮数、总超时和连续失败限制；P04-04/P04-05 再接流式工具事件、桌面工具卡片与持久化恢复。
+- P05-04 才实现 Token 预算、完整轮次裁剪和摘要；P07～P09 再将 Skills、MCP、记忆和知识检索按可信来源注入上下文。

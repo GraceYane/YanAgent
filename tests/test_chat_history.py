@@ -74,7 +74,7 @@ class ChatHistoryTests(unittest.TestCase):
         self.assertEqual((result["user_seq"], result["bot_seq"]), (2, 3))
         second_context = fake.calls[1].messages
         self.assertEqual(
-            [(message.role, message.content) for message in second_context],
+            [(message.role, message.content) for message in second_context[1:]],
             [
                 ("user", "我叫张三"),
                 ("assistant", "好的，我记住了。"),
@@ -128,9 +128,9 @@ class ChatHistoryTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(len(second.calls[0].messages), 3)
+        self.assertEqual(len(second.calls[0].messages), 4)
         self.assertEqual(
-            [(item.role, item.content) for item in second.calls[1].messages],
+            [(item.role, item.content) for item in second.calls[1].messages[1:]],
             [("user", "我的代号是什么？")],
         )
 
@@ -180,11 +180,11 @@ class ChatHistoryTests(unittest.TestCase):
 
         context = fake.calls[0].messages
         self.assertEqual([item.role for item in context], [
-            "user", "assistant", "tool", "assistant", "user",
+            "system", "user", "assistant", "tool", "assistant", "user",
         ])
-        self.assertEqual(context[1].tool_calls[0].id, "call-1")
-        self.assertEqual(context[2].tool_call_id, "call-1")
-        self.assertTrue(context[2].is_error)
+        self.assertEqual(context[2].tool_calls[0].id, "call-1")
+        self.assertEqual(context[3].tool_call_id, "call-1")
+        self.assertTrue(context[3].is_error)
 
     def test_complete_history_is_not_silently_limited_to_one_page(self) -> None:
         """P02-03 必须读取完整历史，不能只取 SessionStore 的最近 500 条。"""
@@ -200,8 +200,8 @@ class ChatHistoryTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(len(fake.calls[0].messages), 502)
-        self.assertEqual(fake.calls[0].messages[0].content, "历史-0")
+        self.assertEqual(len(fake.calls[0].messages), 503)
+        self.assertEqual(fake.calls[0].messages[1].content, "历史-0")
         self.assertEqual(fake.calls[0].messages[-1].content, "当前消息")
 
 
@@ -290,7 +290,7 @@ class ChatHistoryHttpTests(unittest.TestCase):
         })
         self.assertEqual(second["inline_reply"], "你是张三。")
         self.assertEqual(
-            [(item.role, item.content) for item in self.fake.calls[1].messages],
+            [(item.role, item.content) for item in self.fake.calls[1].messages[1:]],
             [
                 ("user", "你好，我是张三"),
                 ("assistant", "记住了"),

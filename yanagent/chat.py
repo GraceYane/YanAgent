@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from yanagent.config import AppConfig, ConfigStore, MASKED_SECRET
+from yanagent.context import ModelContext, PromptContextBuilder, RuntimeIdentity
 from yanagent.contracts import Message, ModelReply
 from yanagent.errors import (
     AgentError,
@@ -48,7 +49,8 @@ class PreparedChat:
 class ChatContext:
     """本轮模型输入及已落库用户消息序号，供完成事件关联桌面气泡。"""
 
-    messages: list[Message]
+    messages: tuple[Message, ...]
+    tools: tuple[dict[str, Any], ...]
     user_sequence: int | None
 
 
@@ -90,8 +92,9 @@ class YanAgentApplication:
         session_store: SessionStore | None = None,
         run_store: RunStore | None = None,
         tool_manager: ToolManager | None = None,
+        context_builder: PromptContextBuilder | None = None,
     ) -> None:
-        """注入配置、Provider、仓储和工具注册表；缺省注册 P03 安全示例工具。"""
+        """注入配置、Provider、仓储、工具注册表和统一上下文构建器。"""
         self.config_store = config_store if config_store is not None else ConfigStore()
         self.provider_factory = (
             provider_factory if provider_factory is not None else OpenAICompatibleProvider
@@ -104,6 +107,11 @@ class YanAgentApplication:
         elif not isinstance(tool_manager, ToolManager):
             raise TypeError("tool_manager 必须是 ToolManager")
         self.tool_manager = tool_manager
+        if context_builder is None:
+            context_builder = PromptContextBuilder()
+        elif not isinstance(context_builder, PromptContextBuilder):
+            raise TypeError("context_builder 必须是 PromptContextBuilder")
+        self.context_builder = context_builder
         self._config_lock = threading.RLock()
 
     def tools_payload(self) -> dict[str, Any]:
@@ -306,7 +314,9 @@ class YanAgentApplication:
         context = await self.begin_chat(prepared, request_id=request_id)
         run_started = await self.start_run(prepared, request_id=request_id)
         try:
-            reply = await prepared.provider.complete(context.messages, tools=[])
+            reply = await prepared.provider.complete(
+                context.messages, tools=context.tools,
+            )
             if reply.tool_calls:
                 raise UnexpectedToolCallError()
             assistant_sequence = await self.finish_chat(
@@ -429,34 +439,72 @@ class YanAgentApplication:
     async def begin_chat(
         self, prepared: PreparedChat, *, request_id: str
     ) -> ChatContext:
-        """加载完整历史并先持久化用户消息，返回模型上下文及用户消息序号。"""
+        """加载历史、组装统一模型上下文，再持久化本轮用户消息。"""
         current = Message(
             role="user",
             content=prepared.message.content,
             metadata={"request_id": request_id},
         )
         if self.session_store is None:
+            assembled = self._assemble_model_context(
+                prepared, request_id=request_id, history=[], current=current,
+            )
             LOGGER.info(
                 "[chat.py][YanAgentApplication.begin_chat] 未注入会话仓储，使用无状态测试模式，request_id=%s",
                 request_id,
             )
-            return ChatContext(messages=[current], user_sequence=None)
+            return ChatContext(
+                messages=assembled.messages,
+                tools=assembled.tools,
+                user_sequence=None,
+            )
         # 生产持久化链路在落库前先拒绝缺失配置，避免留下从未调用模型的消息。
         # 无仓储的离线 Fake Provider 模式由 Provider 自己决定是否要求配置。
         prepared.config.require_model_ready()
         await self._ensure_session(prepared.session_id)
         stored = await self.session_store.complete_history(prepared.session_id)
+        assembled = self._assemble_model_context(
+            prepared,
+            request_id=request_id,
+            history=[record.message for record in stored],
+            current=current,
+        )
         current_records = await self.session_store.append(prepared.session_id, [current])
-        messages = [record.message for record in stored] + [current]
         LOGGER.info(
-            "[chat.py][YanAgentApplication.begin_chat] 历史已装入模型上下文且用户消息已落库，request_id=%s，session_id=%s，历史消息数=%d",
+            "[chat.py][YanAgentApplication.begin_chat] 统一上下文已组装且用户消息已落库，request_id=%s，session_id=%s，历史消息数=%d，工具数=%d",
             request_id,
             prepared.session_id,
             len(stored),
+            len(assembled.tools),
         )
         return ChatContext(
-            messages=messages,
+            messages=assembled.messages,
+            tools=assembled.tools,
             user_sequence=current_records[0].sequence,
+        )
+
+    def _assemble_model_context(
+        self,
+        prepared: PreparedChat,
+        *,
+        request_id: str,
+        history: list[Message],
+        current: Message,
+    ) -> ModelContext:
+        """把可信身份、历史、当前输入和工具快照交给统一构建器。"""
+        user_id = self.session_store.user_id if self.session_store is not None else "local"
+        agent_id = self.session_store.agent_id if self.session_store is not None else "default"
+        identity = RuntimeIdentity(
+            user_id=user_id,
+            agent_id=agent_id,
+            session_id=prepared.session_id,
+            request_id=request_id,
+        )
+        return self.context_builder.build(
+            identity=identity,
+            history=history,
+            current=current,
+            tools=self.tool_manager.schemas(),
         )
 
     async def finish_chat(

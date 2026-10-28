@@ -216,7 +216,9 @@ class AgentRuntime:
             run_started = await self.application.start_run(
                 prepared, request_id=record.request_id,
             )
-            async for event in prepared.provider.stream(context.messages, tools=[]):
+            async for event in prepared.provider.stream(
+                context.messages, tools=context.tools,
+            ):
                 if event.kind == "text_delta":
                     content.append(event.content)
                     record.append("delta", {"content": event.content})
