@@ -74,7 +74,7 @@ class ToolCatalogApplicationTests(unittest.TestCase):
 
 
 class ToolCatalogHttpTests(unittest.TestCase):
-    """通过真实回环 HTTP 验证桌面现有 `/api/tools` 契约。"""
+    """通过真实回环 HTTP 验证桌面能力页依赖的目录契约。"""
 
     def setUp(self) -> None:
         """启动带默认安全工具的独立本地服务。"""
@@ -105,6 +105,15 @@ class ToolCatalogHttpTests(unittest.TestCase):
             ["calculator", "current_time"],
         )
         self.assertTrue(all(item["description"] for item in payload["tools"]))
+
+    def test_empty_mcp_servers_endpoint_returns_array(self) -> None:
+        """空 MCP 配置仍返回数组，避免能力页按数组读取时发生白屏。"""
+        with urlopen(self.base_url + "/api/mcp/servers", timeout=3) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(
+                response.headers.get_content_type(), "application/json"
+            )
+        self.assertEqual(payload, {"status": "success", "servers": []})
 
 
 class ToolStageAcceptanceTests(unittest.IsolatedAsyncioTestCase):

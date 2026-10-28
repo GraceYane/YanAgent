@@ -362,7 +362,7 @@ class YanAgentHandler(BaseHTTPRequestHandler):
                 self._json({"status": "success", "skills": []})
                 return
             if path == "/api/mcp/servers":
-                self._json({"status": "success", "servers": {}})
+                self._json({"status": "success", "servers": []})
                 return
             if path.startswith("/api/scheduler/runs"):
                 self._json({"status": "success", "runs": []})
