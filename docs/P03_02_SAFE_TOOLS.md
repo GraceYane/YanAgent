@@ -2,7 +2,7 @@
 
 状态：已完成  
 完成日期：2026-10-27  
-后续状态：P03-03 参数与结果已完成；下一项为 P03-04 权限基础
+后续状态：P03-03 参数与结果、P03-04 权限基础已完成；下一项为 P03-05 测试与接口
 
 ## 1. 本阶段交付
 
@@ -65,7 +65,7 @@ register_safe_example_tools(ToolManager)
 模型可见 Schema / 内部安全目录
 ```
 
-P03-03 已接通 `ToolCall → 参数校验 → handler → ToolResult`，可以通过统一执行器调用本阶段工具；详见 [统一工具执行](P03_03_TOOL_EXECUTION.md)。当前仍未接入真实聊天循环，P03-04 再完善风险与权限元数据的消费语义。
+P03-03 已接通 `ToolCall → 参数校验 → handler → ToolResult`，P03-04 已加入风险、作用域和确认权限；详见 [统一工具执行](P03_03_TOOL_EXECUTION.md)与[工具权限基础](P03_04_PERMISSION_FOUNDATION.md)。当前仍未接入真实聊天循环。
 
 ## 5. 与 CowAgentByYan 的参考关系
 
@@ -91,6 +91,6 @@ P03-03 已接通 `ToolCall → 参数校验 → handler → ToolResult`，可以
 ## 7. 当前边界
 
 - 通用参数 Schema 子集、未知工具、结构化 `ToolResult`、超时、异常转换和输出截断已由 P03-03 完成。
-- 还没有 `deny / ask / allow` 权限决策或确认 UI；由 P03-04 完成。
+- 已有 `deny / ask / allow` 权限决策和确认协议；桌面确认 UI 尚未接入。
 - 还没有 HTTP 工具列表；由 P03-05 完成。
 - 还没有模型选择工具、执行后回写再继续回答的 Agent Loop；由 P04 完成。

@@ -1228,3 +1228,74 @@ Electron/React chatStore
 - 下一项严格执行 P03-04：定义 `deny / ask / allow` 的完整语义，结合 risk、scope 与 requires_confirmation，增加确认请求 ID 和批准/拒绝结果；确认 UI 未接通前 ask 默认拒绝。
 - P03-05 接通工具列表接口，并对 P03 阶段重复注册、非法参数、权限拒绝、超时和执行失败做综合接口验收。
 - P04 才将工具 Schema 注入模型请求，保存 Assistant 原始工具调用和 Tool Result，并驱动下一轮模型直到最终文本。
+
+## 2026-10-28：P03-04 工具权限基础
+
+### 需求
+
+按照 `docs/DEVELOPMENT_REQUIREMENTS.md` 和最新 `AGENTS.md` 完成 P03-04：定义 `deny / ask / allow` 的确切语义，限制工具可用作用域，为确认流程定义请求 ID 和批准/拒绝结果；桌面确认 UI 尚未接入时，所有需确认操作必须默认拒绝。权限拒绝必须发生在 handler 副作用之前，并保持 P03-04 与 P03-05 工具列表、P04 模型工具循环的阶段边界。
+
+### 实际完成内容
+
+- 新增 `yanagent/tools/permissions.py`，将权限决策从 `ToolManager` 的临时字符串判断拆成无副作用策略函数和显式数据契约：`ToolPermissionContext`、`ToolPermissionDecision`、`ToolConfirmationRequest`、`ToolConfirmationResult`。
+- 明确三种模式：`deny` 无条件拒绝且不能被确认覆盖；`ask` 每次调用都要求显式确认；`allow` 只自动放行低风险且未标记 `requires_confirmation` 的工具，中高风险或显式确认工具仍进入确认流程。非法模式失败关闭。
+- `ToolPermissionContext.allowed_scopes` 默认只包含 `global`。授权 `user` 必须绑定 `user_id`，授权 `agent` 必须绑定 `user_id + agent_id`，授权 `session` 必须绑定 `user_id + agent_id + session_id`，授权 `workspace` 必须绑定工作区标识；缺少边界时上下文构造直接失败。
+- 作用域判断消费 P03-01 的 `scope` 元数据。批准结果只能满足确认条件，不能越过 `deny`、未授权 scope、参数校验或未知工具；默认上下文不会意外开放用户、Agent、Session 或工作区工具。
+- 确认请求 ID 使用 `confirm_` 加 32 位 SHA-256 摘要，规范输入绑定 `run_id`、用户/Agent/Session/工作区、`tool_call_id`、工具名、完整参数以及风险/范围元数据。相同调用 ID 稳定，任一关键输入变化都会得到不同 ID。
+- 确认结果使用精确枚举 `approved / rejected`，不接受含糊布尔或任意字符串。ID 不匹配、用户拒绝、确认界面不可用、缺少 run 上下文都返回固定安全失败说明。
+- `ToolManager.execute()` 新增可选权限上下文与确认结果；参数通过后再决策，handler 只在 `allowed` 结论下运行。所有拒绝仍生成关联原 `tool_call_id` 的 `ToolResult(is_error=True)`。
+- 批准结果在 `ToolManager` 内通过线程锁原子消费，阻止并发或重试对同一确认结果重复产生副作用。已消费集合上限为 10000；容量满后默认拒绝，不通过淘汰旧记录重新允许重放。
+- 默认 `confirmation_ui_available=False`。因此当前桌面不会弹出确认框，`ask` 以及 `allow` 下的中高风险/显式确认工具都会默认拒绝；测试只用可信构造上下文模拟未来 UI 往返，不把协议测试描述为桌面功能已完成。
+- 参考 CowAgentByYan 权限策略中“未知能力失败关闭”“作用域检查不是 OS Sandbox”的边界，但没有复制其 `read-only / workspace-write / full-access` 命令解析器。YanAgent 当前先实现工具目录级的 `deny / ask / allow` 和身份 scope，文件/命令参数级路径策略按 P06 建设。
+- 新增 `docs/P03_04_PERMISSION_FOUNDATION.md`，同步 README、需求文档 v1.11、路线图、P03 前序状态、P02 后续状态和岗位映射；P03-04 标记完成，下一项更新为 P03-05。
+
+### 涉及文件
+
+- 权限契约与策略：`yanagent/tools/permissions.py`
+- 统一执行入口：`yanagent/tools/manager.py`
+- 工具公开接口：`yanagent/tools/__init__.py`
+- 自动化测试：`tests/test_tool_permissions.py`、`tests/test_tool_execution.py`
+- 实现说明：`docs/P03_04_PERMISSION_FOUNDATION.md`
+- 状态与导航：`README.md`、`docs/DEVELOPMENT_REQUIREMENTS.md`、`docs/IMPLEMENTATION_ROADMAP.md`、`docs/P03_01_TOOL_REGISTRY.md`、`docs/P03_02_SAFE_TOOLS.md`、`docs/P03_03_TOOL_EXECUTION.md`、`docs/P02_04_DESKTOP_SESSIONS.md`、`docs/P02_05_ISOLATION_RECOVERY.md`、`docs/TARGET_ROLES.md`
+- 开发记录：`workProcess.md`
+
+### 验证结果
+
+- 新增 11 项 P03-04 测试：作用域身份约束、完整上下文规范化、三模式语义、中高风险/显式确认、scope 拒绝、确认 ID 稳定与参数绑定、批准/拒绝、跨 Run 挪用拒绝、handler 前失败、一次性批准消费和 Session 归属放行均通过。
+- 权限与统一执行定向共 24 项测试通过；其中 `deny / ask / allow` 拒绝用例的 handler 执行次数为 0，批准重放用例第一次成功、第二次失败，最终执行次数为 1。
+- P03 工具专项测试由 34 项增至 45 项；全量 `unittest discover` 共 182 项通过，最终单次回归耗时 9.957 秒。该耗时只记录本机本次运行，不作为性能或吞吐结论。
+- `python -m compileall -q yanagent tests` 通过。Windows 异步测试在受限沙箱内创建事件循环本机 socket 时发生等待，改在获准的本机环境运行后立即通过；这是测试执行环境限制，不是权限代码死锁。
+- `git diff --check`、敏感值扫描和最终工作区检查通过；没有引入真实 API Key、凭据或外部网络调用。
+
+### 开发难点与评分
+
+整体难度：**8/10**。难点不是写三个 `if`，而是避免“批准”成为万能绕过：需要同时绑定运行、身份、工具、参数和安全元数据，明确 scope 与资源 ACL 的边界，并保证并发重放时最多一个执行进入 handler。
+
+| 难点 | 难度 | 容易出现的问题 | 实现方式与证据 |
+|---|---:|---|---|
+| 三模式与风险组合 | 7/10 | 把 `allow` 解释为中高风险全自动；把 `ask` 当普通失败而没有可关联请求 | 明确模式表；medium/high 与显式确认在 allow 下仍确认；纯决策测试覆盖三模式和三类确认触发 |
+| 确认结果防挪用 | 9/10 | 只绑定工具名，批准后参数或 Session 被替换；跨 Run 复用批准 | 规范 JSON 指纹同时绑定运行、身份、调用 ID、参数和安全元数据；参数变化与跨 Run 测试验证 ID 不同/拒绝 |
+| 并发与重放 | 8/10 | 两个协程同时消费同一批准，产生两次外部副作用；无限记录造成内存增长 | 锁内检查并消费 ID；重放测试执行次数为 1；固定容量满后失败关闭 |
+| scope 语义与 Sandbox 边界 | 8/10 | 仅有 `scope="session"` 就误认为已校验归属；把工作区分类冒充路径或 OS 隔离 | 每类 scope 要求可信身份字段；默认只开放 global；文档明确目录级能力边界不替代路径检查/容器 |
+| 未接 UI 的安全退化 | 6/10 | 为方便联调把 ask 静默当 allow，导致生产环境无按钮却执行敏感操作 | 默认 UI 不可用；所有确认型调用返回固定拒绝，只有显式可信上下文和匹配批准才能执行 |
+
+### 岗位要求关联与实践证据
+
+- **小米职责3、职责6～7（Tooling、Sandbox 边界、安全稳定性与可维护性）**：实现风险、作用域、确认协议和 handler 前失败关闭，明确目录级策略不是 OS Sandbox；没有容器隔离、命令/文件完整 ACL、企业系统或 MCP 授权。
+- **字节质量 Agent 职责2～3（多工具执行管控、调试与评测框架）**：权限结论、确认 ID 和结构化失败为后续工具编排提供可测试管控点，45 项工具回归形成确定性证据；没有模型多工具规划、质量业务流或效果评测。
+- **腾讯职责1～3及要求2/6（工具执行引擎、Tool Use、质量保障和系统思维）**：将工具元数据、运行身份和执行入口组合成失败关闭权限层，并验证重放/越权/异常路径；尚未完成 Agent Loop、Planning、Reflection 或 Benchmark。
+- **开源机制拆解实践**：对照 CowAgent 权限策略的模式、工具分类和“参数级检查不是硬沙箱”说明，选择适合 YanAgent 阶段的显式上下文与确认协议；这不等于完成 CowAgent 全部命令策略或使用 LangGraph/AutoGen 等框架。
+- **Verification Loop 实践**：先列出越权、无 UI、跨 Run、参数替换和确认重放失败矩阵，再用纯决策与真实 handler 计数测试验证；这是权限工程验证回路，不等于 Agent 自主修复闭环。
+
+### 面试可讲事实与边界
+
+- 可以表述：为自研 Agent Runtime 设计三模式工具权限层，低风险工具和需确认工具采用不同路径，并以可信身份上下文限制 global/user/agent/session/workspace 范围。
+- 可以表述：确认请求 ID 绑定运行、身份、工具调用和参数，批准结果原子一次性消费；通过跨 Run 挪用和重放测试证明拒绝发生在 handler 副作用前。
+- 可以表述：参考开源 Agent 的权限策略后，明确区分工具目录级授权、参数级资源 ACL 与 OS Sandbox，避免把字符串 scope 夸大为硬隔离。
+- 不可以表述：桌面已经有确认弹窗、模型已经会自动调用工具、工作区文件路径已被完整隔离、已有容器 Sandbox、HTTP 工具列表或 P03 全阶段接口联调。这些属于 P03-05、P04 和 P06。
+
+### 后续事项
+
+- 下一项严格执行 P03-05：接通工具列表接口，并综合覆盖重复注册、非法参数、权限拒绝、超时和执行失败。
+- P04 将模型工具调用、权限决策、handler 结果和下一轮模型请求组成真实 Agent Loop；届时需决定确认事件如何进入流式事件协议。
+- P06 文件与命令工具必须在 scope 之外继续实现规范路径、工作区根检查、危险参数拒绝和更强隔离，不能把当前 `workspace` 标签直接视为安全沙箱。

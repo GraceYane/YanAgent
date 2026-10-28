@@ -202,7 +202,7 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不存在", result.content)
 
     async def test_permission_modes_fail_closed_before_handler(self) -> None:
-        """P03-04 前 deny、ask 和非法模式均不会运行 handler。"""
+        """deny、无确认界面的 ask 和非法模式均不会运行 handler。"""
         executions = 0
 
         async def handler(_arguments: dict[str, Any]) -> str:

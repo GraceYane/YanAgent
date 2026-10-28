@@ -14,7 +14,7 @@ YanAgent 是从 CowAgent 的桌面产品外壳中抽出的学习脚手架。项�
 - 普通与流式聊天会自动落库；同一 Session 的下一轮模型调用会携带先前完整历史。
 - 桌面会话列表、历史分页、用户消息时间线、重命名、置顶、删除和重新生成已接到 SQLite。
 - Session/Message/Run 强制使用用户、Agent 和 Session 归属；并发消息写入保持唯一序号，启动时恢复遗留 Run 为中断状态。
-- 工具系统已支持严格定义与注册、本机时间、受限计算器，以及统一参数校验、执行超时、结构化结果和输出截断；完整权限与聊天工具循环尚未启用。
+- 工具系统已支持严格定义与注册、本机时间、受限计算器、统一执行，以及 `deny / ask / allow`、作用域和确认结果边界；确认 UI、工具列表与聊天工具循环尚未启用。
 - 阅读各核心模块的接口、TODO 和验收条件，逐步替换占位实现。
 - 使用 Python 普通/流式 Provider 或离线 Fake Provider；配置、SSE、取消和错误已接到桌面 HTTP 契约。
 
@@ -27,7 +27,7 @@ YanAgent 是从 CowAgent 的桌面产品外壳中抽出的学习脚手架。项�
 | Session 与上下文 | `yanagent/storage/`、`yanagent/sessions/`、`yanagent/chat.py` | P02 已完成聊天落库、重启恢复、完整历史、桌面管理、强归属和 Run 中断恢复 |
 | 模型适配层 | `yanagent/models/openai_compatible.py`、`yanagent/chat.py` | P01-05 已接通普通与流式桌面消息、增量组装和安全错误 |
 | 最小流式 Runtime | `yanagent/runtime/streaming.py`、`yanagent/events.py`、`app.py` | 常驻事件循环、Run 隔离、SSE 回放、基本取消与终态清理已完成 |
-| 工具系统 | `yanagent/tools/manager.py`、`validation.py`、`examples.py` | P03-01～P03-03 已完成注册、安全示例和统一执行；完整权限与工具列表待 P03-04～P03-05 |
+| 工具系统 | `yanagent/tools/manager.py`、`validation.py`、`permissions.py`、`examples.py` | P03-01～P03-04 已完成注册、安全示例、统一执行和权限基础；工具列表待 P03-05 |
 | 长期记忆 | `yanagent/memory/service.py` | 接口保留，实现为空 |
 | MCP Client | `yanagent/mcp/client.py` | 接口保留，实现为空 |
 | Skills | `yanagent/skills/loader.py` | 接口保留，实现为空 |
@@ -92,7 +92,7 @@ npm run dev
 6. P06～P10：多模型、完整工具、Skills、MCP、记忆知识库和 Multi-Agent。
 7. P11～P12：Web、多渠道、定时、桌面交付与功能对照验收。
 
-P01-01～P01-06、P02-01～P02-05 和 P03-01～P03-03 均已完成。P01 阶段验收见 [P01 验证与文档](docs/P01_06_VERIFICATION.md)；P02 实现见 [数据库基础](docs/P02_01_DATABASE.md)、[会话与消息存储](docs/P02_02_SESSION_STORE.md)、[历史与上下文接通](docs/P02_03_HISTORY_CONTEXT.md)、[桌面会话联调](docs/P02_04_DESKTOP_SESSIONS.md)和[隔离与恢复](docs/P02_05_ISOLATION_RECOVERY.md)；P03 当前实现见 [工具注册与统一 Schema](docs/P03_01_TOOL_REGISTRY.md)、[安全示例工具](docs/P03_02_SAFE_TOOLS.md)和[统一工具执行](docs/P03_03_TOOL_EXECUTION.md)。当前共 171 项测试通过，下一项任务是 **P03-04：权限基础**；统一执行器尚未接入真实聊天循环。
+P01-01～P01-06、P02-01～P02-05 和 P03-01～P03-04 均已完成。P01 阶段验收见 [P01 验证与文档](docs/P01_06_VERIFICATION.md)；P02 实现见 [数据库基础](docs/P02_01_DATABASE.md)、[会话与消息存储](docs/P02_02_SESSION_STORE.md)、[历史与上下文接通](docs/P02_03_HISTORY_CONTEXT.md)、[桌面会话联调](docs/P02_04_DESKTOP_SESSIONS.md)和[隔离与恢复](docs/P02_05_ISOLATION_RECOVERY.md)；P03 当前实现见 [工具注册与统一 Schema](docs/P03_01_TOOL_REGISTRY.md)、[安全示例工具](docs/P03_02_SAFE_TOOLS.md)、[统一工具执行](docs/P03_03_TOOL_EXECUTION.md)和[工具权限基础](docs/P03_04_PERMISSION_FOUNDATION.md)。当前共 182 项测试通过，下一项任务是 **P03-05：测试与接口**；确认 UI 和真实聊天工具循环尚未接入。
 
 可在项目根目录运行本次配置演示（使用无效测试密钥，不请求网络）：
 

@@ -1,4 +1,4 @@
-"""工具定义与注册表：校验工具元数据并导出供应商无关 Schema。"""
+"""工具定义、注册表与执行入口：统一 Schema、权限、校验和结果。"""
 
 from __future__ import annotations
 
@@ -15,6 +15,13 @@ from typing import Any, Literal
 from yanagent.contracts import ContractValidationError, ToolCall, ToolResult
 
 from .validation import ToolArgumentError, ToolSchemaError, validate_tool_arguments
+from .permissions import (
+    TOOL_PERMISSION_MODES,
+    ToolConfirmationResult,
+    ToolPermissionContext,
+    ToolPermissionDecision,
+    evaluate_tool_permission,
+)
 
 
 LOGGER = logging.getLogger("yanagent.tools")
@@ -24,11 +31,12 @@ ToolScope = Literal["global", "user", "agent", "session", "workspace"]
 TOOL_NAME_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 TOOL_RISKS = frozenset({"low", "medium", "high"})
 TOOL_SCOPES = frozenset({"global", "user", "agent", "session", "workspace"})
-PERMISSION_MODES = frozenset({"deny", "ask", "allow"})
+PERMISSION_MODES = TOOL_PERMISSION_MODES
 DEFAULT_TOOL_TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_TOOL_OUTPUT_CHARS = 20_000
 MIN_TOOL_OUTPUT_CHARS = 64
 MAX_TOOL_OUTPUT_CHARS = 1_000_000
+MAX_CONSUMED_CONFIRMATIONS = 10_000
 
 
 class ToolDefinitionError(ValueError):
@@ -170,7 +178,7 @@ class ToolDefinition:
 
 
 class ToolManager:
-    """线程安全地注册和发现工具，并稳定导出供应商无关 Schema。"""
+    """线程安全地注册、发现并在权限边界内执行工具。"""
 
     def __init__(
         self,
@@ -193,6 +201,7 @@ class ToolManager:
         self.timeout_seconds = float(timeout_seconds)
         self.max_output_chars = max_output_chars
         self._definitions: dict[str, ToolDefinition] = {}
+        self._consumed_confirmation_ids: set[str] = set()
         self._lock = threading.RLock()
 
     def register(self, definition: ToolDefinition) -> None:
@@ -285,7 +294,31 @@ class ToolManager:
         prefix_length = self.max_output_chars - len(marker)
         return content[:prefix_length] + marker, True
 
-    async def execute(self, call: ToolCall, *, permission_mode: str) -> ToolResult:
+    def _consume_confirmation(
+        self,
+        decision: ToolPermissionDecision,
+        confirmation: ToolConfirmationResult | None,
+    ) -> ToolPermissionDecision:
+        """原子消费批准结果，阻止并发或重试重复执行同一受确认调用。"""
+        if decision.reason != "confirmation_approved":
+            return decision
+        assert confirmation is not None
+        with self._lock:
+            if confirmation.request_id in self._consumed_confirmation_ids:
+                return ToolPermissionDecision("denied", "confirmation_replayed")
+            if len(self._consumed_confirmation_ids) >= MAX_CONSUMED_CONFIRMATIONS:
+                return ToolPermissionDecision("denied", "confirmation_capacity")
+            self._consumed_confirmation_ids.add(confirmation.request_id)
+        return decision
+
+    async def execute(
+        self,
+        call: ToolCall,
+        *,
+        permission_mode: str,
+        permission_context: ToolPermissionContext | None = None,
+        confirmation: ToolConfirmationResult | None = None,
+    ) -> ToolResult:
         """校验并执行一次工具调用，把所有可预期失败转换为结构化 ToolResult。"""
         if not isinstance(call, ToolCall):
             raise TypeError("call 必须是 ToolCall")
@@ -307,15 +340,29 @@ class ToolManager:
                 call_id,
             )
             return self._failure(call_id, "工具权限模式不合法。")
-        if permission_mode != "allow":
+        if permission_mode == "deny":
             LOGGER.info(
-                "[manager.py][ToolManager.execute] 当前模式不自动执行工具，"
+                "[manager.py][ToolManager.execute] 当前模式禁止执行工具，"
                 "call_id=%r，tool=%r，mode=%s",
                 call_id,
                 call.name,
                 permission_mode,
             )
-            return self._failure(call_id, "当前权限模式不允许自动执行工具。")
+            return self._failure(call_id, "当前权限模式禁止执行工具。")
+        if permission_context is not None and not isinstance(
+            permission_context, ToolPermissionContext
+        ):
+            LOGGER.warning(
+                "[manager.py][ToolManager.execute] 权限上下文无效，call_id=%r",
+                call_id,
+            )
+            return self._failure(call_id, "工具权限上下文不合法。")
+        if confirmation is not None and not isinstance(confirmation, ToolConfirmationResult):
+            LOGGER.warning(
+                "[manager.py][ToolManager.execute] 确认结果类型无效，call_id=%r",
+                call_id,
+            )
+            return self._failure(call_id, "工具确认结果不合法。")
 
         definition = self.get(call.name)
         if definition is None:
@@ -344,6 +391,32 @@ class ToolManager:
                 call.name,
             )
             return self._failure(call_id, "工具定义不合法，无法执行。")
+
+        context = permission_context or ToolPermissionContext()
+        decision = evaluate_tool_permission(
+            call,
+            definition,
+            permission_mode=permission_mode,
+            context=context,
+            confirmation=confirmation,
+        )
+        decision = self._consume_confirmation(decision, confirmation)
+        if decision.status != "allowed":
+            request_id = (
+                decision.confirmation_request.request_id
+                if decision.confirmation_request is not None
+                else None
+            )
+            LOGGER.info(
+                "[manager.py][ToolManager.execute] 工具权限未放行，"
+                "call_id=%r，tool=%r，mode=%s，reason=%s，confirmation_id=%r",
+                call_id,
+                call.name,
+                permission_mode,
+                decision.reason,
+                request_id,
+            )
+            return self._failure(call_id, decision.message)
 
         LOGGER.info(
             "[manager.py][ToolManager.execute] 开始执行工具，call_id=%r，"

@@ -2,13 +2,13 @@
 
 状态：已完成  
 完成日期：2026-10-23  
-后续状态：P03-02～P03-03 已完成；下一项为 P03-04 权限基础
+后续状态：P03-02～P03-04 已完成；下一项为 P03-05 测试与接口
 
 ## 1. 本阶段交付
 
 P03-01 建立工具系统的第一层：定义“一个工具必须描述什么”、阻止同名工具互相覆盖，并把内部定义导出为现有 ModelProvider 可以接收的供应商无关 Schema。
 
-P03-01 完成时不执行工具，`ToolManager.execute()` 当时明确抛出未实现错误；后续 P03-02 已实现时间与计算器，P03-03 已实现参数校验、超时和结果收口，权限仍属于 P03-04。
+P03-01 完成时不执行工具，`ToolManager.execute()` 当时明确抛出未实现错误；后续 P03-02 已实现时间与计算器，P03-03 已实现参数校验、超时和结果收口，P03-04 已完成权限基础。
 
 ## 2. ToolDefinition
 
@@ -23,9 +23,9 @@ P03-01 完成时不执行工具，`ToolManager.execute()` 当时明确抛出未�
 | `risk_level` | 权限策略使用的风险级别 | `low / medium / high` |
 | `parallel_safe` | 同一轮多个调用能否安全并行 | 布尔值，默认 `False` |
 | `scope` | 工具可访问数据或资源的归属范围 | `global / user / agent / session / workspace` |
-| `requires_confirmation` | 后续确认策略的显式元数据 | 布尔值；P03-04 才解释执行语义 |
+| `requires_confirmation` | 确认策略的显式元数据 | 布尔值；P03-04 已接入执行语义 |
 
-风险级别目前只作为元数据保存：`low` 表示纯计算或只读低风险能力，`medium` 为有限状态修改，`high` 为敏感或明显外部副作用。P03-04 才会把它与 `deny / ask / allow` 权限模式组合，当前不会因为标记了风险就自动执行或自动批准。
+风险级别定义为：`low` 表示纯计算或只读低风险能力，`medium` 为有限状态修改，`high` 为敏感或明显外部副作用。P03-04 已把它与 `deny / ask / allow` 组合；即使是 `allow`，中高风险工具仍需要确认。
 
 作用范围表达工具设计上的数据边界，不代表用户已经获得授权：
 
@@ -93,6 +93,6 @@ ToolManager.register
 
 - `current_time` 和受限计算器已由 P03-02 实现；详见 [安全示例工具](P03_02_SAFE_TOOLS.md)。
 - `ToolCall.arguments`、未知工具、超时、异常和大结果已由 P03-03 处理；详见 [统一工具执行](P03_03_TOOL_EXECUTION.md)。
-- `risk_level`、`scope` 和 `requires_confirmation` 目前只是受控元数据，没有授权效果；P03-04 完成权限决策。
+- `risk_level`、`scope` 和 `requires_confirmation` 已由 P03-04 接入权限决策，详见 [工具权限基础](P03_04_PERMISSION_FOUNDATION.md)。
 - 尚无桌面或 HTTP 工具列表接口；P03-05 接通。
 - 尚未把工具 Schema 注入真实聊天，也没有模型→工具→模型循环；P04 完成。
