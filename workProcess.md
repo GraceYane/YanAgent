@@ -1534,3 +1534,36 @@ Electron/React chatStore
 - 下一项严格执行 P04-03：按模型原顺序处理同一响应中的多个 ToolCall，并加入最大模型轮数、总超时、单工具超时复核和连续失败限制。
 - P04-04 再将工具调用接入 SSE 事件，P04-05 处理桌面工具卡片、历史还原和崩溃后半轮解释/恢复。
 - 在 P04 阶段验收前补真实 DeepSeek 工具调用；当前 P01 的真实普通/流式证据不能替代 P04 新闭环的真实验证。
+
+## 2026-10-29：聊天全链路 yanDebug 调试日志
+
+### 实际完成内容
+
+- 在桌面 `/message` 请求入口、流任务登记与执行、会话历史读取、统一上下文组装、流式 Provider 调用、OpenAI-compatible SSE 请求、完整响应解析、Assistant 落库和 SSE 完成处增加中文流程日志。
+- 所有新增日志统一包含 `yanDebug` 关键字和阶段编号，关键阶段携带 `request_id`；并发请求日志发生交错时，可以按请求标识还原单次聊天流程。
+- 日志只记录流式标识、Session/Request 标识、消息与工具数量、模型名、输出字符数、结束原因和数据库序号，不记录用户消息正文、API Key、Authorization 或上游原始响应正文。
+- 保留流式增量的正常处理，不逐个 Token 打印日志，避免长回答导致控制台刷屏和明显的额外 I/O。
+
+### 涉及文件
+
+- `app.py`
+- `yanagent/runtime/streaming.py`
+- `yanagent/chat.py`
+- `yanagent/models/openai_compatible.py`
+- `workProcess.md`
+
+### 验证结果
+
+- `compileall` 通过。
+- Provider HTTP、流式 Runtime 和聊天集成共 27 项定向测试通过。
+- 单独以 INFO 日志级别执行真实本地 HTTP/SSE 集成用例，输出包含 `yanDebug` 请求入口、流任务、Provider 调用、模型完成和 SSE 交付阶段；用例通过。
+- 当前虚拟环境未安装 Ruff，因此没有执行 Ruff；以编译、测试和后续 `git diff --check` 检查本次修改。
+
+### 难点与评分
+
+整体难度：**4/10**。主要难点是让异步流式链路的日志能按 `request_id` 关联，同时避免为了调试打印消息正文、API Key 或每个文本增量。实现上使用固定阶段编号和安全计数字段，只在请求、上下文、模型请求/完成、持久化及 SSE 终态打印一次关键日志。
+
+### 尚未完成事项
+
+- 本次日志面向 PyCharm 中的 Python 后端全链路；桌面 TypeScript 渲染器未增加 `console` 日志。如需观察“点击发送”和“气泡收到首个 delta”的前端细节，应使用 Electron/Chromium JavaScript 调试器，不应把高频前端增量全部写入后端日志。
+

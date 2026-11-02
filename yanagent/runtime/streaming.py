@@ -196,7 +196,8 @@ class AgentRuntime:
         future = asyncio.run_coroutine_threadsafe(self._run_stream(record, prepared), self._loop)
         record.attach_future(future)
         LOGGER.info(
-            "[streaming.py][AgentRuntime.start_stream] 流任务已登记，request_id=%s，session_id=%s",
+            "[yanDebug][02-流任务登记][streaming.py][AgentRuntime.start_stream] "
+            "流任务已登记，request_id=%s，session_id=%s",
             request_id, prepared.session_id,
         )
         return {
@@ -210,11 +211,24 @@ class AgentRuntime:
         completed = False
         run_started = False
         try:
+            LOGGER.info(
+                "[yanDebug][02-流任务执行][streaming.py][AgentRuntime._run_stream] "
+                "开始加载会话上下文，request_id=%s，session_id=%s",
+                record.request_id,
+                prepared.session_id,
+            )
             context = await self.application.begin_chat(
                 prepared, request_id=record.request_id,
             )
             run_started = await self.application.start_run(
                 prepared, request_id=record.request_id,
+            )
+            LOGGER.info(
+                "[yanDebug][04-Provider调用][streaming.py][AgentRuntime._run_stream] "
+                "准备调用流式 Provider，request_id=%s，消息数=%d，工具数=%d",
+                record.request_id,
+                len(context.messages),
+                len(context.tools),
             )
             async for event in prepared.provider.stream(
                 context.messages, tools=context.tools,
@@ -226,6 +240,15 @@ class AgentRuntime:
                     if completed or event.reply is None:
                         raise ModelResponseError()
                     completed = True
+                    LOGGER.info(
+                        "[yanDebug][06-模型完成][streaming.py][AgentRuntime._run_stream] "
+                        "收到 Provider 完整响应，request_id=%s，输出字符数=%d，"
+                        "工具调用数=%d，finish_reason=%s",
+                        record.request_id,
+                        len(event.reply.content),
+                        len(event.reply.tool_calls),
+                        event.reply.finish_reason,
+                    )
                     if event.reply.tool_calls:
                         raise UnexpectedToolCallError()
                     if event.reply.content != "".join(content):
@@ -251,7 +274,8 @@ class AgentRuntime:
             if not completed:
                 raise EmptyModelResponseError()
             LOGGER.info(
-                "[streaming.py][AgentRuntime._run_stream] 流任务完成且回答已持久化，request_id=%s，上下文消息数=%d，输出字符数=%d",
+                "[yanDebug][08-SSE交付完成][streaming.py][AgentRuntime._run_stream] "
+                "流任务完成且回答已持久化，request_id=%s，上下文消息数=%d，输出字符数=%d",
                 record.request_id, len(context.messages), len("".join(content)),
             )
         except asyncio.CancelledError:

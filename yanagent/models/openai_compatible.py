@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 from collections.abc import AsyncIterator, Sequence
@@ -21,6 +22,18 @@ from .provider import NonStreamingProvider
 from .transport import (
     JsonTransport, SseTransport, UrllibJsonTransport, UrllibSseTransport, strict_json_loads,
 )
+
+
+LOGGER = logging.getLogger("yanagent.models.openai_compatible")
+
+
+def _request_id_for_log(messages: Sequence[Message]) -> str:
+    """从内部消息元数据提取安全的请求标识，仅用于关联调试日志。"""
+    for message in reversed(messages):
+        request_id = message.metadata.get("request_id")
+        if type(request_id) is str and request_id:
+            return request_id
+    return "<unknown>"
 
 
 def _copy_json(value: Any) -> Any:
@@ -344,6 +357,18 @@ class OpenAICompatibleProvider(NonStreamingProvider):
         }
         if schemas:
             payload["tools"] = schemas
+        request_id = _request_id_for_log(messages)
+        LOGGER.info(
+            "[yanDebug][05-模型请求发送][openai_compatible.py]"
+            "[OpenAICompatibleProvider.stream] 准备发送 Chat Completions SSE 请求，"
+            "request_id=%s，model=%s，消息数=%d，工具数=%d，timeout=%s；"
+            "API Key 与消息正文未写入日志",
+            request_id,
+            self._config.model,
+            len(converted),
+            len(schemas),
+            self._config.request_timeout,
+        )
         builder = StreamReplyBuilder()
         saw_done = False
         async for raw in self._stream_transport.stream_data(
@@ -363,4 +388,15 @@ class OpenAICompatibleProvider(NonStreamingProvider):
         if not saw_done:
             raise ModelResponseError()
         reply = builder.finish()
+        LOGGER.info(
+            "[yanDebug][06-模型响应解析完成][openai_compatible.py]"
+            "[OpenAICompatibleProvider.stream] 已组装完整模型响应，"
+            "request_id=%s，输出字符数=%d，工具调用数=%d，finish_reason=%s，"
+            "usage字段=%s",
+            request_id,
+            len(reply.content),
+            len(reply.tool_calls),
+            reply.finish_reason,
+            sorted(reply.usage),
+        )
         yield ModelStreamEvent(kind="completed", reply=reply)

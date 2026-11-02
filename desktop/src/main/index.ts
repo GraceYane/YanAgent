@@ -460,6 +460,22 @@ function getBackendPath(): string {
 }
 
 /**
+ * 本地调试可让 Electron 复用 IDE 已启动的后端。正式安装包忽略该变量，
+ * 避免生产环境意外连接到未受桌面端管理的进程。
+ */
+function getExternalBackendPort(): number | null {
+  if (!isDev) return null
+  const raw = process.env.YANAGENT_EXTERNAL_BACKEND_PORT?.trim()
+  if (!raw) return null
+  const port = Number(raw)
+  if (!Number.isInteger(port) || port <= 0 || port >= 65536) {
+    console.warn(`[backend] invalid YANAGENT_EXTERNAL_BACKEND_PORT: ${raw}`)
+    return null
+  }
+  return port
+}
+
+/**
  * Push the backend's current state to the renderer. Used both for the initial
  * replay after a page load and as the shape every live status event follows.
  */
@@ -485,10 +501,11 @@ function sendBackendState() {
 
 async function startBackend() {
   const backendPath = getBackendPath()
+  const externalPort = getExternalBackendPort()
   // isDev distinguishes a source checkout from an installed app. The backend
   // manager needs to know: an installed app must never fall back to looking
   // for a Python interpreter, and its writable data always lives in ~/.cow.
-  pythonBackend = new PythonBackend(backendPath, !isDev)
+  pythonBackend = new PythonBackend(backendPath, !isDev, externalPort)
 
   pythonBackend.on('ready', (port: number) => {
     console.log(`[backend] ready on port ${port}`)

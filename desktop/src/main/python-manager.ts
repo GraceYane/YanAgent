@@ -86,6 +86,8 @@ export class PythonBackend extends EventEmitter {
   // demoted an installed app to "development mode", where it looked for
   // app.py in the read-only install dir and wrote its log there too.
   private packaged: boolean
+  // 开发调试时可连接由 IDE 启动的外部后端；此时桌面端不创建、抢占或结束 Python 进程。
+  private readonly externalPort: number | null
   private port: number = DESKTOP_BACKEND_PORT
   private status: 'stopped' | 'starting' | 'ready' | 'error' = 'stopped'
   // Resolves once start() has settled on a port. The renderer awaits this
@@ -129,10 +131,11 @@ export class PythonBackend extends EventEmitter {
   // into the void, leaving the user with a bare "initialization failed".
   private lastError: BackendError | null = null
 
-  constructor(backendPath: string, packaged = false) {
+  constructor(backendPath: string, packaged = false, externalPort: number | null = null) {
     super()
     this.backendPath = backendPath
     this.packaged = packaged
+    this.externalPort = externalPort
     this.portReady = new Promise<number>((resolve) => {
       this.markPortReady = resolve
     })
@@ -706,6 +709,17 @@ export class PythonBackend extends EventEmitter {
     // Drop the previous run's output so a retry can't report a stale error.
     this.recentLogs = []
     this.lastError = null
+
+    // 外部后端模式专用于本地 IDE 调试。只等待指定端口健康，不清理端口，
+    // 也不 spawn Python；因此 Electron 退出时不会把断点中的进程一起结束。
+    if (this.externalPort !== null) {
+      this.port = this.externalPort
+      this.markPortReady(this.port)
+      this.emit('port', this.port)
+      this.emit('log', `Using external debug backend on port ${this.port}`)
+      await this.waitForReady()
+      return
+    }
 
     // Packaged app stores writable data in ~/.cow; dev keeps it in the repo.
     const dataDir = this.getDataDir()

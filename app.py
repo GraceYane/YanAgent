@@ -385,6 +385,12 @@ class YanAgentHandler(BaseHTTPRequestHandler):
             payload = self._body()
             if path == "/message":
                 request_id = f"run-{uuid.uuid4().hex}"
+                LOGGER.info(
+                    "[yanDebug][01-请求入口][app.py][YanAgentHandler.do_POST] "
+                    "收到桌面聊天请求，request_id=%s，stream=%s；消息正文未写入日志",
+                    request_id,
+                    payload.get("stream") is True,
+                )
                 if payload.get("stream") is True:
                     self._json(self.runtime.start_stream(payload, request_id=request_id))
                 else:

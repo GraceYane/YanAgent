@@ -481,6 +481,12 @@ class YanAgentApplication:
         # 无仓储的离线 Fake Provider 模式由 Provider 自己决定是否要求配置。
         prepared.config.require_model_ready()
         await self._ensure_session(prepared.session_id)
+        LOGGER.info(
+            "[yanDebug][03-上下文装载开始][chat.py][YanAgentApplication.begin_chat] "
+            "准备读取完整历史并组装模型上下文，request_id=%s，session_id=%s",
+            request_id,
+            prepared.session_id,
+        )
         stored = await self.session_store.complete_history(prepared.session_id)
         assembled = self._assemble_model_context(
             prepared,
@@ -490,11 +496,15 @@ class YanAgentApplication:
         )
         current_records = await self.session_store.append(prepared.session_id, [current])
         LOGGER.info(
-            "[chat.py][YanAgentApplication.begin_chat] 统一上下文已组装且用户消息已落库，request_id=%s，session_id=%s，历史消息数=%d，工具数=%d",
+            "[yanDebug][03-上下文已组装][chat.py][YanAgentApplication.begin_chat] "
+            "统一上下文已组装且用户消息已落库，request_id=%s，session_id=%s，"
+            "历史消息数=%d，模型消息数=%d，工具数=%d，user_sequence=%d",
             request_id,
             prepared.session_id,
             len(stored),
+            len(assembled.messages),
             len(assembled.tools),
+            current_records[0].sequence,
         )
         return ChatContext(
             messages=assembled.messages,
@@ -543,9 +553,13 @@ class YanAgentApplication:
         assistant.metadata["usage"] = reply.usage
         records = await self.session_store.append(prepared.session_id, [assistant])
         LOGGER.info(
-            "[chat.py][YanAgentApplication.finish_chat] Assistant 完整回答已落库，request_id=%s，session_id=%s",
+            "[yanDebug][07-回答落库][chat.py][YanAgentApplication.finish_chat] "
+            "Assistant 完整回答已落库，request_id=%s，session_id=%s，"
+            "assistant_sequence=%d，输出字符数=%d",
             request_id,
             prepared.session_id,
+            records[0].sequence,
+            len(reply.content),
         )
         return records[0].sequence
 

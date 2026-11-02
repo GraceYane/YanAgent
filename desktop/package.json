@@ -9,6 +9,8 @@
     "console:utf8": "node scripts/console-utf8.mjs",
     "predev": "npm run console:utf8",
     "dev": "npm run build && electron .",
+    "predev:external": "npm run console:utf8",
+    "dev:external": "npm run build && node scripts/electron-external-backend.mjs",
     "dev:hot": "concurrently \"npm run dev:renderer\" \"sleep 2 && npm run dev:main\"",
     "predev:main": "npm run console:utf8",
     "dev:main": "tsc -p tsconfig.main.json && electron .",
