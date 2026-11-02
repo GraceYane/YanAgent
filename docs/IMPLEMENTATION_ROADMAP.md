@@ -1,10 +1,10 @@
 # YanAgent 实施路线摘要
 
-详细需求、任务编号、依赖、验收与进度以 [开发需求与实施计划](DEVELOPMENT_REQUIREMENTS.md) 为准。本摘要与该文档 v1.13 对齐，替代初始骨架阶段的简略 Phase 顺序。
+详细需求、任务编号、依赖、验收与进度以 [开发需求与实施计划](DEVELOPMENT_REQUIREMENTS.md) 为准。本摘要与该文档 v1.14 对齐，替代初始骨架阶段的简略 Phase 顺序。
 
 ## 当前起点
 
-P01～P03 已完成，P04-01 已完成统一 Prompt 与上下文组装，共 194 项测试通过。下一项：**P04-02，非流式 Agent Loop**。
+P01～P03 已完成，P04-01、P04-02 已完成统一上下文与非流式 Agent Loop，共 198 项测试通过。下一项：**P04-03，多调用与限制**。
 
 ## 阶段顺序
 
@@ -42,6 +42,7 @@ P01～P03 已完成，P04-01 已完成统一 Prompt 与上下文组装，共 194
 15. P03-04（已完成）：`deny / ask / allow`、作用域绑定、确认请求/结果和一次性批准消费，见 [工具权限基础](P03_04_PERMISSION_FOUNDATION.md)。
 16. P03-05（已完成）：应用级工具注册表、桌面 `/api/tools` 目录和 P03 综合失败矩阵，见 [工具列表与阶段验收](P03_05_TOOL_INTERFACE.md)。
 17. P04-01（已完成）：可信身份、系统规则、工具说明、完整历史和当前输入的统一上下文组装，见 [Prompt 与上下文组装](P04_01_PROMPT_CONTEXT.md)。
+18. P04-02（已完成）：Fake Provider 非流式模型工具闭环、Assistant/Tool 原序持久化、权限失败反馈、累计 Usage 与 Run 终态，见 [非流式 Agent Loop](P04_02_NON_STREAMING_LOOP.md)。
 
 ## 推进约定
 

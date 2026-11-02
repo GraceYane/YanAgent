@@ -19,12 +19,12 @@ from yanagent.errors import (
     RequestValidationError,
     SessionAlreadyExistsError,
     SessionNotFoundError,
-    UnexpectedToolCallError,
 )
 from yanagent.models import ModelProvider, OpenAICompatibleProvider
+from yanagent.runtime.agent_loop import AgentLoop
 from yanagent.sessions import RunStore, SessionStore
 from yanagent.sessions.runs import TerminalRunStatus
-from yanagent.tools import ToolManager, register_safe_example_tools
+from yanagent.tools import ToolManager, ToolPermissionContext, register_safe_example_tools
 
 
 LOGGER = logging.getLogger("yanagent.chat")
@@ -314,21 +314,35 @@ class YanAgentApplication:
         context = await self.begin_chat(prepared, request_id=request_id)
         run_started = await self.start_run(prepared, request_id=request_id)
         try:
-            reply = await prepared.provider.complete(
-                context.messages, tools=context.tools,
+            identity = self._runtime_identity(prepared, request_id=request_id)
+            loop_result = await AgentLoop(
+                model=prepared.provider,
+                tools=self.tool_manager,
+                sessions=self.session_store,
+            ).run(
+                messages=context.messages,
+                tool_schemas=context.tools,
+                session_id=prepared.session_id,
+                request_id=request_id,
+                permission_mode=prepared.config.permission_mode,
+                permission_context=ToolPermissionContext(
+                    allowed_scopes=frozenset({"global", "user", "agent", "session"}),
+                    run_id=request_id,
+                    user_id=identity.user_id,
+                    agent_id=identity.agent_id,
+                    session_id=identity.session_id,
+                    confirmation_ui_available=False,
+                ),
             )
-            if reply.tool_calls:
-                raise UnexpectedToolCallError()
-            assistant_sequence = await self.finish_chat(
-                prepared, reply, request_id=request_id,
-            )
+            reply = loop_result.reply
+            assistant_sequence = loop_result.assistant_sequence
             if run_started:
                 await self.finish_run(
                     request_id,
                     prepared.session_id,
                     status="completed",
                     finish_reason=reply.finish_reason,
-                    usage=reply.usage,
+                    usage=loop_result.usage,
                 )
         except asyncio.CancelledError:
             if run_started:
@@ -360,8 +374,12 @@ class YanAgentApplication:
                 )
             raise
         LOGGER.info(
-            "[chat.py][YanAgentApplication.chat] 普通聊天请求完成，request_id=%s，上下文消息数=%d，输出字符数=%d",
-            request_id, len(context.messages), len(reply.content),
+            "[chat.py][YanAgentApplication.chat] 普通 Agent Loop 完成，"
+            "request_id=%s，模型轮数=%d，初始上下文消息数=%d，输出字符数=%d",
+            request_id,
+            loop_result.turns,
+            len(context.messages),
+            len(reply.content),
         )
         return {
             "status": "success",
@@ -371,7 +389,8 @@ class YanAgentApplication:
             "speaker": "default",
             "received_session_id": prepared.session_id,
             "finish_reason": reply.finish_reason,
-            "usage": reply.usage,
+            "usage": loop_result.usage,
+            "turns": loop_result.turns,
             "user_seq": context.user_sequence,
             "bot_seq": assistant_sequence,
         }
@@ -492,19 +511,25 @@ class YanAgentApplication:
         current: Message,
     ) -> ModelContext:
         """把可信身份、历史、当前输入和工具快照交给统一构建器。"""
-        user_id = self.session_store.user_id if self.session_store is not None else "local"
-        agent_id = self.session_store.agent_id if self.session_store is not None else "default"
-        identity = RuntimeIdentity(
-            user_id=user_id,
-            agent_id=agent_id,
-            session_id=prepared.session_id,
-            request_id=request_id,
-        )
+        identity = self._runtime_identity(prepared, request_id=request_id)
         return self.context_builder.build(
             identity=identity,
             history=history,
             current=current,
             tools=self.tool_manager.schemas(),
+        )
+
+    def _runtime_identity(
+        self, prepared: PreparedChat, *, request_id: str
+    ) -> RuntimeIdentity:
+        """从受信仓储作用域和当前请求生成 Prompt 与工具权限共用的身份。"""
+        user_id = self.session_store.user_id if self.session_store is not None else "local"
+        agent_id = self.session_store.agent_id if self.session_store is not None else "default"
+        return RuntimeIdentity(
+            user_id=user_id,
+            agent_id=agent_id,
+            session_id=prepared.session_id,
+            request_id=request_id,
         )
 
     async def finish_chat(

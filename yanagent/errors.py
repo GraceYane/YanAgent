@@ -146,10 +146,17 @@ class RunAlreadyExistsError(AgentError):
 
 
 class UnexpectedToolCallError(AgentError):
-    """标识普通聊天收到工具请求，但工具循环尚未进入本阶段。"""
+    """标识当前调用链收到工具请求，但尚未接入对应的工具循环。"""
 
     code = "unexpected_tool_call"
-    message = "模型请求调用工具；普通聊天阶段尚未启用工具执行，请更换模型或提示词。"
+    message = "模型请求调用工具；当前调用链尚未启用工具执行。"
+
+
+class MultipleToolCallsUnsupportedError(AgentError):
+    """标识模型在 P04-02 阶段同一响应请求了多个工具。"""
+
+    code = "multiple_tool_calls_unsupported"
+    message = "模型一次请求了多个工具；当前阶段仅支持每轮一个工具调用。"
 
 
 class AuthenticationError(AgentError):

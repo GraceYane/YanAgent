@@ -2,7 +2,7 @@
 
 状态：已完成  
 完成日期：2026-10-28  
-下一项：P04-02 非流式 Agent Loop
+后续状态：P04-02 已完成；下一项为 P04-03 多调用与限制
 
 ## 1. 本阶段解决的问题
 
@@ -72,7 +72,7 @@ System → 完整历史 → 当前 User
 
 ## 4. 本阶段未完成
 
-- 模型虽然已经能看到 `calculator` 和 `current_time` 的 Schema，但 P04-02 前不会执行模型返回的 ToolCall；当前仍以 `UnexpectedToolCallError` 明确失败。
+- P04-02 已让普通非流式聊天执行每轮一个 ToolCall，并把 Assistant ToolCall 与 Tool Result 依次写入历史后继续请求模型；流式聊天仍会对 ToolCall 明确失败，待 P04-04 接通。
 - 没有实现 `模型 → 工具 → 模型` 多轮循环、轮数/总超时/连续失败限制或累计 Token。
 - 没有实现上下文 Token 预算、裁剪和摘要；这些属于 P05-04。
 - 没有接入 Skills、Memory、Knowledge、MCP 或 Workspace Prompt；分别属于 P07～P09 和 P06。

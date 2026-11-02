@@ -1467,3 +1467,70 @@ Electron/React chatStore
 - 下一项严格执行 P04-02：先使用 Fake Provider 完成非流式 `模型 → 工具 → 模型`，保存 Assistant 原始 ToolCall 与对应 Tool Result，并验证下一轮输入顺序。
 - P04-03 再增加多调用、最大轮数、总超时和连续失败限制；P04-04/P04-05 再接流式工具事件、桌面工具卡片与持久化恢复。
 - P05-04 才实现 Token 预算、完整轮次裁剪和摘要；P07～P09 再将 Skills、MCP、记忆和知识检索按可信来源注入上下文。
+
+## 2026-10-29：P04-02 非流式 Agent Loop
+
+### 需求与完成范围
+
+按照 `docs/DEVELOPMENT_REQUIREMENTS.md` 和最新 `AGENTS.md` 完成 P04-02：先使用 `FakeProvider` 接通非流式 `模型 → 工具 → 模型`，保存模型原始 Assistant ToolCall，再保存相同调用 ID 的 Tool Result；只要模型继续请求单个工具就进入下一轮，直到得到最终回答。本次严格保留 P04-03 边界，不提前实现同一响应多个 ToolCall、最大轮数、总超时和连续失败限制。
+
+### 实际开发内容
+
+- 将 `yanagent/runtime/agent_loop.py` 从占位实现改为供应商无关的非流式循环。每轮直接使用 P04-01 组装的 `Message` 与工具 Schema 调用当前 Provider，不创建第二套模型消息格式。
+- 模型返回 ToolCall 后先验证加入该消息后的完整对话，再保存原始 Assistant Message；随后通过 P03 的 `ToolManager.execute()` 完成参数校验、权限决策、超时和 handler 调用，把成功或失败结果转换为同 `tool_call_id`、同工具名的 Tool Message 保存并追加到下一轮模型输入。
+- 未知工具、非法参数和权限拒绝不会被误当成 Provider 故障，而是作为 `is_error=True` 的 Tool Result 回交模型，使模型有机会解释或调整；Provider 自身失败仍结束整个 Run，且不会伪造最终 Assistant 回答。
+- 一次用户请求只创建一个 Run；所有模型轮次 Usage 累计到该 Run，最终普通 HTTP 结果增加 `turns`，继续返回真实 `user_seq / bot_seq`。无数据库的离线入口保留相同内存循环语义。
+- 当前同一模型响应若包含多个 ToolCall，会在保存 Assistant 或执行任何工具前抛出稳定的 `multiple_tool_calls_unsupported`，防止只保存/执行一部分。P04-03 将补顺序多调用和循环限制。
+- 保留 Bridge 阶段边界：SQLite 仍保证并发消息序号唯一，但同一 Session 的两个模型 Run 尚未串行，业务消息可能交错；P04-02 只验收单 Run 工具链，P05-02 再完成同 Session 排队。
+- 在 `yanagent/runtime/__init__.py` 使用延迟导出兼容 `AgentLoop` 与既有 `AgentRuntime`，避免 `chat → runtime.agent_loop → storage → runtime` 的循环导入；普通聊天入口改为调用 AgentLoop，流式入口保持原路径并继续明确拒绝 ToolCall。
+- 增加 `[agent_loop.py][函数名]` 中文日志，记录循环轮次、工具调用、结果状态、持久化序号和最终累计信息；日志不输出 API Key 或原始敏感错误正文。
+- 新增 `docs/P04_02_NON_STREAMING_LOOP.md`，同步 README、需求文档 v1.14、路线图、历史阶段状态和岗位映射；下一项更新为 P04-03。
+
+### 修改文件
+
+- 核心：`yanagent/runtime/agent_loop.py`、`yanagent/chat.py`、`yanagent/runtime/__init__.py`
+- 错误与 HTTP：`yanagent/errors.py`、`app.py`
+- 测试：`tests/test_agent_loop.py`、`tests/test_chat_integration.py`、`tests/test_scaffold.py`
+- 文档：`README.md`、`docs/P04_02_NON_STREAMING_LOOP.md`、`docs/DEVELOPMENT_REQUIREMENTS.md`、`docs/IMPLEMENTATION_ROADMAP.md`、`docs/P04_01_PROMPT_CONTEXT.md`、`docs/TARGET_ROLES.md`、P02/P03 状态文档和本记录
+
+### 验证证据
+
+- 新增 5 项 `tests/test_agent_loop.py` 行为测试，并删除 1 项“AgentLoop 必须未实现”的旧占位测试。
+- 两轮计算器 ToolCall、第三轮最终回答用例验证三次模型输入依次增长，数据库顺序为 `User → Assistant ToolCall → Tool → Assistant ToolCall → Tool → Assistant`，调用 ID、工具名、序号和累计 Usage 均保持一致。
+- 未知工具、坏参数和 `deny` 权限均以失败 Tool Result 回交第二轮模型；同轮多调用在部分持久化/副作用前失败；工具执行完成后的模型认证失败保留完整 Assistant/Tool 对、Run 标记失败且不产生伪回答。
+- AgentLoop、聊天集成和脚手架定向测试通过；全量 `unittest discover` 共 198 项通过，最终单次耗时 11.558 秒；`compileall`、运行时导入烟雾检查和 `git diff --check` 通过。该耗时只记录本机本次运行，不作为性能结论。
+- 本次只修改 Python 后端、测试与文档，没有桌面源码变化，因此未重复执行 `npm run build`；没有网络请求、真实 API Key 或真实 DeepSeek 工具调用，不能把 Fake Provider 证据描述为真实模型联调。
+
+### 难度评分
+
+整体难度：**8/10**。核心困难不在 `while` 循环，而是保证模型协议、工具权限、副作用、数据库消息顺序、Run 终态和累计 Usage 在成功与失败路径上仍然属于同一次请求，并且不越过下一阶段的稳定性范围。
+
+| 难点 | 难度 | 容易出现的问题 | 实现方式与证据 |
+|---|---:|---|---|
+| 消息关联与落库顺序 | 9/10 | 只保存 Tool Result；丢失模型原调用 ID；模型失败后生成假的最终回答 | 每轮先验证完整对话，再保存 Assistant ToolCall，执行并保存同 ID Tool；六消息顺序和工具后模型失败测试验证 |
+| 权限与失败反馈 | 8/10 | 绕过 ToolManager 直接调用 handler；把未知工具/拒绝当网络异常结束，模型看不到错误 | AgentLoop 只走统一执行入口；三类失败均生成 `is_error=True` Tool Message 并进入下一轮模型输入 |
+| Run 与累计 Usage | 7/10 | 每个模型轮次创建一个 Run；只记录最后一轮 Token；失败产生多个终态 | 一次用户请求复用一个 Run；字段逐轮累计且未知保持 `None`；成功/认证失败测试验证唯一终态 |
+| 阶段边界与部分副作用 | 8/10 | P04-02 临时支持半个多调用；无限循环被错误宣称可长期运行 | 多调用在副作用前稳定拒绝，文档明确当前没有循环上限；多调用和限制留给 P04-03 |
+| 模块依赖 | 7/10 | chat 导入 AgentLoop 后触发 runtime/storage/chat 循环导入，应用无法启动 | runtime 包对既有类型延迟导出；导入烟雾测试、定向及全量回归通过 |
+
+### 岗位要求关联与实践证据
+
+- **XM 职责1/6 与工具调用执行管控**：实现模型决策、统一工具执行、结构化结果回写和最终回答的闭环，权限/参数拒绝发生在 handler 副作用前；当前没有工作区文件/命令工具、OS Sandbox 或企业内部工具接入。
+- **DYQ 职责2～3（多工具调用管控、可调试框架）**：复用 ToolManager 的 Schema/权限/异常边界，并将调用 ID、轮次和失败语义固化为确定性测试；“多工具”这里只指工具体系，P04-02 尚不支持同一响应并列多个 ToolCall。
+- **DYG 职责1/4 与端到端 Agent 流程**：形成可运行的单 Agent 模型工具闭环，并参考 CowAgentByYan 的循环和消息完整性设计；没有复制其完整并行、steering、重试或恢复逻辑，也没有真实业务效果指标。
+- **TX 职责1及要求2（工具执行引擎与 Tool Use）**：把 Provider、ToolManager、SessionStore 和 RunStore 串成一个可验证执行路径，覆盖成功、拒绝、协议错误和模型失败；尚未完成 Planning、Reflection 或 Benchmark。
+- **Verification Loop 实践**：先列出孤立 Tool Result、部分多调用、权限旁路、Token 丢失和模型失败等风险，再用 Fake Provider 与真实 SQLite 逐项验证。这是工程验证回路，不等于 Agent 自动修复闭环。
+
+### 面试可讲事实与边界
+
+- 可以表述：实现供应商无关的非流式 Agent Loop，模型 ToolCall 先按原消息持久化，再经统一校验/权限执行，Tool Result 使用相同调用 ID 回交模型，直到获得最终回答。
+- 可以表述：一次用户请求保持一个 Run，累计多轮模型 Usage；失败路径保留已真实发生的完整 Assistant/Tool 记录，不伪造回答。
+- 可以表述：通过 5 项新增行为测试验证两轮工具链、六消息落库、结构化失败回馈、部分副作用防护和工具后模型失败。
+- 不可以表述：已支持同轮多工具、完整循环限流、流式工具事件、桌面工具卡片/确认、崩溃后半轮自动恢复或真实 DeepSeek 工具闭环；这些属于 P04-03～P04-05 及后续稳定性工作。
+- 不可以表述：同一 Session 并发模型请求已经串行化；当前只有数据库写入序号安全，Bridge 排队属于 P05-02。
+
+### 后续事项
+
+- 下一项严格执行 P04-03：按模型原顺序处理同一响应中的多个 ToolCall，并加入最大模型轮数、总超时、单工具超时复核和连续失败限制。
+- P04-04 再将工具调用接入 SSE 事件，P04-05 处理桌面工具卡片、历史还原和崩溃后半轮解释/恢复。
+- 在 P04 阶段验收前补真实 DeepSeek 工具调用；当前 P01 的真实普通/流式证据不能替代 P04 新闭环的真实验证。

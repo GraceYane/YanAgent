@@ -18,7 +18,7 @@ from yanagent.config import ConfigStore, MASKED_SECRET
 from yanagent.contracts import ModelReply, ToolCall
 from yanagent.errors import (
     AuthenticationError, ConfigurationError, ModelNotFoundError, ModelTimeoutError,
-    RateLimitError, RequestValidationError, UnexpectedToolCallError,
+    RateLimitError, RequestValidationError,
 )
 from yanagent.events import ModelStreamEvent
 from yanagent.models import FakeProvider
@@ -153,6 +153,7 @@ class ChatApplicationTests(unittest.TestCase):
         self.assertFalse(result["stream"])
         self.assertEqual(result["inline_reply"], "你好，我是 YanAgent。")
         self.assertTrue(result["request_id"].startswith("run-"))
+        self.assertEqual(result["turns"], 1)
         self.assertEqual(
             [item.role for item in fake.calls[0].messages], ["system", "user"]
         )
@@ -188,15 +189,26 @@ class ChatApplicationTests(unittest.TestCase):
         self.assertEqual(fake.remaining, 1)
         self.assertEqual(fake.calls, [])
 
-    def test_chat_does_not_execute_unexpected_tool_call(self) -> None:
-        """P04-01 只暴露工具上下文，P04-02 前不能提前执行模型工具请求。"""
+    def test_chat_returns_unknown_tool_result_to_model_in_memory(self) -> None:
+        """无仓储 Fake 模式也会把未知工具失败回写给下一轮模型。"""
         fake = FakeProvider([
-            ModelReply(tool_calls=[ToolCall(id="call-1", name="shell", arguments={})])
+            ModelReply(tool_calls=[ToolCall(id="call-1", name="shell", arguments={})]),
+            ModelReply(content="当前没有 shell 工具。", finish_reason="stop"),
         ])
         application = YanAgentApplication(self.store, provider_factory=lambda _config: fake)
 
-        with self.assertRaises(UnexpectedToolCallError):
-            asyncio.run(application.chat({"session_id": "s1", "message": "执行命令"}))
+        result = asyncio.run(
+            application.chat({"session_id": "s1", "message": "执行命令"})
+        )
+
+        self.assertEqual(result["inline_reply"], "当前没有 shell 工具。")
+        self.assertEqual(result["turns"], 2)
+        self.assertEqual(
+            [message.role for message in fake.calls[1].messages],
+            ["system", "user", "assistant", "tool"],
+        )
+        self.assertEqual(fake.calls[1].messages[-1].tool_call_id, "call-1")
+        self.assertTrue(fake.calls[1].messages[-1].is_error)
 
 
 class ChatHttpIntegrationTests(unittest.TestCase):

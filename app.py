@@ -15,7 +15,7 @@ from yanagent.chat import ProviderFactory, YanAgentApplication, ensure_applicati
 from yanagent.config import ConfigStore
 from yanagent.errors import (
     AgentError, AuthenticationError, ConfigurationError, InvalidRequestError,
-    MessageNotFoundError,
+    MessageNotFoundError, MultipleToolCallsUnsupportedError,
     ModelConnectionError, ModelNotFoundError, ModelRefusalError, ModelResponseError,
     ModelServerError, ModelTimeoutError, PermissionDeniedError, RateLimitError,
     RequestValidationError, RunAlreadyExistsError, SessionAlreadyExistsError,
@@ -68,7 +68,8 @@ def _http_status(error: AgentError) -> HTTPStatus:
     if isinstance(error, ModelRefusalError):
         return HTTPStatus.UNPROCESSABLE_ENTITY
     if isinstance(error, (
-        ModelConnectionError, ModelResponseError, ModelServerError, UnexpectedToolCallError,
+        ModelConnectionError, ModelResponseError, ModelServerError,
+        MultipleToolCallsUnsupportedError, UnexpectedToolCallError,
     )):
         return HTTPStatus.BAD_GATEWAY
     if isinstance(error, SessionStorageError):
