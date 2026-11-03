@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from yanagent.chat import ProviderFactory, YanAgentApplication, ensure_application_ready
 from yanagent.config import ConfigStore
+from yanagent.debug_log import configure_yan_debug_logging
 from yanagent.errors import (
     AgentError, AuthenticationError, ConfigurationError, InvalidRequestError,
     MessageNotFoundError, MultipleToolCallsUnsupportedError,
@@ -582,6 +583,7 @@ def create_server(
 def main() -> None:
     """启动本地服务并在 SIGTERM 或 Ctrl+C 时关闭监听。"""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    configure_yan_debug_logging()
     database = Database()
     database_info = database.initialize()
     server = create_server(database=database)

@@ -1567,3 +1567,65 @@ Electron/React chatStore
 
 - 本次日志面向 PyCharm 中的 Python 后端全链路；桌面 TypeScript 渲染器未增加 `console` 日志。如需观察“点击发送”和“气泡收到首个 delta”的前端细节，应使用 Electron/Chromium JavaScript 调试器，不应把高频前端增量全部写入后端日志。
 
+## 2026-11-02：专用 yan_debug 日志与临时独占输出
+
+### 实际完成内容
+
+- 新增 `yanagent/debug_log.py`，提供统一的 `yan_debug(source, function, message, **values)` 工具函数，自动使用 `pformat` 将消息、工具 Schema 和模型回复格式化为多行调试内容。
+- 新增 `YANAGENT_DEBUG_ONLY=1` 临时开关；启用后根日志处理器屏蔽普通日志，专用 Logger 直接输出 `yan_debug` 内容，避免 `/poll`、健康检查和调度查询淹没模型调用链。
+- 将 OpenAI-compatible 普通/流式请求与完整回复，以及非流式 Agent Loop 的手工调试日志迁移到统一函数；没有把 API Key、Authorization 或密码传给该函数。
+- 本地 PyCharm 的 `YanAgent Backend Debug` 运行配置已加入独占日志环境变量；正式运行未设置该变量时仍保留原有日志行为。
+
+### 涉及文件
+
+- `yanagent/debug_log.py`
+- `yanagent/models/openai_compatible.py`
+- `yanagent/runtime/agent_loop.py`
+- `yanagent/runtime/streaming.py`
+- `app.py`
+- `tests/test_debug_log.py`
+- `.idea/workspace.xml`（仅本地调试配置）
+
+### 验证结果
+
+- `compileall` 通过。
+- 独立冒烟验证确认普通 Logger 内容被隐藏，`yan_debug` 内容正常输出。
+- 新增专用同步测试验证独占过滤与多行对象格式，避免依赖网络和异步运行环境。
+- Provider 组合测试的前 10 项同步编解码测试通过；进入首个异步测试时，当前受限 Windows 环境在创建 `asyncio` Proactor 内部 socket pair 时阻塞，堆栈停在标准库 `socket._fallback_socketpair`，因此未将该环境问题记为业务测试通过。
+
+### 难点与评分
+
+整体难度：**3/10**。主要难点是不能简单把根日志级别调高，否则专用 INFO 日志也会一起消失。实现上给根处理器安装临时拒绝过滤器，同时让专用 Logger 使用独立 stdout Handler 且不向根 Logger 传播，从而只保留明确通过 `yan_debug` 发出的内容；关闭开关后恢复普通传播模式。
+
+### 尚未完成事项
+
+- 当前独占模式仅用于本地流程观察，不应长期替代正式错误日志；调试结束后从运行配置移除 `YANAGENT_DEBUG_ONLY` 或将其设为 `0`。
+- 流式增量仍未逐片打印，当前只打印请求上下文和最终组装回复，以免每个 Token 刷屏；如需观察单个 SSE 原始片段，可在 `strict_json_loads(raw)` 后临时调用同一工具函数。
+
+## 2026-11-02：外部后端断点长暂停适配
+
+### 实际完成内容
+
+- 调整 Electron 的外部后端调试模式：检测到 `YANAGENT_EXTERNAL_BACKEND_PORT` 后立即将后端状态标记为 ready，不再进入 30 秒 `/api/health` 启动等待。
+- 外部模式不启动周期健康监控和自动恢复，避免 PyCharm 长时间暂停线程时被桌面端误判为后端失联并触发初始化失败。
+- 普通开发启动和正式安装模式未修改，仍保留启动健康检查、30 秒超时、运行期健康监控及有界自动恢复。
+
+### 涉及文件
+
+- `desktop/src/main/python-manager.ts`
+- `workProcess.md`
+
+### 验证结果
+
+- `npm run build:main` TypeScript 编译通过。
+- 通过代码路径复核确认外部模式不会调用 `waitForReady()` 和 `startHealthMonitor()`；普通模式仍在 Python 进程启动后调用原有 `waitForReady()`。
+
+### 难点与评分
+
+整体难度：**2/10**。关键是只放宽显式外部调试模式，不能全局删除健康保护。实现采用构造时已确定的 `externalPort` 分支提前返回，使 IDE 调试与正式运行的生命周期策略保持隔离。
+
+### 尚未完成事项
+
+- 外部模式现在信任 IDE 进程，即使 Python 尚未监听端口，Electron 也会先展示主界面；应先启动 `YanAgent Backend Debug`，再执行 `npm run dev:external`。
+- 断点暂停期间正在进行的单个 HTTP/SSE 请求仍可能在客户端或上游模型侧超时；本次修改只取消桌面壳对外部后端的启动超时与健康恢复。
+

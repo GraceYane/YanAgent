@@ -15,6 +15,7 @@ from yanagent.contracts import (
     Usage,
     validate_conversation,
 )
+from yanagent.debug_log import yan_debug
 from yanagent.errors import ModelResponseError, MultipleToolCallsUnsupportedError
 from yanagent.models.provider import ModelProvider
 from yanagent.sessions.store import SessionStore
@@ -23,7 +24,6 @@ from yanagent.tools.permissions import ToolPermissionContext
 
 
 LOGGER = logging.getLogger("yanagent.agent_loop")
-
 
 @dataclass(frozen=True, slots=True)
 class AgentLoopResult:
@@ -121,7 +121,20 @@ class AgentLoop:
             permission_mode,
         )
         while True:
+            yan_debug(
+                "agent_loop.py",
+                "AgentLoop.run",
+                "准备发送非流式模型轮次",
+                messages=working,
+                tools=schemas,
+            )
             reply = await self.model.complete(working, tools=schemas)
+            yan_debug(
+                "agent_loop.py",
+                "AgentLoop.run",
+                "收到非流式模型轮次回复",
+                reply=reply,
+            )
             turns += 1
             usage = _merge_usage(usage, reply.usage)
             LOGGER.info(

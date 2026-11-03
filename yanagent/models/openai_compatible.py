@@ -17,6 +17,7 @@ from yanagent.contracts import (
 from yanagent.errors import (
     EmptyModelResponseError, InvalidRequestError, ModelRefusalError, ModelResponseError,
 )
+from yanagent.debug_log import yan_debug
 from yanagent.events import ModelStreamEvent
 from .provider import NonStreamingProvider
 from .transport import (
@@ -25,7 +26,6 @@ from .transport import (
 
 
 LOGGER = logging.getLogger("yanagent.models.openai_compatible")
-
 
 def _request_id_for_log(messages: Sequence[Message]) -> str:
     """从内部消息元数据提取安全的请求标识，仅用于关联调试日志。"""
@@ -344,7 +344,14 @@ class OpenAICompatibleProvider(NonStreamingProvider):
                      "Content-Type": "application/json", "Accept": "application/json"},
             payload=payload, timeout=self._config.request_timeout,
         )
-        return parse_reply(data)
+        reply = parse_reply(data)
+        yan_debug(
+            "openai_compatible.py",
+            "OpenAICompatibleProvider.complete",
+            "收到非流式模型完整回复",
+            reply=reply,
+        )
+        return reply
 
     async def stream(
         self, messages: Sequence[Message], *, tools: Sequence[dict[str, Any]] = (),
@@ -352,6 +359,15 @@ class OpenAICompatibleProvider(NonStreamingProvider):
         """发送一次流式请求，传播文本/工具增量并在末尾生成统一完整响应。"""
         self._config.require_model_ready()
         converted, schemas = prepare_request(messages, tools)
+        yan_debug(
+            "openai_compatible.py",
+            "OpenAICompatibleProvider.stream",
+            "准备发送流式模型请求",
+            model=self._config.model,
+            messages=converted,
+            tools=schemas,
+        )
+
         payload: dict[str, Any] = {
             "model": self._config.model, "messages": converted, "stream": True,
         }
@@ -371,12 +387,25 @@ class OpenAICompatibleProvider(NonStreamingProvider):
         )
         builder = StreamReplyBuilder()
         saw_done = False
-        async for raw in self._stream_transport.stream_data(
-            url=self._config.api_base.rstrip("/") + "/chat/completions",
-            headers={"Authorization": f"Bearer {self._config.api_key}",
-                     "Content-Type": "application/json", "Accept": "text/event-stream"},
-            payload=payload, timeout=self._config.request_timeout,
-        ):
+
+        url = self._config.api_base.rstrip("/") + "/chat/completions"
+
+        headers = {
+            "Authorization": f"Bearer {self._config.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+
+        request_payload = payload
+        timeout = self._config.request_timeout
+
+        stream = self._stream_transport.stream_data(
+            url=url,
+            headers=headers,
+            payload=request_payload,
+            timeout=timeout,
+        )
+        async for raw in stream:
             if raw.strip() == "[DONE]":
                 saw_done = True
                 break
@@ -388,6 +417,12 @@ class OpenAICompatibleProvider(NonStreamingProvider):
         if not saw_done:
             raise ModelResponseError()
         reply = builder.finish()
+        yan_debug(
+            "openai_compatible.py",
+            "OpenAICompatibleProvider.stream",
+            "收到流式模型完整回复",
+            reply=reply,
+        )
         LOGGER.info(
             "[yanDebug][06-模型响应解析完成][openai_compatible.py]"
             "[OpenAICompatibleProvider.stream] 已组装完整模型响应，"
