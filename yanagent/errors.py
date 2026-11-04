@@ -159,6 +159,28 @@ class MultipleToolCallsUnsupportedError(AgentError):
     message = "模型一次请求了多个工具；当前阶段仅支持每轮一个工具调用。"
 
 
+class AgentLoopMaxTurnsError(AgentError):
+    """标识非流式 Agent Loop 已用完允许的模型决策轮次。"""
+
+    code = "agent_loop_max_turns"
+    message = "Agent 已达到本次运行的最大模型轮数，任务已安全停止。"
+
+
+class AgentLoopTimeoutError(AgentError):
+    """标识非流式 Agent Loop 超过整次运行的总时间预算。"""
+
+    code = "agent_loop_timeout"
+    message = "Agent 本次运行已超过总超时限制，任务已停止。"
+    retryable = True
+
+
+class AgentLoopConsecutiveFailuresError(AgentError):
+    """标识工具连续失败达到熔断阈值，防止模型无限重复调用。"""
+
+    code = "agent_loop_consecutive_tool_failures"
+    message = "工具连续失败次数达到限制，Agent 已停止继续调用工具。"
+
+
 class AuthenticationError(AgentError):
     """标识模型供应商拒绝凭据；不等同于 YanAgent 用户登录失败。"""
 

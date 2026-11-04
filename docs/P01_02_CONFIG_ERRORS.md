@@ -34,7 +34,7 @@
 | `api_base` | `YAN_API_BASE` | 空字符串；非空时要求 HTTP(S) 地址，可用本地服务；禁止 URL 用户名/密码、查询串和片段 |
 | `model` | `YAN_MODEL` | 空字符串；非空时为供应商模型标识，不预设远端模型清单 |
 | `api_key` | `YAN_API_KEY` | 空字符串；隐藏打印；全星号占位符不能作为真实密钥 |
-| `request_timeout` | `YAN_REQUEST_TIMEOUT` | 60 秒；数值且 `0 < 值 <= 3600`；拒绝布尔值、NaN、Infinity |
+| `request_timeout` | `YAN_REQUEST_TIMEOUT` | 600 秒；数值且 `0 < 值 <= 3600`；拒绝布尔值、NaN、Infinity |
 | `host` | `YAN_WEB_HOST` | `127.0.0.1`；非空，无空白及 URL 路径等分隔符 |
 | `port` | `YAN_WEB_PORT` | 9876；整数，范围 1～65535；拒绝布尔值 |
 | `permission_mode` | `YAN_PERMISSION_MODE` | `ask`；允许 `deny / ask / allow`，只是保留配置字段，执行权限在 P03 实现 |

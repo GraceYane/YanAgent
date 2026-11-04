@@ -15,7 +15,7 @@ YanAgent 是从 CowAgent 的桌面产品外壳中抽出的学习脚手架。项�
 - 桌面会话列表、历史分页、用户消息时间线、重命名、置顶、删除和重新生成已接到 SQLite。
 - Session/Message/Run 强制使用用户、Agent 和 Session 归属；并发消息写入保持唯一序号，启动时恢复遗留 Run 为中断状态。
 - 工具系统已支持严格定义与注册、本机时间、受限计算器、统一执行，以及 `deny / ask / allow`、作用域和确认结果边界；`/api/tools` 已接通真实目录，确认 UI 尚未启用。
-- 普通与流式模型请求已统一组装可信身份、系统规则、工具说明、完整历史和当前输入，并向模型发送真实工具 Schema；普通非流式聊天已能执行每轮一个工具调用并把结果交回模型继续回答，流式工具循环仍待 P04-04。
+- 普通与流式模型请求已统一组装可信身份、系统规则、工具说明、完整历史和当前输入，并向模型发送真实工具 Schema；普通非流式聊天已能顺序执行同轮多个工具，并受最大轮数、总超时、单工具超时和连续失败限制保护，流式工具循环仍待 P04-04。
 - 阅读各核心模块的接口、TODO 和验收条件，逐步替换占位实现。
 - 使用 Python 普通/流式 Provider 或离线 Fake Provider；配置、SSE、取消和错误已接到桌面 HTTP 契约。
 
@@ -23,12 +23,12 @@ YanAgent 是从 CowAgent 的桌面产品外壳中抽出的学习脚手架。项�
 
 | 模块 | 入口 | 当前状态 |
 |---|---|---|
-| Agent 执行循环 | `yanagent/runtime/agent_loop.py` | P04-02 已完成非流式单工具多轮闭环、消息回写、累计 Usage 与 Run 终态；多调用和限制待 P04-03 |
+| Agent 执行循环 | `yanagent/runtime/agent_loop.py` | P04-03 已完成非流式多工具顺序执行、消息配对、累计 Usage、运行限制与 Run 终态；流式循环待 P04-04 |
 | 运行时调度 Bridge | `yanagent/runtime/bridge.py` | 接口保留，实现为空 |
 | Session 与上下文 | `yanagent/storage/`、`yanagent/sessions/`、`yanagent/chat.py` | P02 已完成聊天落库、重启恢复、完整历史、桌面管理、强归属和 Run 中断恢复 |
 | 模型适配层 | `yanagent/models/openai_compatible.py`、`yanagent/chat.py` | P01-05 已接通普通与流式桌面消息、增量组装和安全错误 |
 | 最小流式 Runtime | `yanagent/runtime/streaming.py`、`yanagent/events.py`、`app.py` | 常驻事件循环、Run 隔离、SSE 回放、基本取消与终态清理已完成 |
-| 工具系统 | `yanagent/tools/manager.py`、`validation.py`、`permissions.py`、`examples.py` | P03 已完成注册、安全示例、统一执行、权限和桌面工具列表；P04-02 已接入普通非流式模型循环，多调用/流式循环待后续 |
+| 工具系统 | `yanagent/tools/manager.py`、`validation.py`、`permissions.py`、`examples.py` | P03 已完成注册、安全示例、统一执行、权限和桌面工具列表；P04-03 已接入普通非流式多工具循环，流式循环待 P04-04 |
 | Prompt 与上下文 | `yanagent/context.py`、`yanagent/chat.py` | P04-01 已统一身份、系统规则、工具说明、完整历史、当前输入和普通/流式 Provider 参数 |
 | 长期记忆 | `yanagent/memory/service.py` | 接口保留，实现为空 |
 | MCP Client | `yanagent/mcp/client.py` | 接口保留，实现为空 |
@@ -94,7 +94,7 @@ npm run dev
 6. P06～P10：多模型、完整工具、Skills、MCP、记忆知识库和 Multi-Agent。
 7. P11～P12：Web、多渠道、定时、桌面交付与功能对照验收。
 
-P01、P02 和 P03 均已完成。P01 阶段验收见 [P01 验证与文档](docs/P01_06_VERIFICATION.md)；P02 实现见 [数据库基础](docs/P02_01_DATABASE.md)、[会话与消息存储](docs/P02_02_SESSION_STORE.md)、[历史与上下文接通](docs/P02_03_HISTORY_CONTEXT.md)、[桌面会话联调](docs/P02_04_DESKTOP_SESSIONS.md)和[隔离与恢复](docs/P02_05_ISOLATION_RECOVERY.md)；P03 实现见 [工具注册与统一 Schema](docs/P03_01_TOOL_REGISTRY.md)、[安全示例工具](docs/P03_02_SAFE_TOOLS.md)、[统一工具执行](docs/P03_03_TOOL_EXECUTION.md)、[工具权限基础](docs/P03_04_PERMISSION_FOUNDATION.md)和[工具列表与阶段验收](docs/P03_05_TOOL_INTERFACE.md)；P04-01 实现见 [Prompt 与上下文组装](docs/P04_01_PROMPT_CONTEXT.md)，P04-02 实现见 [非流式 Agent Loop](docs/P04_02_NON_STREAMING_LOOP.md)。当前共 198 项测试通过，下一项任务是 **P04-03：多调用与限制**；确认 UI、同轮多工具和流式工具循环尚未接入。
+P01、P02 和 P03 均已完成。P01 阶段验收见 [P01 验证与文档](docs/P01_06_VERIFICATION.md)；P02 实现见 [数据库基础](docs/P02_01_DATABASE.md)、[会话与消息存储](docs/P02_02_SESSION_STORE.md)、[历史与上下文接通](docs/P02_03_HISTORY_CONTEXT.md)、[桌面会话联调](docs/P02_04_DESKTOP_SESSIONS.md)和[隔离与恢复](docs/P02_05_ISOLATION_RECOVERY.md)；P03 实现见 [工具注册与统一 Schema](docs/P03_01_TOOL_REGISTRY.md)、[安全示例工具](docs/P03_02_SAFE_TOOLS.md)、[统一工具执行](docs/P03_03_TOOL_EXECUTION.md)、[工具权限基础](docs/P03_04_PERMISSION_FOUNDATION.md)和[工具列表与阶段验收](docs/P03_05_TOOL_INTERFACE.md)；P04-01 实现见 [Prompt 与上下文组装](docs/P04_01_PROMPT_CONTEXT.md)，P04-02 实现见 [非流式 Agent Loop](docs/P04_02_NON_STREAMING_LOOP.md)，P04-03 实现见 [多调用与限制](docs/P04_03_MULTI_CALL_LIMITS.md)。当前共 206 项测试通过，下一项任务是 **P04-04：流式循环**；确认 UI、流式工具事件和桌面工具卡片尚未接入。
 
 可在项目根目录运行本次配置演示（使用无效测试密钥，不请求网络）：
 

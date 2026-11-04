@@ -4,7 +4,8 @@ import json
 import unittest
 
 from yanagent.errors import (
-    AgentError, AuthenticationError, ConfigurationError, InvalidRequestError,
+    AgentError, AgentLoopConsecutiveFailuresError, AgentLoopMaxTurnsError,
+    AgentLoopTimeoutError, AuthenticationError, ConfigurationError, InvalidRequestError,
     ModelConnectionError, ModelNotFoundError, ModelServerError, ModelTimeoutError,
     PermissionDeniedError, RateLimitError, map_http_error,
 )
@@ -29,12 +30,15 @@ class ErrorTests(unittest.TestCase):
         """可重试提示与错误类别一致，输出可 JSON 往返且不包含异常对象。"""
         for error in (AgentError(), ConfigurationError(), AuthenticationError(),
                       PermissionDeniedError(), ModelNotFoundError(), InvalidRequestError(),
-                      RateLimitError(), ModelTimeoutError(), ModelConnectionError(), ModelServerError()):
+                      RateLimitError(), ModelTimeoutError(), ModelConnectionError(), ModelServerError(),
+                      AgentLoopMaxTurnsError(), AgentLoopTimeoutError(),
+                      AgentLoopConsecutiveFailuresError()):
             result = error.to_dict()
             self.assertEqual(json.loads(json.dumps(result)), result)
             self.assertEqual(str(error), result["message"])
             self.assertEqual(result["retryable"], isinstance(error, (
                 RateLimitError, ModelTimeoutError, ModelConnectionError, ModelServerError,
+                AgentLoopTimeoutError,
             )))
 
     def test_bad_status_is_not_guessed_from_text(self) -> None:

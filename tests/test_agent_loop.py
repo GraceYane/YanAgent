@@ -1,4 +1,4 @@
-"""P04-02 非流式模型、工具、模型闭环及持久化测试。"""
+"""P04-02～P04-03 非流式 Agent Loop、多调用、限制及持久化测试。"""
 
 from __future__ import annotations
 
@@ -9,11 +9,19 @@ from pathlib import Path
 
 from yanagent.chat import YanAgentApplication
 from yanagent.config import ConfigStore
-from yanagent.contracts import ModelReply, ToolCall
-from yanagent.errors import AuthenticationError, MultipleToolCallsUnsupportedError
+from yanagent.contracts import Message, ModelReply, ToolCall
+from yanagent.errors import (
+    AgentLoopConsecutiveFailuresError,
+    AgentLoopMaxTurnsError,
+    AgentLoopTimeoutError,
+    AuthenticationError,
+    EmptyModelResponseError,
+)
 from yanagent.models import FakeProvider
+from yanagent.runtime import AgentLoop
 from yanagent.sessions import RunStore, SessionStore
 from yanagent.storage import Database
+from yanagent.tools import ToolDefinition, ToolManager, ToolPermissionContext
 
 
 def _run(coroutine):
@@ -30,7 +38,7 @@ def _tool_reply(call_id: str, name: str, arguments: dict[str, object]) -> ModelR
 
 
 class NonStreamingAgentLoopTests(unittest.TestCase):
-    """验证 P04-02 单工具多轮循环、消息顺序、失败回写和 Run 终态。"""
+    """验证非流式多工具循环、消息顺序、运行限制和 Run 终态。"""
 
     def setUp(self) -> None:
         """创建独立配置、SQLite SessionStore 和 RunStore。"""
@@ -70,6 +78,39 @@ class NonStreamingAgentLoopTests(unittest.TestCase):
             provider_factory=lambda _config: fake,
             session_store=self.sessions,
             run_store=self.runs,
+        )
+
+    async def _run_direct_loop(
+        self,
+        fake: object,
+        *,
+        tools: ToolManager | None = None,
+        max_model_turns: int = 20,
+        total_timeout_seconds: float = 600,
+        max_consecutive_tool_failures: int = 3,
+    ):
+        """无数据库运行可调限制的 AgentLoop，供边界测试精确缩短阈值。"""
+        selected_tools = tools if tools is not None else self._application(fake).tool_manager
+        return await AgentLoop(
+            model=fake,
+            tools=selected_tools,
+            sessions=None,
+            max_model_turns=max_model_turns,
+            total_timeout_seconds=total_timeout_seconds,
+            max_consecutive_tool_failures=max_consecutive_tool_failures,
+        ).run(
+            messages=[Message("user", "测试循环限制")],
+            tool_schemas=selected_tools.schemas(),
+            session_id="direct-loop",
+            request_id="run-direct-loop",
+            permission_mode="allow",
+            permission_context=ToolPermissionContext(
+                allowed_scopes=frozenset({"global", "user", "agent", "session"}),
+                run_id="run-direct-loop",
+                user_id="local",
+                agent_id="default",
+                session_id="direct-loop",
+            ),
         )
 
     def test_two_tool_rounds_then_final_answer_are_ordered_and_persisted(self) -> None:
@@ -219,8 +260,8 @@ class NonStreamingAgentLoopTests(unittest.TestCase):
         run = _run(self.runs.get("run-denied", "denied"))
         self.assertEqual(run.status, "completed")
 
-    def test_multiple_tool_calls_fail_before_partial_assistant_persistence(self) -> None:
-        """P04-03 前拒绝同轮多工具调用，避免只执行或保存其中一部分。"""
+    def test_multiple_tool_calls_execute_in_model_order_and_persist_complete_group(self) -> None:
+        """同轮多个调用按模型顺序执行，下一轮收到一个 Assistant 和全部 Tool 结果。"""
         fake = FakeProvider([
             ModelReply(
                 tool_calls=[
@@ -228,20 +269,246 @@ class NonStreamingAgentLoopTests(unittest.TestCase):
                     ToolCall(id="multi-2", name="calculator", arguments={"expression": "2+2"}),
                 ],
                 finish_reason="tool_calls",
-            )
+            ),
+            ModelReply(content="两个结果分别是 2 和 4。", finish_reason="stop"),
         ])
 
-        with self.assertRaises(MultipleToolCallsUnsupportedError):
+        result = _run(self._application(fake).chat(
+            {"session_id": "multiple", "message": "同时计算两次"},
+            request_id="run-multiple",
+        ))
+
+        self.assertEqual(result["inline_reply"], "两个结果分别是 2 和 4。")
+        self.assertEqual(result["turns"], 2)
+        second_input = fake.calls[1].messages
+        self.assertEqual(
+            [message.role for message in second_input[-3:]],
+            ["assistant", "tool", "tool"],
+        )
+        self.assertEqual(
+            [message.tool_call_id for message in second_input[-2:]],
+            ["multi-1", "multi-2"],
+        )
+        self.assertEqual(
+            [message.content for message in second_input[-2:]],
+            ["2", "4"],
+        )
+        history = _run(self.sessions.complete_history("multiple"))
+        self.assertEqual(
+            [record.message.role for record in history],
+            ["user", "assistant", "tool", "tool", "assistant"],
+        )
+        self.assertEqual(
+            [call.id for call in history[1].message.tool_calls],
+            ["multi-1", "multi-2"],
+        )
+        run = _run(self.runs.get("run-multiple", "multiple"))
+        self.assertEqual(run.status, "completed")
+
+    def test_max_model_turns_stops_before_unconsumable_tool_side_effect(self) -> None:
+        """最后允许轮次仍请求工具时直接失败，不执行无法再交给模型消费的调用。"""
+        fake = FakeProvider([
+            _tool_reply("turn-1", "calculator", {"expression": "1+1"}),
+            _tool_reply("turn-2", "calculator", {"expression": "2+2"}),
+        ])
+
+        with self.assertRaises(AgentLoopMaxTurnsError):
+            _run(self._run_direct_loop(fake, max_model_turns=2))
+
+        self.assertEqual(len(fake.calls), 2)
+        self.assertEqual(fake.calls[1].messages[-1].content, "2")
+
+    def test_consecutive_tool_failures_stop_loop_and_mark_run_failed(self) -> None:
+        """连续三个失败 Tool Result 后熔断，不再发起下一轮模型请求。"""
+        fake = FakeProvider([
+            _tool_reply(f"failed-{index}", "missing_tool", {})
+            for index in range(1, 5)
+        ])
+
+        with self.assertRaises(AgentLoopConsecutiveFailuresError):
             _run(self._application(fake).chat(
-                {"session_id": "multiple", "message": "同时计算两次"},
-                request_id="run-multiple",
+                {"session_id": "failure-limit", "message": "重复调用未知工具"},
+                request_id="run-failure-limit",
             ))
 
-        history = _run(self.sessions.complete_history("multiple"))
-        self.assertEqual([record.message.role for record in history], ["user"])
-        run = _run(self.runs.get("run-multiple", "multiple"))
+        self.assertEqual(len(fake.calls), 3)
+        self.assertEqual(fake.remaining, 1)
+        history = _run(self.sessions.complete_history("failure-limit"))
+        self.assertEqual(
+            [record.message.role for record in history],
+            ["user", "assistant", "tool", "assistant", "tool", "assistant", "tool"],
+        )
+        self.assertTrue(all(history[index].message.is_error for index in (2, 4, 6)))
+        run = _run(self.runs.get("run-failure-limit", "failure-limit"))
         self.assertEqual(run.status, "failed")
-        self.assertEqual(run.error_code, "multiple_tool_calls_unsupported")
+        self.assertEqual(run.error_code, "agent_loop_consecutive_tool_failures")
+
+    def test_failure_limit_closes_remaining_calls_in_same_model_group(self) -> None:
+        """同轮达到失败上限后跳过剩余副作用，但仍补齐结果以保持历史合法。"""
+        fake = FakeProvider([ModelReply(
+            tool_calls=[
+                ToolCall(id=f"group-failed-{index}", name="missing_tool", arguments={})
+                for index in range(1, 4)
+            ] + [
+                ToolCall(
+                    id="group-skipped-4",
+                    name="calculator",
+                    arguments={"expression": "100+1"},
+                )
+            ],
+            finish_reason="tool_calls",
+        )])
+
+        with self.assertRaises(AgentLoopConsecutiveFailuresError):
+            _run(self._application(fake).chat(
+                {"session_id": "group-failure", "message": "一轮调用多个工具"},
+                request_id="run-group-failure",
+            ))
+
+        history = _run(self.sessions.complete_history("group-failure"))
+        self.assertEqual(
+            [record.message.role for record in history],
+            ["user", "assistant", "tool", "tool", "tool", "tool"],
+        )
+        self.assertEqual(history[-1].message.tool_call_id, "group-skipped-4")
+        self.assertTrue(history[-1].message.is_error)
+        self.assertIn("未执行", history[-1].message.content)
+
+    def test_total_timeout_cancels_slow_model_with_stable_error(self) -> None:
+        """模型长时间不返回时由 Agent Loop 总预算取消，并转换为稳定超时错误。"""
+
+        class SlowProvider:
+            """模拟超过循环总预算才返回的模型 Provider。"""
+
+            async def complete(self, _messages, *, tools=()):
+                """等待足够长时间，使测试中的循环总超时先触发。"""
+                del tools
+                await asyncio.sleep(0.2)
+                return ModelReply(content="不应返回")
+
+        with self.assertRaises(AgentLoopTimeoutError):
+            _run(self._run_direct_loop(
+                SlowProvider(),
+                total_timeout_seconds=0.01,
+            ))
+
+    def test_total_timeout_closes_current_multi_tool_group_without_more_side_effects(self) -> None:
+        """工具阶段耗尽总预算时补齐整组结果，并阻止后续工具产生副作用。"""
+
+        async def scenario() -> None:
+            later_executed = False
+
+            async def slow_handler(_arguments):
+                """模拟运行时间超过 Agent 总剩余预算的第一个工具。"""
+                await asyncio.sleep(1)
+                return "慢工具不应完成"
+
+            async def later_handler(_arguments):
+                """记录熔断后本不应该执行的同轮后续工具。"""
+                nonlocal later_executed
+                later_executed = True
+                return "不应执行"
+
+            tools = ToolManager(timeout_seconds=1)
+            for name, handler in (("slow_tool", slow_handler), ("later_tool", later_handler)):
+                tools.register(ToolDefinition(
+                    name=name,
+                    description=f"测试 {name}。",
+                    parameters={"type": "object", "properties": {}, "required": []},
+                    handler=handler,
+                    requires_confirmation=False,
+                ))
+            fake = FakeProvider([ModelReply(
+                tool_calls=[
+                    ToolCall(id="timeout-1", name="slow_tool", arguments={}),
+                    ToolCall(id="timeout-2", name="later_tool", arguments={}),
+                ],
+                finish_reason="tool_calls",
+            )])
+            await self.sessions.create("timeout-tools")
+            await self.sessions.append("timeout-tools", [Message("user", "测试总超时")])
+            loop = AgentLoop(
+                model=fake,
+                tools=tools,
+                sessions=self.sessions,
+                total_timeout_seconds=0.05,
+            )
+            with self.assertRaises(AgentLoopTimeoutError):
+                await loop.run(
+                    messages=[Message("user", "测试总超时")],
+                    tool_schemas=tools.schemas(),
+                    session_id="timeout-tools",
+                    request_id="run-timeout-tools",
+                    permission_mode="allow",
+                    permission_context=ToolPermissionContext(
+                        allowed_scopes=frozenset({"session"}),
+                        run_id="run-timeout-tools",
+                        user_id="local",
+                        agent_id="default",
+                        session_id="timeout-tools",
+                    ),
+                )
+            self.assertFalse(later_executed)
+            history = await self.sessions.complete_history("timeout-tools")
+            self.assertEqual(
+                [record.message.role for record in history],
+                ["user", "assistant", "tool", "tool"],
+            )
+            self.assertEqual(
+                [record.message.tool_call_id for record in history[-2:]],
+                ["timeout-1", "timeout-2"],
+            )
+            self.assertTrue(all(record.message.is_error for record in history[-2:]))
+
+        _run(scenario())
+
+    def test_single_tool_timeout_counts_as_failure_and_cancels_handler(self) -> None:
+        """单工具超时仍由 ToolManager 取消 handler，并纳入连续失败熔断。"""
+
+        async def scenario() -> None:
+            cancelled = asyncio.Event()
+
+            async def slow_handler(_arguments):
+                """模拟可响应取消的慢工具处理函数。"""
+                try:
+                    await asyncio.sleep(1)
+                finally:
+                    cancelled.set()
+
+            tools = ToolManager(timeout_seconds=0.01)
+            tools.register(ToolDefinition(
+                name="slow_tool",
+                description="测试单工具超时。",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=slow_handler,
+                requires_confirmation=False,
+            ))
+            fake = FakeProvider([_tool_reply("slow-1", "slow_tool", {})])
+            with self.assertRaises(AgentLoopConsecutiveFailuresError):
+                await self._run_direct_loop(
+                    fake,
+                    tools=tools,
+                    max_consecutive_tool_failures=1,
+                )
+            self.assertTrue(cancelled.is_set())
+
+        _run(scenario())
+
+    def test_empty_model_reply_fails_once_instead_of_completing_empty_run(self) -> None:
+        """空文本且无工具调用不能冒充最终答案，Run 进入稳定失败终态。"""
+        fake = FakeProvider([ModelReply(content="   ", finish_reason="stop")])
+
+        with self.assertRaises(EmptyModelResponseError):
+            _run(self._application(fake).chat(
+                {"session_id": "empty", "message": "不要返回空消息"},
+                request_id="run-empty",
+            ))
+
+        history = _run(self.sessions.complete_history("empty"))
+        self.assertEqual([record.message.role for record in history], ["user"])
+        run = _run(self.runs.get("run-empty", "empty"))
+        self.assertEqual(run.status, "failed")
+        self.assertEqual(run.error_code, "empty_model_response")
 
     def test_model_failure_after_tool_keeps_complete_pair_and_failed_run(self) -> None:
         """第二轮模型失败时保留完整 A/T 工具轮次，不伪造最终 Assistant。"""
