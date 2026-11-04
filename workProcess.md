@@ -1699,3 +1699,74 @@ Electron/React chatStore
 - P04-05 再完成桌面工具卡片、历史还原和持久化联调；P05-03 接入确认 UI，当前 `ask` 且无确认界面仍默认拒绝。
 - 在 P04 阶段验收前补一次真实 DeepSeek 工具闭环人工验证；真实模型是否在同一响应返回多个工具具有不确定性，不能用单次结果替代 Fake Provider 的确定性测试。
 
+## 2026-11-04：P04-04 流式循环
+
+### 需求与完成范围
+
+按照 `docs/DEVELOPMENT_REQUIREMENTS.md` 和最新 `AGENTS.md` 完成 P04-04：流式聊天接入模型增量、完整 ToolCall、本地工具执行、工具开始/结束事件和多轮累计 Usage；工具参数只有在 Provider 完整解析后才允许执行。流式与非流式必须复用 P04-03 的消息配对、同轮顺序、最大轮数、总超时、单工具超时和连续失败限制。本次不提前勾选 P04-05 桌面工具卡片/历史还原，也不实现 P05 确认 UI、Bridge 排队或崩溃恢复。
+
+### 实际开发内容
+
+- 将 `AgentLoop` 从“仅由 `complete()` 驱动的非流式循环”抽成统一模型工具循环。默认 `model_turn` 仍调用 `ModelProvider.complete()`，所以普通聊天保持原行为；流式 Runtime 注入消费 `ModelProvider.stream()` 的轮次函数，不复制第二套工具调度和限制逻辑。
+- 为统一循环加入工具开始与结束观察器。Assistant ToolCall 通过对话校验并落库后才触发开始观察器；Tool Result 落库并加入下一轮模型上下文后才触发结束观察器。观察器只负责事件投影，不改变工具执行结果。
+- `AgentRuntime._run_stream()` 现在可以执行多轮流式工具闭环。每轮 `text_delta` 立即转成桌面 `delta`；`tool_call_delta` 只等待 Provider 拼接；唯一 `completed` 产生完整 `ModelReply` 后才交给 AgentLoop。
+- 新增 `message_end / tool_start / tool_end` 后端事件。含工具调用的模型轮次先用 `message_end` 分隔文本与工具阶段；`tool_start` 携带完整参数对象，`tool_end` 携带成功/失败状态、结果和执行耗时。普通无工具回答继续保持原有 `delta → done`，避免破坏既有 HTTP/桌面契约。
+- 最终 `done` 携带最终答案、结束原因、累计 Usage、总模型轮数、用户消息序号和最终 Assistant 序号。累计值来自统一 AgentLoop，不再只返回最后一轮用量。
+- 流式 Runtime 不再调用旧的 `finish_chat()` 保存最终回答，因为统一 AgentLoop 已负责保存中间 Assistant/Tool 和最终 Assistant；这样避免最终消息重复落库。
+- 将工具权限上下文构造收口到 `YanAgentApplication.tool_permission_context()`，普通与流式路径使用相同可信用户、Agent、Session 和 Run 身份，不各自复制权限参数。
+- 工具参数未完成便结束的流不会执行 handler、不会发送 `tool_start`，而是以既有 `empty_model_response` 结束。未知工具则发送失败 `tool_end`，把相同调用 ID 的错误 Tool Result 回写模型，允许下一轮解释失败并正常收尾。
+- 新增 `docs/P04_04_STREAMING_LOOP.md`，同步 README、开发需求、路线图、P02～P04 历史说明和岗位映射；下一项更新为 P04-05。
+
+### 修改文件
+
+- 统一循环与流式 Runtime：`yanagent/runtime/agent_loop.py`、`yanagent/runtime/streaming.py`
+- 事件与权限上下文：`yanagent/events.py`、`yanagent/chat.py`
+- 自动化测试：`tests/test_streaming_runtime.py`
+- 文档：`docs/P04_04_STREAMING_LOOP.md`、`README.md`、`docs/DEVELOPMENT_REQUIREMENTS.md`、`docs/IMPLEMENTATION_ROADMAP.md`、`docs/TARGET_ROLES.md`、P02/P03/P04 历史状态文档、`workProcess.md`
+
+### 验证证据
+
+- `tests/test_streaming_runtime.py` 从 5 项扩展到 8 项。核心用例用 Fake Provider 连续两轮返回计算器调用、第三轮返回最终文本，断言 SSE 顺序为 `message_end → tool_start → tool_end → message_end → tool_start → tool_end → delta → delta → done`。
+- 同一用例验证两次 `tool_start.arguments` 分别为完整的 `1+2` 和 `3*4`，两个 `tool_end` 结果为 `3` 和 `12`；第三次模型输入包含前两轮 Assistant ToolCall 与对应 Tool Result。
+- SQLite 历史断言为 `User → Assistant → Tool → Assistant → Tool → Assistant`，没有重复最终 Assistant；Run 进入一次 completed，累计 `total_tokens` 为三轮预设的 73。
+- 不完整参数用例只提供 `tool_call_delta` 而不提供 `completed`，断言流只产生 error，既没有 `tool_start` 也没有工具执行机会。
+- 未知工具用例断言 `tool_end.status=error`，失败 Tool Result 带原调用 ID 进入第二轮模型输入，随后仍产生 done 最终答案。
+- 流式、HTTP、历史和 AgentLoop 组合回归 40 项通过；最终 `python -X utf8 -m unittest discover -s tests -v` 共 **209 项通过**，耗时 16.671 秒。该时间只记录本机单次执行，不作为性能提升结论。
+- `python -X utf8 -m compileall -q yanagent tests` 和 `git diff --check` 通过。Windows 受限沙箱无法创建 asyncio 内部 socketpair，异步测试按批准在沙箱外运行；全部新增测试使用 Fake Provider 与本地安全工具，没有网络请求或真实 API Key。
+- 本次没有修改桌面业务代码，也没有覆盖用户当前保留的 `desktop/src/main/python-manager.ts`、`desktop/src/renderer/src/store/chatStore.ts` 和 `yanagent/config/settings.py` 调试改动；未重复执行桌面生产构建。
+
+### 难度评分
+
+整体难度：**8.5/10**。核心难点是流式响应不是“一次返回一个 ToolCall”，而是先收到若干不完整 JSON 片段；同时已有 P04-03 已经定义了严格的多工具顺序、限制和持久化规则。如果在 Runtime 重新写一套循环，最容易出现流式与非流式限制不一致、参数未完成就执行、工具卡片永远 running、最终消息重复保存或 Usage 只统计最后一轮。
+
+| 难点 | 难度 | 容易出现的问题 | 实现方式与证据 |
+|---|---:|---|---|
+| 增量参数与副作用边界 | 9/10 | 收到半段 JSON 就执行；参数解析失败后留下 running 工具卡片 | `tool_call_delta` 只观察，Provider 生成完整 `completed/ToolCall` 后才交给 AgentLoop；不完整流测试断言无 `tool_start` |
+| 两种调用方式复用一个循环 | 9/10 | 流式路径复制 `while True`，以后最大轮数、超时和失败规则发生漂移 | AgentLoop 注入 `model_turn`，默认 complete、流式注入 stream 消费器；40 项组合回归同时覆盖两条路径 |
+| 事件与落库时序 | 9/10 | UI 先显示工具但 Assistant 未保存；tool_end 先于结果回写；断线后历史无法解释 | Tool start/end 观察器分别位于 Assistant 保存后和 Tool Result 保存后；SQLite 顺序与 SSE 顺序同时断言 |
+| 最终答案和累计 Usage | 8/10 | done 只带最后一轮 Usage；Runtime 再保存一次最终 Assistant | done 直接使用 `AgentLoopResult` 的累计 Usage、turns 和 assistant_sequence；历史断言只有一个最终 Assistant |
+| 兼容既有纯文本流 | 7/10 | 所有回答都新增 message_end，导致既有 HTTP 合约失败 | 回归首先发现差异，随后把 message_end 收紧为仅工具轮次发送；原 HTTP SSE 用例与全量 209 项重新通过 |
+
+### 岗位要求关联与实践证据
+
+- **XM 职责1/3/6（Agent 框架、Tooling、稳定性）**：完成模型增量、工具生命周期事件、本地执行和结果回写的流式闭环，并复用统一超时/失败限制；没有实现企业内部 MCP、云端 Runtime、OS Sandbox 或线上监控。
+- **DYQ 职责2～3（多工具调用管控、易扩展易调试框架）**：统一流式/非流式模型轮次接口，事件包含工具名、调用 ID、完整参数、状态和耗时，中文日志能定位文件与函数；没有质量业务工具、线上调度或效果指标。
+- **DYG 职责1/4、要求2～4（Agent 架构、Prompt/上下文、模型 API）**：在 OpenAI-compatible 增量协议上保持多轮上下文和原生 Tool Calling 结构，确保每轮模型输入可回放；本次使用 Fake Provider 自动化验证，未声称真实 DeepSeek 工具可靠性。
+- **TX 职责1～3及要求2（Tool Use、执行引擎、任务编排）**：形成 `模型流 → 完整调用 → 本地工具 → 结果回写 → 下一模型流` 的最小事件化编排，失败工具可作为结构化结果进入下一轮；尚未实现 Planning/Reflection、并行 DAG、长任务恢复或 Benchmark。
+- **Python / TypeScript 工程能力**：本次自主修改 Python 异步 Runtime、统一循环、线程安全 SSE 队列的事件类型及 SQLite 集成测试；桌面 TypeScript 已具备消费这些事件的旧代码，但本次没有把“已有处理分支”冒充 P04-05 桌面联调成果。
+
+### 面试可讲事实与边界
+
+- 可以表述：实现了流式多工具 Agent Loop，模型文本增量实时输出，工具参数片段完整组装后才允许本地执行，工具开始/结束事件和最终累计 Usage 通过同一 SSE Run 交付。
+- 可以表述：流式与非流式复用一个 AgentLoop，通过可注入模型轮次隔离 `complete()` 与 `stream()` 的读取差异，统一沿用轮数、超时、失败熔断和消息配对规则。
+- 可以表述：通过 Fake Provider 构造两轮工具、第三轮答案，验证事件、三次模型输入、SQLite `A/T` 历史和 Run Usage；全量 209 项回归通过。
+- 不可以表述：已完成真实 DeepSeek 工具闭环、桌面工具卡片人工验收、确认 UI、Bridge 并发排队、工具执行中完整取消、崩溃恢复或线上性能优化。
+- 不可以表述：权限上下文等价于 OS Sandbox，或本次测试耗时证明性能提升。
+
+### 尚未完成事项
+
+- 下一项 P04-05：让桌面在真实流式模式展示工具卡片，完成历史过程还原，验证退出/重启及半轮工具记录的可解释行为。
+- P04 阶段最终验收前，使用真实 DeepSeek 人工执行一次“查询当前时间并说明结果”的工具闭环，并如实记录模型、事件和失败情况。
+- P05-03 再接入确认 UI 与工具执行中的完整取消传播；当前需要确认的工具在无确认界面时仍默认拒绝。
+- P05 后续处理同 Session 排队、上下文预算、连接断开、重试副作用和崩溃恢复。
+

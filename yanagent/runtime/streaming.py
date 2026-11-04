@@ -7,16 +7,18 @@ import concurrent.futures
 import logging
 import threading
 import time
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
 from yanagent.chat import PreparedChat, YanAgentApplication
+from yanagent.contracts import Message, ModelReply, ToolCall, ToolResult
 from yanagent.errors import (
     AgentError, EmptyModelResponseError, ModelResponseError, ModelTimeoutError,
-    SessionStorageError, UnexpectedToolCallError,
+    SessionStorageError,
 )
 from yanagent.events import ClientEventType, RunEvent
+from yanagent.runtime.agent_loop import AgentLoop
 from yanagent.sessions.runs import TerminalRunStatus
 
 
@@ -206,10 +208,94 @@ class AgentRuntime:
         }
 
     async def _run_stream(self, record: RunRecord, prepared: PreparedChat) -> None:
-        """消费 Provider 增量，组装桌面事件，并把异常或取消转换为稳定终态。"""
+        """循环消费模型增量、执行完整工具调用，并转换为桌面流事件和稳定终态。"""
         content: list[str] = []
-        completed = False
         run_started = False
+
+        async def stream_model_turn(
+            messages: Sequence[Message],
+            tools: Sequence[dict[str, Any]],
+        ) -> ModelReply:
+            """消费一轮 Provider 流，实时转发文本，并仅返回已完整解析的轮次结果。"""
+            turn_content: list[str] = []
+            completed_reply: ModelReply | None = None
+            LOGGER.info(
+                "[streaming.py][AgentRuntime._run_stream] 开始流式模型轮次，"
+                "request_id=%s，消息数=%d，工具数=%d",
+                record.request_id,
+                len(messages),
+                len(tools),
+            )
+            async for event in prepared.provider.stream(messages, tools=tools):
+                if event.kind == "text_delta":
+                    turn_content.append(event.content)
+                    content.append(event.content)
+                    record.append("delta", {"content": event.content})
+                elif event.kind == "tool_call_delta":
+                    # Provider 在 completed 前负责拼接并校验全部参数；此处绝不提前执行。
+                    LOGGER.debug(
+                        "[streaming.py][AgentRuntime._run_stream] 收到工具调用增量，等待完整参数，"
+                        "request_id=%s，tool_index=%s，参数增量字符数=%d",
+                        record.request_id,
+                        event.tool_index,
+                        len(event.arguments_delta),
+                    )
+                elif event.kind == "completed":
+                    if completed_reply is not None or event.reply is None:
+                        raise ModelResponseError()
+                    completed_reply = event.reply
+            if completed_reply is None:
+                raise EmptyModelResponseError()
+            if completed_reply.content != "".join(turn_content):
+                raise ModelResponseError()
+            if completed_reply.tool_calls:
+                record.append("message_end", {
+                    "has_tool_calls": True,
+                    "finish_reason": completed_reply.finish_reason,
+                    "usage": completed_reply.usage,
+                })
+            LOGGER.info(
+                "[streaming.py][AgentRuntime._run_stream] 流式模型轮次完成，"
+                "request_id=%s，输出字符数=%d，工具调用数=%d，finish_reason=%s",
+                record.request_id,
+                len(completed_reply.content),
+                len(completed_reply.tool_calls),
+                completed_reply.finish_reason,
+            )
+            return completed_reply
+
+        def emit_tool_start(call: ToolCall, turn: int, index: int, total: int) -> None:
+            """在完整 ToolCall 已保存且即将执行时发送桌面工具开始事件。"""
+            record.append("tool_start", {
+                "tool": call.name,
+                "tool_call_id": call.id,
+                "arguments": dict(call.arguments),
+                "status": "running",
+                "model_turn": turn,
+                "tool_call_index": index,
+                "tool_call_total": total,
+            })
+
+        def emit_tool_end(
+            call: ToolCall,
+            result: ToolResult,
+            turn: int,
+            index: int,
+            total: int,
+            execution_time: float,
+        ) -> None:
+            """在 Tool Result 已保存并回写上下文后发送成功或失败的工具结束事件。"""
+            record.append("tool_end", {
+                "tool": call.name,
+                "tool_call_id": call.id,
+                "status": "error" if result.is_error else "success",
+                "result": result.content,
+                "execution_time": execution_time,
+                "model_turn": turn,
+                "tool_call_index": index,
+                "tool_call_total": total,
+            })
+
         try:
             LOGGER.info(
                 "[yanDebug][02-流任务执行][streaming.py][AgentRuntime._run_stream] "
@@ -223,60 +309,48 @@ class AgentRuntime:
             run_started = await self.application.start_run(
                 prepared, request_id=record.request_id,
             )
-            LOGGER.info(
-                "[yanDebug][04-Provider调用][streaming.py][AgentRuntime._run_stream] "
-                "准备调用流式 Provider，request_id=%s，消息数=%d，工具数=%d",
-                record.request_id,
-                len(context.messages),
-                len(context.tools),
+            loop_result = await AgentLoop(
+                model=prepared.provider,
+                tools=self.application.tool_manager,
+                sessions=self.application.session_store,
+                model_turn=stream_model_turn,
+                on_tool_start=emit_tool_start,
+                on_tool_end=emit_tool_end,
+            ).run(
+                messages=context.messages,
+                tool_schemas=context.tools,
+                session_id=prepared.session_id,
+                request_id=record.request_id,
+                permission_mode=prepared.config.permission_mode,
+                permission_context=self.application.tool_permission_context(
+                    prepared,
+                    request_id=record.request_id,
+                ),
             )
-            async for event in prepared.provider.stream(
-                context.messages, tools=context.tools,
-            ):
-                if event.kind == "text_delta":
-                    content.append(event.content)
-                    record.append("delta", {"content": event.content})
-                elif event.kind == "completed":
-                    if completed or event.reply is None:
-                        raise ModelResponseError()
-                    completed = True
-                    LOGGER.info(
-                        "[yanDebug][06-模型完成][streaming.py][AgentRuntime._run_stream] "
-                        "收到 Provider 完整响应，request_id=%s，输出字符数=%d，"
-                        "工具调用数=%d，finish_reason=%s",
-                        record.request_id,
-                        len(event.reply.content),
-                        len(event.reply.tool_calls),
-                        event.reply.finish_reason,
-                    )
-                    if event.reply.tool_calls:
-                        raise UnexpectedToolCallError()
-                    if event.reply.content != "".join(content):
-                        raise ModelResponseError()
-                    assistant_sequence = await self.application.finish_chat(
-                        prepared, event.reply, request_id=record.request_id,
-                    )
-                    if run_started:
-                        await self.application.finish_run(
-                            record.request_id,
-                            prepared.session_id,
-                            status="completed",
-                            finish_reason=event.reply.finish_reason,
-                            usage=event.reply.usage,
-                        )
-                    record.append("done", {
-                        "content": event.reply.content,
-                        "finish_reason": event.reply.finish_reason,
-                        "usage": event.reply.usage,
-                        "user_seq": context.user_sequence,
-                        "bot_seq": assistant_sequence,
-                    })
-            if not completed:
-                raise EmptyModelResponseError()
+            if run_started:
+                await self.application.finish_run(
+                    record.request_id,
+                    prepared.session_id,
+                    status="completed",
+                    finish_reason=loop_result.reply.finish_reason,
+                    usage=loop_result.usage,
+                )
+            record.append("done", {
+                "content": loop_result.reply.content,
+                "finish_reason": loop_result.reply.finish_reason,
+                "usage": loop_result.usage,
+                "turns": loop_result.turns,
+                "user_seq": context.user_sequence,
+                "bot_seq": loop_result.assistant_sequence,
+            })
             LOGGER.info(
                 "[yanDebug][08-SSE交付完成][streaming.py][AgentRuntime._run_stream] "
-                "流任务完成且回答已持久化，request_id=%s，上下文消息数=%d，输出字符数=%d",
-                record.request_id, len(context.messages), len("".join(content)),
+                "流式工具循环完成且回答已持久化，request_id=%s，模型轮数=%d，"
+                "上下文消息数=%d，最终输出字符数=%d",
+                record.request_id,
+                loop_result.turns,
+                len(context.messages),
+                len(loop_result.reply.content),
             )
         except asyncio.CancelledError:
             if run_started:

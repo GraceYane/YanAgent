@@ -12,10 +12,13 @@ from pathlib import Path
 from typing import Any
 
 from yanagent.chat import YanAgentApplication
-from yanagent.config import AppConfig, ConfigStore
-from yanagent.contracts import Message, ModelReply
+from yanagent.config import ConfigStore
+from yanagent.contracts import Message, ModelReply, ToolCall
 from yanagent.events import ModelStreamEvent
+from yanagent.models import FakeProvider
 from yanagent.runtime import AgentRuntime
+from yanagent.sessions import RunStore, SessionStore
+from yanagent.storage import Database
 
 
 class EchoStreamingProvider:
@@ -69,7 +72,7 @@ class StreamingRuntimeTests(unittest.TestCase):
         self.store = ConfigStore(Path(self.temporary.name) / "config.json", environ={})
         self.store.save({
             "api_base": "https://example.invalid/v1", "model": "fake", "api_key": "fake-key",
-            "request_timeout": 2,
+            "request_timeout": 2, "permission_mode": "allow",
         })
         self.runtime: AgentRuntime | None = None
 
@@ -165,6 +168,174 @@ class StreamingRuntimeTests(unittest.TestCase):
         self._collect(runtime, "old")
         time.sleep(0.03)
         self.assertIsNone(runtime.wait_events("old", 0, timeout=0))
+
+    def test_two_streaming_tool_rounds_emit_ordered_events_and_persist_history(self) -> None:
+        """连续两轮流式工具调用后第三轮回答，并保存完整 A/T 配对与累计用量。"""
+        first_reply = ModelReply(
+            tool_calls=[ToolCall(
+                id="stream-call-1",
+                name="calculator",
+                arguments={"expression": "1+2"},
+            )],
+            finish_reason="tool_calls",
+            usage={"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+        )
+        second_reply = ModelReply(
+            tool_calls=[ToolCall(
+                id="stream-call-2",
+                name="calculator",
+                arguments={"expression": "3*4"},
+            )],
+            finish_reason="tool_calls",
+            usage={"input_tokens": 20, "output_tokens": 3, "total_tokens": 23},
+        )
+        final_reply = ModelReply(
+            content="两个结果分别是 3 和 12。",
+            finish_reason="stop",
+            usage={"input_tokens": 30, "output_tokens": 8, "total_tokens": 38},
+        )
+        provider = FakeProvider([], stream_outcomes=[
+            [
+                ModelStreamEvent(
+                    kind="tool_call_delta",
+                    tool_index=0,
+                    tool_call_id="stream-call-1",
+                    tool_name="calculator",
+                    arguments_delta='{"expression":"1',
+                ),
+                ModelStreamEvent(
+                    kind="tool_call_delta",
+                    tool_index=0,
+                    arguments_delta='+2"}',
+                ),
+                ModelStreamEvent(kind="completed", reply=first_reply),
+            ],
+            [
+                ModelStreamEvent(
+                    kind="tool_call_delta",
+                    tool_index=0,
+                    tool_call_id="stream-call-2",
+                    tool_name="calculator",
+                    arguments_delta='{"expression":"3*4"}',
+                ),
+                ModelStreamEvent(kind="completed", reply=second_reply),
+            ],
+            [
+                ModelStreamEvent(kind="text_delta", content="两个结果分别是 "),
+                ModelStreamEvent(kind="text_delta", content="3 和 12。"),
+                ModelStreamEvent(kind="completed", reply=final_reply),
+            ],
+        ])
+        root = Path(self.temporary.name)
+        database = Database(data_dir=root / "data", environ={})
+        sessions = SessionStore(database, user_id="local", agent_id="default")
+        runs = RunStore(database, user_id="local", agent_id="default")
+        application = YanAgentApplication(
+            self.store,
+            provider_factory=lambda _config: provider,
+            session_store=sessions,
+            run_store=runs,
+        )
+        self.runtime = AgentRuntime(application)
+
+        self.runtime.start_stream(
+            {"session_id": "stream-loop", "message": "依次计算", "stream": True},
+            request_id="run-stream-loop",
+        )
+        events = self._collect(self.runtime, "run-stream-loop")
+
+        self.assertEqual(
+            [event["type"] for event in events],
+            [
+                "message_end", "tool_start", "tool_end",
+                "message_end", "tool_start", "tool_end",
+                "delta", "delta", "done",
+            ],
+        )
+        starts = [event for event in events if event["type"] == "tool_start"]
+        ends = [event for event in events if event["type"] == "tool_end"]
+        self.assertEqual(
+            [event["arguments"] for event in starts],
+            [{"expression": "1+2"}, {"expression": "3*4"}],
+        )
+        self.assertEqual([event["result"] for event in ends], ["3", "12"])
+        self.assertEqual([event["status"] for event in ends], ["success", "success"])
+        self.assertEqual(events[-1]["content"], final_reply.content)
+        self.assertEqual(events[-1]["turns"], 3)
+        self.assertEqual(
+            events[-1]["usage"],
+            {"input_tokens": 60, "output_tokens": 13, "total_tokens": 73},
+        )
+
+        calls = provider.calls
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[1].messages[-2].tool_calls[0].id, "stream-call-1")
+        self.assertEqual(calls[1].messages[-1].tool_call_id, "stream-call-1")
+        self.assertEqual(calls[1].messages[-1].content, "3")
+        self.assertEqual(calls[2].messages[-2].tool_calls[0].id, "stream-call-2")
+        self.assertEqual(calls[2].messages[-1].tool_call_id, "stream-call-2")
+        self.assertEqual(calls[2].messages[-1].content, "12")
+
+        history = self.runtime.execute(sessions.complete_history("stream-loop"))
+        self.assertEqual(
+            [record.message.role for record in history],
+            ["user", "assistant", "tool", "assistant", "tool", "assistant"],
+        )
+        stored_run = self.runtime.execute(runs.get("run-stream-loop", "stream-loop"))
+        self.assertEqual(stored_run.status, "completed")
+        self.assertEqual(stored_run.usage["total_tokens"], 73)
+
+    def test_incomplete_tool_delta_never_executes_or_emits_tool_card(self) -> None:
+        """只有参数增量而没有 completed 完整 ToolCall 时，拒绝执行并以流错误结束。"""
+        provider = FakeProvider([], stream_outcomes=[[
+            ModelStreamEvent(
+                kind="tool_call_delta",
+                tool_index=0,
+                tool_call_id="partial-call",
+                tool_name="calculator",
+                arguments_delta='{"expression":"1+',
+            ),
+        ]])
+        runtime = self._runtime(provider)
+        runtime.start_stream(
+            {"session_id": "partial", "message": "计算 1+2", "stream": True},
+            request_id="run-partial",
+        )
+
+        events = self._collect(runtime, "run-partial")
+
+        self.assertEqual([event["type"] for event in events], ["error"])
+        self.assertNotIn("tool_start", [event["type"] for event in events])
+        self.assertEqual(provider.remaining_streams, 0)
+
+    def test_streaming_unknown_tool_emits_failed_result_then_model_can_finish(self) -> None:
+        """未知工具以 tool_end 失败事件和 Tool Result 回写，模型下一轮仍可正常收尾。"""
+        tool_reply = ModelReply(
+            tool_calls=[ToolCall(id="missing-call", name="missing_tool", arguments={})],
+            finish_reason="tool_calls",
+        )
+        final_reply = ModelReply(content="该工具不可用，我已停止调用。", finish_reason="stop")
+        provider = FakeProvider([], stream_outcomes=[
+            [ModelStreamEvent(kind="completed", reply=tool_reply)],
+            [
+                ModelStreamEvent(kind="text_delta", content=final_reply.content),
+                ModelStreamEvent(kind="completed", reply=final_reply),
+            ],
+        ])
+        runtime = self._runtime(provider)
+        runtime.start_stream(
+            {"session_id": "missing", "message": "调用不存在工具", "stream": True},
+            request_id="run-missing",
+        )
+
+        events = self._collect(runtime, "run-missing")
+
+        tool_end = next(event for event in events if event["type"] == "tool_end")
+        self.assertEqual(tool_end["status"], "error")
+        self.assertIn("工具不存在", tool_end["result"])
+        self.assertEqual(events[-1]["type"], "done")
+        self.assertEqual(events[-1]["content"], final_reply.content)
+        self.assertTrue(provider.calls[1].messages[-1].is_error)
 
 
 if __name__ == "__main__":

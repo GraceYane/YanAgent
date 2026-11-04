@@ -1,11 +1,11 @@
-"""非流式 Agent Loop：模型请求工具、执行并回写结果后继续调用模型。"""
+"""统一 Agent Loop：模型请求工具、执行并回写结果后继续调用模型。"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
@@ -14,6 +14,7 @@ from yanagent.contracts import (
     ContractValidationError,
     Message,
     ModelReply,
+    ToolCall,
     ToolResult,
     Usage,
     validate_conversation,
@@ -39,11 +40,14 @@ DEFAULT_MAX_CONSECUTIVE_TOOL_FAILURES = 3
 MAX_CONFIGURED_MODEL_TURNS = 1_000
 MAX_CONFIGURED_TIMEOUT_SECONDS = 86_400.0
 MAX_CONFIGURED_CONSECUTIVE_FAILURES = 1_000
+ModelTurn = Callable[[Sequence[Message], Sequence[dict[str, Any]]], Awaitable[ModelReply]]
+ToolStartObserver = Callable[[ToolCall, int, int, int], None]
+ToolEndObserver = Callable[[ToolCall, ToolResult, int, int, int, float], None]
 
 
 @dataclass(frozen=True, slots=True)
 class AgentLoopResult:
-    """保存一次非流式循环的最终模型回答、轮数、累计用量和消息序号。"""
+    """保存一次循环的最终模型回答、轮数、累计用量和消息序号。"""
 
     reply: ModelReply
     turns: int
@@ -79,7 +83,7 @@ def _merge_usage(total: Usage, current: Usage) -> Usage:
 
 
 class AgentLoop:
-    """执行供应商无关的非流式模型与多工具循环，并统一限制运行边界。"""
+    """执行供应商无关的模型与多工具循环，并统一限制运行边界。"""
 
     def __init__(
         self,
@@ -90,14 +94,23 @@ class AgentLoop:
         max_model_turns: int = DEFAULT_MAX_MODEL_TURNS,
         total_timeout_seconds: float = DEFAULT_TOTAL_TIMEOUT_SECONDS,
         max_consecutive_tool_failures: int = DEFAULT_MAX_CONSECUTIVE_TOOL_FAILURES,
+        model_turn: ModelTurn | None = None,
+        on_tool_start: ToolStartObserver | None = None,
+        on_tool_end: ToolEndObserver | None = None,
     ) -> None:
-        """注入循环依赖，并校验轮数、总超时和连续工具失败三类限制。"""
+        """注入循环依赖、可选流式轮次及观察器，并校验所有运行限制。"""
         if not callable(getattr(model, "complete", None)):
             raise TypeError("model 必须实现 complete")
         if not isinstance(tools, ToolManager):
             raise TypeError("tools 必须是 ToolManager")
         if sessions is not None and not isinstance(sessions, SessionStore):
             raise TypeError("sessions 必须是 SessionStore 或 None")
+        if model_turn is not None and not callable(model_turn):
+            raise TypeError("model_turn 必须是可调用对象或 None")
+        if on_tool_start is not None and not callable(on_tool_start):
+            raise TypeError("on_tool_start 必须是可调用对象或 None")
+        if on_tool_end is not None and not callable(on_tool_end):
+            raise TypeError("on_tool_end 必须是可调用对象或 None")
         if (
             type(max_model_turns) is not int
             or not 1 <= max_model_turns <= MAX_CONFIGURED_MODEL_TURNS
@@ -122,6 +135,17 @@ class AgentLoop:
         self.max_model_turns = max_model_turns
         self.total_timeout_seconds = float(total_timeout_seconds)
         self.max_consecutive_tool_failures = max_consecutive_tool_failures
+        self.model_turn = model_turn or self._complete_model_turn
+        self.on_tool_start = on_tool_start
+        self.on_tool_end = on_tool_end
+
+    async def _complete_model_turn(
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[dict[str, Any]],
+    ) -> ModelReply:
+        """执行默认非流式模型轮次；流式运行时可注入等价的完整轮次实现。"""
+        return await self.model.complete(messages, tools=tools)
 
     async def run(
         self,
@@ -150,7 +174,7 @@ class AgentLoop:
         schemas = deepcopy(list(tool_schemas))
 
         LOGGER.info(
-            "[agent_loop.py][AgentLoop.run] 非流式循环开始，"
+            "[agent_loop.py][AgentLoop.run] 模型工具循环开始，"
             "request_id=%s，session_id=%s，初始消息数=%d，工具数=%d，权限模式=%s，"
             "最大模型轮数=%d，总超时=%.3f，连续失败上限=%d，单工具超时=%.3f",
             selected_request,
@@ -197,13 +221,13 @@ class AgentLoop:
             yan_debug(
                 "agent_loop.py",
                 "AgentLoop.run",
-                "准备发送非流式模型轮次",
+                "准备发送模型轮次",
                 messages=working,
                 tools=schemas,
             )
             try:
                 reply = await asyncio.wait_for(
-                    self.model.complete(working, tools=schemas),
+                    self.model_turn(working, schemas),
                     timeout=remaining,
                 )
             except (TimeoutError, asyncio.TimeoutError):
@@ -211,7 +235,7 @@ class AgentLoop:
             yan_debug(
                 "agent_loop.py",
                 "AgentLoop.run",
-                "收到非流式模型轮次回复",
+                "收到模型轮次回复",
                 reply=reply,
             )
             turns += 1
@@ -266,7 +290,7 @@ class AgentLoop:
                     stage="final_assistant",
                 )
                 LOGGER.info(
-                    "[agent_loop.py][AgentLoop.run] 非流式循环完成，"
+                    "[agent_loop.py][AgentLoop.run] 模型工具循环完成，"
                     "request_id=%s，turns=%d，累计用量字段=%s，assistant_sequence=%s",
                     request_id,
                     turns,
@@ -298,6 +322,14 @@ class AgentLoop:
             failure_limit_reached = False
             total_limit_reached = False
             for index, call in enumerate(reply.tool_calls):
+                tool_started_at = asyncio.get_running_loop().time()
+                if self.on_tool_start is not None:
+                    self.on_tool_start(
+                        call,
+                        turns,
+                        index,
+                        len(reply.tool_calls),
+                    )
                 remaining = deadline - asyncio.get_running_loop().time()
                 if total_limit_reached or remaining <= 0:
                     total_limit_reached = True
@@ -388,6 +420,19 @@ class AgentLoop:
                     stage="tool_result",
                 )
                 working.append(Message.from_dict(tool_message.to_dict()))
+                execution_time = max(
+                    0.0,
+                    asyncio.get_running_loop().time() - tool_started_at,
+                )
+                if self.on_tool_end is not None:
+                    self.on_tool_end(
+                        call,
+                        result,
+                        turns,
+                        index,
+                        len(reply.tool_calls),
+                        execution_time,
+                    )
                 LOGGER.info(
                     "[agent_loop.py][AgentLoop._run_loop] Tool Result 已保存并回写模型上下文，"
                     "request_id=%s，turn=%d，call_index=%d/%d，call_id=%s，tool=%s，"
@@ -419,7 +464,7 @@ class AgentLoop:
     def _raise_total_timeout(self, request_id: str) -> None:
         """记录统一总超时日志并抛出稳定错误，不暴露正在处理的消息内容。"""
         LOGGER.warning(
-            "[agent_loop.py][AgentLoop._raise_total_timeout] 非流式循环达到总超时，"
+            "[agent_loop.py][AgentLoop._raise_total_timeout] 模型工具循环达到总超时，"
             "request_id=%s，总超时=%.3f",
             request_id,
             self.total_timeout_seconds,

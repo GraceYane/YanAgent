@@ -314,7 +314,6 @@ class YanAgentApplication:
         context = await self.begin_chat(prepared, request_id=request_id)
         run_started = await self.start_run(prepared, request_id=request_id)
         try:
-            identity = self._runtime_identity(prepared, request_id=request_id)
             loop_result = await AgentLoop(
                 model=prepared.provider,
                 tools=self.tool_manager,
@@ -325,13 +324,9 @@ class YanAgentApplication:
                 session_id=prepared.session_id,
                 request_id=request_id,
                 permission_mode=prepared.config.permission_mode,
-                permission_context=ToolPermissionContext(
-                    allowed_scopes=frozenset({"global", "user", "agent", "session"}),
-                    run_id=request_id,
-                    user_id=identity.user_id,
-                    agent_id=identity.agent_id,
-                    session_id=identity.session_id,
-                    confirmation_ui_available=False,
+                permission_context=self.tool_permission_context(
+                    prepared,
+                    request_id=request_id,
                 ),
             )
             reply = loop_result.reply
@@ -540,6 +535,23 @@ class YanAgentApplication:
             agent_id=agent_id,
             session_id=prepared.session_id,
             request_id=request_id,
+        )
+
+    def tool_permission_context(
+        self,
+        prepared: PreparedChat,
+        *,
+        request_id: str,
+    ) -> ToolPermissionContext:
+        """用可信运行身份构造流式和非流式共用的工具权限上下文。"""
+        identity = self._runtime_identity(prepared, request_id=request_id)
+        return ToolPermissionContext(
+            allowed_scopes=frozenset({"global", "user", "agent", "session"}),
+            run_id=request_id,
+            user_id=identity.user_id,
+            agent_id=identity.agent_id,
+            session_id=identity.session_id,
+            confirmation_ui_available=False,
         )
 
     async def finish_chat(

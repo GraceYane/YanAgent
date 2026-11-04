@@ -9,7 +9,15 @@ from yanagent.contracts import ModelReply
 
 
 ModelStreamKind = Literal["text_delta", "tool_call_delta", "completed"]
-ClientEventType = Literal["delta", "done", "cancelled", "error"]
+ClientEventType = Literal[
+    "delta",
+    "message_end",
+    "tool_start",
+    "tool_end",
+    "done",
+    "cancelled",
+    "error",
+]
 
 
 @dataclass(frozen=True)
@@ -56,7 +64,15 @@ class RunEvent:
             raise ValueError("运行事件序号必须是非负整数")
         if type(self.request_id) is not str or not self.request_id:
             raise ValueError("运行事件必须包含 request_id")
-        if self.type not in {"delta", "done", "cancelled", "error"}:
+        if self.type not in {
+            "delta",
+            "message_end",
+            "tool_start",
+            "tool_end",
+            "done",
+            "cancelled",
+            "error",
+        }:
             raise ValueError("运行事件类型不受支持")
         if type(self.data) is not dict or "type" in self.data:
             raise ValueError("运行事件 data 必须是且只能是附加字段对象")
