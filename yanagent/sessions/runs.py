@@ -162,6 +162,13 @@ class RunStore:
             str(_identifier(session_id)),
         )
 
+    async def list_for_session(self, session_id: str) -> list[StoredRun]:
+        """按创建顺序读取当前作用域会话的全部 Run，供历史过程恢复批量关联。"""
+        return await asyncio.to_thread(
+            self._list_for_session_sync,
+            str(_identifier(session_id)),
+        )
+
     def recover_unfinished_on_startup(self) -> int:
         """启动接流量前把当前作用域遗留的 queued/running Run 标记为 interrupted。"""
         timestamp = self._timestamp()
@@ -290,6 +297,36 @@ class RunStore:
             self._log_storage_error("_get_sync", error)
             raise SessionStorageError() from None
         return None if row is None else self._run_from_row(row)
+
+    def _list_for_session_sync(self, session_id: str) -> list[StoredRun]:
+        """同步批量读取一个会话的 Run，并继续使用完整用户与 Agent 归属过滤。"""
+        try:
+            with self.database.connection() as connection:
+                session = connection.execute(
+                    "SELECT 1 FROM sessions WHERE user_id = ? AND agent_id = ? "
+                    "AND session_id = ?",
+                    (self.user_id, self.agent_id, session_id),
+                ).fetchone()
+                if session is None:
+                    raise SessionNotFoundError()
+                rows = connection.execute(
+                    "SELECT * FROM runs WHERE user_id = ? AND agent_id = ? "
+                    "AND session_id = ? ORDER BY created_at ASC, request_id ASC",
+                    (self.user_id, self.agent_id, session_id),
+                ).fetchall()
+        except AgentError:
+            raise
+        except sqlite3.Error as error:
+            self._log_storage_error("_list_for_session_sync", error)
+            raise SessionStorageError() from None
+        runs = [self._run_from_row(row) for row in rows]
+        LOGGER.info(
+            "[runs.py][RunStore._list_for_session_sync] 会话 Run 批量读取完成，"
+            "session_id=%s，数量=%d",
+            session_id,
+            len(runs),
+        )
+        return runs
 
     def _select_run(
         self,

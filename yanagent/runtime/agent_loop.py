@@ -399,6 +399,10 @@ class AgentLoop:
                     if consecutive_failures >= self.max_consecutive_tool_failures:
                         failure_limit_reached = True
 
+                execution_time = max(
+                    0.0,
+                    asyncio.get_running_loop().time() - tool_started_at,
+                )
                 tool_message = result.to_message()
                 tool_message.name = call.name
                 tool_message.metadata.update({
@@ -406,6 +410,7 @@ class AgentLoop:
                     "model_turn": turns,
                     "tool_name": call.name,
                     "tool_call_index": index,
+                    "execution_time": execution_time,
                 })
                 has_pending_calls = index + 1 < len(reply.tool_calls)
                 self._validate_next(
@@ -420,10 +425,6 @@ class AgentLoop:
                     stage="tool_result",
                 )
                 working.append(Message.from_dict(tool_message.to_dict()))
-                execution_time = max(
-                    0.0,
-                    asyncio.get_running_loop().time() - tool_started_at,
-                )
                 if self.on_tool_end is not None:
                     self.on_tool_end(
                         call,

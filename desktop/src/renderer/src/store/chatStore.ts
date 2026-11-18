@@ -404,6 +404,24 @@ export const useChatStore = create<ChatState>((set, get) => {
       )
     }
 
+    /** 把本轮仍在运行的工具卡统一收口，避免完成、取消或断流后继续显示转圈。 */
+    const closeRunningCards = (result: string) => {
+      patchMessages(sid, (msgs) =>
+        msgs.map((m) =>
+          opened.has(m.id)
+            ? {
+                ...m,
+                steps: (m.steps || []).map((step) =>
+                  step.type === 'tool' && step.status === 'running'
+                    ? { ...step, status: 'error', is_error: true, result: step.result || result }
+                    : step
+                ),
+              }
+            : m
+        )
+      )
+    }
+
     const closeStream = () => {
       if (tailTimer) {
         clearTimeout(tailTimer)
@@ -630,11 +648,13 @@ export const useChatStore = create<ChatState>((set, get) => {
 
         case 'cancelled':
           userCancelled = true
+          closeRunningCards(t('msg_cancelled'))
           updateMsg(sid, main.id, (m) => ({ ...m, isCancelled: true }))
           break
 
         case 'done': {
           ended = true
+          closeRunningCards(t('reply_interrupted'))
           // Stopped, the bubble keeps what was shown by the time stop was
           // pressed; the reply's last text would repeat one of its steps.
           const stopped = detached()
@@ -694,6 +714,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             break
           }
           ended = true
+          closeRunningCards(data.message || t('reply_interrupted'))
           // After a stop the bubble is already marked stopped; don't stack a
           // failure on top.
           if (userCancelled || detached()) {
@@ -711,6 +732,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     // restarted): show what the backend kept of the reply instead of a bubble
     // frozen mid-way, or a step left spinning after a stop.
     const dropStream = () => {
+      closeRunningCards(t('reply_interrupted'))
       finishStream()
       void reloadAfterDrop(sid)
     }

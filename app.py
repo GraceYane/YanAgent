@@ -91,7 +91,10 @@ class YanAgentHTTPServer(ThreadingHTTPServer):
         self.application = application
         self.database = database
         self.session_service = (
-            DesktopSessionService(application.session_store)
+            DesktopSessionService(
+                application.session_store,
+                run_store=application.run_store,
+            )
             if application.session_store is not None
             else None
         )

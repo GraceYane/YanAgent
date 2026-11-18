@@ -23,12 +23,12 @@ YanAgent 是从 CowAgent 的桌面产品外壳中抽出的学习脚手架。项�
 
 | 模块 | 入口 | 当前状态 |
 |---|---|---|
-| Agent 执行循环 | `yanagent/runtime/agent_loop.py` | P04-04 已完成非流式/流式多工具顺序执行、消息配对、累计 Usage、运行限制与 Run 终态；桌面过程联调待 P04-05 |
+| Agent 执行循环 | `yanagent/runtime/agent_loop.py` | P04 已完成非流式/流式多工具顺序执行、消息配对、累计 Usage、运行限制、桌面工具卡片、历史过程还原与真实模型工具闭环 |
 | 运行时调度 Bridge | `yanagent/runtime/bridge.py` | 接口保留，实现为空 |
 | Session 与上下文 | `yanagent/storage/`、`yanagent/sessions/`、`yanagent/chat.py` | P02 已完成聊天落库、重启恢复、完整历史、桌面管理、强归属和 Run 中断恢复 |
 | 模型适配层 | `yanagent/models/openai_compatible.py`、`yanagent/chat.py` | P01-05 已接通普通与流式桌面消息、增量组装和安全错误 |
 | 最小流式 Runtime | `yanagent/runtime/streaming.py`、`yanagent/events.py`、`app.py` | 常驻事件循环、Run 隔离、SSE 回放、基本取消、流式工具轮次与终态清理已完成 |
-| 工具系统 | `yanagent/tools/manager.py`、`validation.py`、`permissions.py`、`examples.py` | P03 已完成注册、安全示例、统一执行、权限和桌面工具列表；P04-04 已接入普通与流式多工具循环，确认 UI 待 P05-03 |
+| 工具系统 | `yanagent/tools/manager.py`、`validation.py`、`permissions.py`、`examples.py` | P03 已完成注册、安全示例、统一执行、权限和桌面工具列表；P04 已接入普通/流式多工具循环及桌面卡片，确认 UI 待 P05-03 |
 | Prompt 与上下文 | `yanagent/context.py`、`yanagent/chat.py` | P04-01 已统一身份、系统规则、工具说明、完整历史、当前输入和普通/流式 Provider 参数 |
 | 长期记忆 | `yanagent/memory/service.py` | 接口保留，实现为空 |
 | MCP Client | `yanagent/mcp/client.py` | 接口保留，实现为空 |
@@ -94,7 +94,7 @@ npm run dev
 6. P06～P10：多模型、完整工具、Skills、MCP、记忆知识库和 Multi-Agent。
 7. P11～P12：Web、多渠道、定时、桌面交付与功能对照验收。
 
-P01、P02 和 P03 均已完成。P01 阶段验收见 [P01 验证与文档](docs/P01_06_VERIFICATION.md)；P02 实现见 [数据库基础](docs/P02_01_DATABASE.md)、[会话与消息存储](docs/P02_02_SESSION_STORE.md)、[历史与上下文接通](docs/P02_03_HISTORY_CONTEXT.md)、[桌面会话联调](docs/P02_04_DESKTOP_SESSIONS.md)和[隔离与恢复](docs/P02_05_ISOLATION_RECOVERY.md)；P03 实现见 [工具注册与统一 Schema](docs/P03_01_TOOL_REGISTRY.md)、[安全示例工具](docs/P03_02_SAFE_TOOLS.md)、[统一工具执行](docs/P03_03_TOOL_EXECUTION.md)、[工具权限基础](docs/P03_04_PERMISSION_FOUNDATION.md)和[工具列表与阶段验收](docs/P03_05_TOOL_INTERFACE.md)；P04-01 实现见 [Prompt 与上下文组装](docs/P04_01_PROMPT_CONTEXT.md)，P04-02 实现见 [非流式 Agent Loop](docs/P04_02_NON_STREAMING_LOOP.md)，P04-03 实现见 [多调用与限制](docs/P04_03_MULTI_CALL_LIMITS.md)，P04-04 实现见 [流式循环](docs/P04_04_STREAMING_LOOP.md)。当前共 209 项测试通过，下一项任务是 **P04-05：桌面与持久化联调**；确认 UI 和桌面工具过程还原尚未完成。
+P01～P04 均已完成。P01 阶段验收见 [P01 验证与文档](docs/P01_06_VERIFICATION.md)；P02 实现见 [数据库基础](docs/P02_01_DATABASE.md)、[会话与消息存储](docs/P02_02_SESSION_STORE.md)、[历史与上下文接通](docs/P02_03_HISTORY_CONTEXT.md)、[桌面会话联调](docs/P02_04_DESKTOP_SESSIONS.md)和[隔离与恢复](docs/P02_05_ISOLATION_RECOVERY.md)；P03 实现见 [工具注册与统一 Schema](docs/P03_01_TOOL_REGISTRY.md)、[安全示例工具](docs/P03_02_SAFE_TOOLS.md)、[统一工具执行](docs/P03_03_TOOL_EXECUTION.md)、[工具权限基础](docs/P03_04_PERMISSION_FOUNDATION.md)和[工具列表与阶段验收](docs/P03_05_TOOL_INTERFACE.md)；P04 实现见 [Prompt 与上下文组装](docs/P04_01_PROMPT_CONTEXT.md)、[非流式 Agent Loop](docs/P04_02_NON_STREAMING_LOOP.md)、[多调用与限制](docs/P04_03_MULTI_CALL_LIMITS.md)、[流式循环](docs/P04_04_STREAMING_LOOP.md)和[桌面与持久化联调](docs/P04_05_DESKTOP_PERSISTENCE.md)。当前共 211 项测试通过，真实 DeepSeek 时间工具闭环与桌面生产构建通过；下一项任务是 **P05-01：Bridge 收口**，确认 UI 仍待 P05-03。
 
 可在项目根目录运行本次配置演示（使用无效测试密钥，不请求网络）：
 
@@ -102,6 +102,7 @@ P01、P02 和 P03 均已完成。P01 阶段验收见 [P01 验证与文档](docs/
 .\.venv\Scripts\python.exe -X utf8 -m examples.config_demo
 .\.venv\Scripts\python.exe -X utf8 -m examples.provider_demo
 .\.venv\Scripts\python.exe -X utf8 -W error -m scripts.verify_p01_real_api
+.\.venv\Scripts\python.exe -X utf8 -m scripts.verify_p04_real_tool
 ```
 
 阶段导航见 [实施路线摘要](docs/IMPLEMENTATION_ROADMAP.md)，每次需求的实际开发记录追加到 [workProcess.md](workProcess.md)。

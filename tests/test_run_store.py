@@ -100,6 +100,12 @@ class RunStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.runs.get("owned-run", "wrong-session"))
         self.assertFalse(await other_user.finish("owned-run", "shared", status="failed"))
         self.assertFalse(await self.runs.finish("owned-run", "wrong-session", status="failed"))
+        self.assertEqual(
+            [run.request_id for run in await self.runs.list_for_session("shared")],
+            ["owned-run"],
+        )
+        with self.assertRaises(SessionNotFoundError):
+            await other_user.list_for_session("shared")
         with self.assertRaises(SessionNotFoundError):
             await other_user.create("foreign-run", "shared")
         self.assertEqual((await self.runs.get("owned-run", "shared")).status, "running")

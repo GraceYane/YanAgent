@@ -281,6 +281,14 @@ class StreamingRuntimeTests(unittest.TestCase):
             [record.message.role for record in history],
             ["user", "assistant", "tool", "assistant", "tool", "assistant"],
         )
+        tool_messages = [
+            record.message for record in history if record.message.role == "tool"
+        ]
+        self.assertTrue(all(
+            type(message.metadata.get("execution_time")) is float
+            and message.metadata["execution_time"] >= 0
+            for message in tool_messages
+        ))
         stored_run = self.runtime.execute(runs.get("run-stream-loop", "stream-loop"))
         self.assertEqual(stored_run.status, "completed")
         self.assertEqual(stored_run.usage["total_tokens"], 73)

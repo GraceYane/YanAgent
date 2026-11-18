@@ -1770,3 +1770,81 @@ Electron/React chatStore
 - P05-03 再接入确认 UI 与工具执行中的完整取消传播；当前需要确认的工具在无确认界面时仍默认拒绝。
 - P05 后续处理同 Session 排队、上下文预算、连接断开、重试副作用和崩溃恢复。
 
+## 2026-11-04：P04-05 桌面与持久化联调及 P04 阶段验收
+
+### 需求与完成范围
+
+按照 `docs/DEVELOPMENT_REQUIREMENTS.md` 和最新 `AGENTS.md` 完成 P04-05：桌面在主聊天链路中使用流式请求并消费工具生命周期事件；关闭再打开会话后，可以从 SQLite 原始 `Assistant ToolCall / Tool Result / 最终 Assistant` 还原同一轮的文本和工具卡片；进程退出、取消、报错或断流后，不留下无法解释且永久转圈的半条工具记录。P04 最后同时补真实 DeepSeek `current_time` 工具闭环证据。本次不提前实现 P05 的正式 AgentBridge、同 Session 排队、确认 UI、Token 预算、重试/去重或可继续执行的崩溃恢复。
+
+### 实际开发内容
+
+- 桌面消息发送恢复 `stream: true`，因此 P04-04 的 `message_end / tool_start / tool_progress / tool_end / done` 事件真正进入主聊天界面。`tool_start` 创建 running 卡片，`tool_end` 写入成功/失败、结果与耗时，最终回答仍显示在同一 Assistant 轮次。
+- 在桌面 `attachStream()` 中增加统一的 running 卡片收口函数。`cancelled`、`error`、`done` 或未到终态的 SSE 断流发生时，本轮仍 running 的工具会变成带明确原因的 error；断流后继续使用历史重载覆盖临时状态，避免界面永久转圈。
+- `DesktopSessionService` 同时注入同一用户和 Agent 作用域的 `SessionStore` 与 `RunStore`。构造时检查两个仓储的可信归属一致，防止历史聚合时跨用户或跨 Agent 关联 Run。
+- 历史接口先读取完整原始历史，再按 User 切分轮次。包含工具的轮次聚合为一个 Assistant 过程气泡：中间模型文本成为 content step；每个 ToolCall 生成带调用 ID、工具名和参数的 tool step；对应 Tool Message 填入结果、错误状态与耗时；最后 Assistant 同时成为最终正文和末尾 content step。
+- 历史分页改为在聚合后的桌面消息上执行。一个含多个模型轮次和工具结果的用户任务不再被原始消息页边界拆开；普通无工具消息的顺序、`_seq`、最新页方向和 `until_seq` 用户消息定位保持兼容。
+- `RunStore` 增加按 Session 批量读取 Run 的归属查询，避免历史适配层为每个轮次执行一次查询。目标 Session 不属于当前作用域时继续返回 `session_not_found`，不会泄露其他用户是否存在相同会话标识。
+- 历史适配层结合 Run 状态解释未完成过程：活动 Run 仍显示 running；failed/interrupted Run 把没有结果的工具卡收口为 error，并说明没有留下可验证完成结果；cancelled Run 使用既有取消标记并说明取消；已有最终 Assistant 时保留有效最终文本。
+- AgentLoop 在 Tool Result 落库前计算执行耗时，并写入 Tool Message 元数据。实时 `tool_end` 和重启后的历史卡片因此使用同一个持久化耗时来源，不再只有当次 SSE 能看到耗时。
+- 新增 `scripts.verify_p04_real_tool.py`。脚本加载本机忽略配置但不打印 API Key，使用统一 PromptContextBuilder、真实 OpenAI-compatible Provider、AgentLoop 和本地 ToolManager；为低风险验收显式使用 `allow`，不修改用户保存的 `ask` 设置。
+- 新增 `docs/P04_05_DESKTOP_PERSISTENCE.md`，同步 README、开发需求 v1.17、实施路线、P02～P04 历史状态和岗位映射；P04 标记已完成，下一项更新为 P05-01。
+
+### 修改文件
+
+- 桌面实时过程：`desktop/src/renderer/src/store/chatStore.ts`
+- 历史投影与 Run 关联：`yanagent/sessions/desktop.py`、`yanagent/sessions/runs.py`、`app.py`
+- 工具耗时持久化：`yanagent/runtime/agent_loop.py`
+- 自动化测试：`tests/test_desktop_sessions.py`、`tests/test_run_store.py`、`tests/test_streaming_runtime.py`
+- 真实模型验收：`scripts/verify_p04_real_tool.py`
+- 文档：`docs/P04_05_DESKTOP_PERSISTENCE.md`、`README.md`、`docs/DEVELOPMENT_REQUIREMENTS.md`、`docs/IMPLEMENTATION_ROADMAP.md`、`docs/TARGET_ROLES.md`、P02/P03/P04 历史状态文档和本记录
+
+用户此前保留的 `desktop/src/main/python-manager.ts` 外部后端调试模式和 `yanagent/config/settings.py` 600 秒默认请求超时没有被本任务修改或回退。`chatStore.ts` 中临时的 `stream: false` 与 P04-05 目标直接冲突，因此本任务只把该发送开关恢复为仓库基线的 `stream: true`，并在同文件增加工具卡终态收口。
+
+### 验证证据
+
+- `tests/test_desktop_sessions.py` 新增 2 项行为测试。一项保存 `User → A(call1) → T(result1) → A(call2) → T(result2) → A(final)`，HTTP 历史只返回 User 和一个 Assistant 过程气泡，并断言两个调用 ID、参数、结果、success、0.125/0.25 秒耗时、Usage、最终正文和末尾 content step；另一项保存退出恢复后的 Assistant 半条 ToolCall，断言返回 `run_state=interrupted`、tool status=error 且结果包含“中断”。
+- `tests/test_run_store.py` 扩展完整归属测试，断言 `list_for_session()` 只返回当前作用域 Run，其他用户即使猜中 Session ID 也得到 `session_not_found`。
+- `tests/test_streaming_runtime.py` 扩展两轮工具闭环用例，断言实际 AgentLoop 落库的每个 Tool Message 都具有非负浮点 `execution_time`。
+- 桌面历史、RunStore 和流式 Runtime 定向 **19 项测试通过**，耗时 5.143 秒。
+- 全量 `python -u -X utf8 -m unittest discover -s tests -v` 共 **211 项通过**，耗时 20.847 秒。Windows 受限沙箱内线程服务关闭会卡住，因此按批准在沙箱外执行；自动化测试使用回环 HTTP、Fake Provider 与本地安全工具。
+- `desktop/npm run build` 通过：renderer 共转换 2152 个模块，Vite 构建通过，main 进程 TypeScript 编译通过。既有字体运行时解析、Browserslist 数据较旧、主 bundle 体积和动态/静态混合导入警告仍存在，但没有构建错误。
+- `python -X utf8 -m compileall -q app.py yanagent tests scripts` 与 `git diff --check` 通过。
+- 真实模型验收使用本机 OpenAI-compatible `deepseek-flash`：第 1 轮标准返回 `current_time` ToolCall；YanAgent 本地成功执行并产生日期、时间、星期、UTC+08:00；第 2 轮模型读取真实 Tool Result 后生成中文最终回答。共 2 个模型轮次、1 次成功工具调用、1.854 秒、累计 1886 tokens。凭据未进入源码、文档或脚本输出。
+
+### 难度评分
+
+整体难度：**8/10**。核心难点不在画一张工具卡，而在于实时 SSE、内部模型历史和桌面历史是三种不同表示：实时事件可以逐步更新，模型历史必须严格保留 Assistant/Tool 调用配对，桌面历史又需要把多条内部消息合并成用户能理解的一次执行。如果直接改变模型历史格式，会破坏下一轮 Tool Calling；如果前端直接渲染每条内部消息，会出现空 Assistant、孤立 Tool Result 和分页拆轮；如果只处理正常 `tool_end`，崩溃或断流后卡片会永久 running。
+
+| 难点 | 难度 | 容易出现的问题 | 实现方式与证据 |
+|---|---:|---|---|
+| 内部历史与桌面投影分离 | 9/10 | 为了 UI 聚合而改写 SQLite 消息，导致模型下一轮看不到标准 A/T 配对 | 原始 Session 历史不变，只在 DesktopSessionService 投影为 steps；真实 AgentLoop 与历史 HTTP 分别测试 |
+| 工具轮次分页 | 8/10 | 一个多工具 Run 被按原始消息页拆开，前一页只有调用、后一页只有结果 | 先按 User 分轮并聚合，再对桌面消息分页；普通历史与 `until_seq` 回归保持通过 |
+| 中断半记录解释 | 9/10 | 崩溃后未知工具是否完成，UI 永久 running 或错误地显示成功 | 联合 Run 终态与已保存 Tool Result；无结果的中断调用明确 error，不自动重做、不声称完成 |
+| 实时卡片终态竞态 | 8/10 | 取消、error、done 或断流顺序变化留下转圈卡片，或重复覆盖正常 tool_end | 统一只收口仍为 running 的卡片，正常 success/error 不受影响；断流继续历史重载 |
+| 耗时一致性 | 7/10 | SSE 能看到 execution_time，重启历史却丢失 | 在 Tool Message 落库前写元数据，同一值再交给 tool_end 观察器；流式持久化测试断言 |
+| 真实模型阶段验收 | 7/10 | 只证明 Fake Provider，或为了验收改写用户长期权限配置 | 独立脚本显式授权低风险时间工具，配置只读、密钥不输出；真实两轮 Tool Calling 成功 |
+
+### 岗位要求关联与实践证据
+
+- **XM 职责1/3/6～7（Agent 框架、Tooling、稳定性和质量）**：将模型工具循环投影到实时桌面和持久化历史，建立调用 ID、结果、状态、耗时和 Run 终态的可追踪闭环；211 项回归和真实模型脚本是可复现证据。没有企业内部工具平台、线上指标或 OS Sandbox。
+- **DYQ 职责2～3（多工具调用管控、易扩展易调试框架）**：多轮工具历史按顺序还原，异常退出记录具有明确状态，Run 批量查询保留作用域隔离；接口、中文日志和测试能定位从模型调用到 UI 卡片的转换。没有质量业务专用工具、线上自动测试生成或效果看板。
+- **DYG 职责1/4、要求2～4（Agent 架构、多步流程、模型 API 与上下文）**：真实 DeepSeek 使用原生 Tool Calling 选择 `current_time`，本地执行后把 Tool Result 作为第二轮上下文，最终生成事实回答；这证明一次真实闭环，不等于多模型可靠性、SFT/RL 或 Prompt 效果评测。
+- **TX 职责1～3及要求2（Tool Use、执行引擎、任务编排）**：实现 `模型 → 本地工具 → 模型 → 桌面/历史` 的完整单 Agent 轨迹，并对失败、中断和顺序建立确定语义；尚未实现 Planning/Reflection、并行 DAG、长任务恢复或 Benchmark。
+- **Python / TypeScript 工程能力**：同一任务修改 Python 异步 AgentLoop、SQLite 适配与 HTTP 测试，以及 TypeScript/Zustand SSE 状态收口；通过 Python 全量测试和 Electron renderer/main 生产构建验证跨栈契约。
+
+### 面试可讲事实与边界
+
+- 可以表述：实现桌面流式工具卡片及持久化历史投影，将标准 `Assistant ToolCall / Tool Result` 内部轨迹聚合成带参数、结果、状态和耗时的可读步骤，同时保持模型上下文原始结构不变。
+- 可以表述：设计中断半记录语义；重启后结合 Run 终态把没有完成结果的工具请求标为可解释错误，不自动重放可能已有副作用的工具。
+- 可以表述：用真实 DeepSeek 完成 2 轮 `current_time` Tool Calling，并通过 211 项测试和桌面生产构建完成 P04 阶段验收。
+- 不可以表述：已实现确认 UI、同 Session 串行队列、工具执行状态表、崩溃后自动续跑、外部写操作恰好一次、上下文压缩、线上性能优化或完整 Agent Harness；这些属于 P05 及以后。
+- 不可以表述：一次 `deepseek-flash` 时间工具成功代表所有模型、工具或多工具组合都具有同等可靠性；Fake Provider 测试仍是确定性失败矩阵的主要证据。
+- 本次没有启动桌面做截图式视觉验收；证据是前端事件代码、HTTP 历史契约测试和 renderer/main 生产构建。视觉样式仍可由用户在正常桌面运行中复核，但不影响已验证的数据闭环。
+
+### 后续事项
+
+- 下一项严格执行 P05-01：将 P01 临时任务管理收口为正式 AgentBridge，明确任务、配置快照、实例缓存、事件订阅和资源释放边界。
+- P05-02 再处理完整身份路由、同 Session 排队和不同 Session 并发；当前 SQLite 序号唯一不等于业务轮次不会交错。
+- P05-03 接入确认 UI、批准/拒绝回传、运行中追加指令和工具取消传播；当前保存的 `ask` 且无确认界面仍安全拒绝。
+- P05-06 建立工具执行状态持久化、崩溃后已有步骤识别及显式继续/重试入口；P04-05 只保证半记录可解释，不自动恢复副作用。
+

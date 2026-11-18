@@ -14,9 +14,9 @@ from urllib.request import Request, urlopen
 
 from app import create_server
 from yanagent.config import ConfigStore
-from yanagent.contracts import Message
+from yanagent.contracts import Message, ToolCall
 from yanagent.models import FakeProvider
-from yanagent.sessions import SessionStore
+from yanagent.sessions import RunStore, SessionStore
 from yanagent.storage import Database
 
 
@@ -36,6 +36,7 @@ class DesktopSessionHttpTests(unittest.TestCase):
         self.config = ConfigStore(root / "config.json", environ={})
         self.database = Database(data_dir=root / "data", environ={})
         self.store = SessionStore(self.database, user_id="local", agent_id="default")
+        self.runs = RunStore(self.database, user_id="local", agent_id="default")
         _run(self.store.create("desktop", title="旧标题"))
         _run(self.store.append("desktop", [
             Message(role="user", content="第一问"),
@@ -172,6 +173,148 @@ class DesktopSessionHttpTests(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertEqual(result["error"]["code"], "session_not_found")
         self.assertNotIn("不可泄露的内容", json.dumps(result, ensure_ascii=False))
+
+    def test_tool_history_is_restored_as_one_ordered_desktop_process(self) -> None:
+        """多轮工具调用历史聚合为一个过程气泡，并保留参数、结果、耗时和最终答案。"""
+        session_id = "tool-history"
+        request_id = "run-tool-history"
+        _run(self.store.create(session_id))
+        _run(self.runs.create(request_id, session_id))
+        _run(self.store.append(session_id, [
+            Message(
+                role="user",
+                content="先计算，再读取时间",
+                metadata={"request_id": request_id},
+            ),
+            Message(
+                role="assistant",
+                content="我先计算。",
+                metadata={"request_id": request_id, "model_turn": 1},
+                tool_calls=[ToolCall(
+                    id="call-calculator",
+                    name="calculator",
+                    arguments={"expression": "1 + 2"},
+                )],
+            ),
+            Message(
+                role="tool",
+                content="3",
+                name="calculator",
+                tool_call_id="call-calculator",
+                metadata={
+                    "request_id": request_id,
+                    "model_turn": 1,
+                    "execution_time": 0.125,
+                },
+            ),
+            Message(
+                role="assistant",
+                content="",
+                metadata={"request_id": request_id, "model_turn": 2},
+                tool_calls=[ToolCall(
+                    id="call-time",
+                    name="current_time",
+                    arguments={},
+                )],
+            ),
+            Message(
+                role="tool",
+                content="2026-11-04 12:00:00 星期三 UTC+08:00",
+                name="current_time",
+                tool_call_id="call-time",
+                metadata={
+                    "request_id": request_id,
+                    "model_turn": 2,
+                    "execution_time": 0.25,
+                },
+            ),
+            Message(
+                role="assistant",
+                content="计算结果是 3，当前时间为 12:00。",
+                metadata={
+                    "request_id": request_id,
+                    "model_turn": 3,
+                    "usage": {"input_tokens": 30, "output_tokens": 8},
+                },
+            ),
+        ]))
+        _run(self.runs.finish(
+            request_id,
+            session_id,
+            status="completed",
+            finish_reason="stop",
+            usage={"input_tokens": 30, "output_tokens": 8},
+        ))
+
+        query = urlencode({"session_id": session_id, "page": 1, "page_size": 2})
+        status, history = self._request(f"/api/history?{query}")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(history["total"], 2)
+        self.assertEqual([item["role"] for item in history["messages"]], [
+            "user", "assistant",
+        ])
+        assistant = history["messages"][1]
+        self.assertEqual(assistant["content"], "计算结果是 3，当前时间为 12:00。")
+        self.assertEqual(assistant["_seq"], 5)
+        self.assertEqual(assistant["usage"], {"input_tokens": 30, "output_tokens": 8})
+        self.assertEqual(
+            [step["type"] for step in assistant["steps"]],
+            ["content", "tool", "tool", "content"],
+        )
+        tools = [step for step in assistant["steps"] if step["type"] == "tool"]
+        self.assertEqual([step["id"] for step in tools], ["call-calculator", "call-time"])
+        self.assertEqual([step["status"] for step in tools], ["success", "success"])
+        self.assertEqual([step["result"] for step in tools], [
+            "3", "2026-11-04 12:00:00 星期三 UTC+08:00",
+        ])
+        self.assertEqual([step["execution_time"] for step in tools], [0.125, 0.25])
+
+    def test_interrupted_half_tool_history_is_closed_with_an_explanation(self) -> None:
+        """重启恢复后的半条工具请求显示为中断错误，而不是永久 running 或孤立空消息。"""
+        session_id = "interrupted-tool-history"
+        request_id = "run-interrupted-tool-history"
+        _run(self.store.create(session_id))
+        _run(self.runs.create(request_id, session_id))
+        _run(self.store.append(session_id, [
+            Message(
+                role="user",
+                content="执行一个工具",
+                metadata={"request_id": request_id},
+            ),
+            Message(
+                role="assistant",
+                content="",
+                metadata={"request_id": request_id, "model_turn": 1},
+                tool_calls=[ToolCall(
+                    id="call-half",
+                    name="calculator",
+                    arguments={"expression": "40 + 2"},
+                )],
+            ),
+        ]))
+        _run(self.runs.finish(
+            request_id,
+            session_id,
+            status="interrupted",
+            finish_reason="process_restarted",
+            error_code="run_interrupted",
+        ))
+
+        query = urlencode({"session_id": session_id, "page": 1, "page_size": 20})
+        status, history = self._request(f"/api/history?{query}")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(len(history["messages"]), 2)
+        assistant = history["messages"][1]
+        self.assertEqual(assistant["run_state"], "interrupted")
+        self.assertEqual(assistant["content"], "")
+        self.assertEqual(len(assistant["steps"]), 1)
+        tool = assistant["steps"][0]
+        self.assertEqual(tool["id"], "call-half")
+        self.assertEqual(tool["status"], "error")
+        self.assertTrue(tool["is_error"])
+        self.assertIn("中断", tool["result"])
 
 
 if __name__ == "__main__":

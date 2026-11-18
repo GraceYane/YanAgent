@@ -73,7 +73,7 @@ class AppConfig:
     api_base: str = ""
     model: str = ""
     api_key: str = field(default="", repr=False)
-    request_timeout: float = 60.0
+    request_timeout: float = 600.0
     permission_mode: str = "ask"
 
     def __post_init__(self) -> None:

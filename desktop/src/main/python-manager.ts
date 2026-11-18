@@ -710,14 +710,16 @@ export class PythonBackend extends EventEmitter {
     this.recentLogs = []
     this.lastError = null
 
-    // 外部后端模式专用于本地 IDE 调试。只等待指定端口健康，不清理端口，
-    // 也不 spawn Python；因此 Electron 退出时不会把断点中的进程一起结束。
+    // 外部后端模式专用于本地 IDE 调试。桌面端信任由开发者管理的 Python
+    // 进程并立即就绪：不探测健康、不执行 30 秒启动超时、不启动健康恢复，
+    // 因此长时间停在断点时不会被误判为后端崩溃。普通模式仍保留全部保护。
     if (this.externalPort !== null) {
       this.port = this.externalPort
       this.markPortReady(this.port)
       this.emit('port', this.port)
-      this.emit('log', `Using external debug backend on port ${this.port}`)
-      await this.waitForReady()
+      this.status = 'ready'
+      this.emit('log', `Trusting external debug backend on port ${this.port}; health recovery disabled`)
+      this.emit('ready', this.port)
       return
     }
 
