@@ -18,6 +18,7 @@ from .validation import ToolArgumentError, ToolSchemaError, validate_tool_argume
 from .permissions import (
     TOOL_PERMISSION_MODES,
     ToolConfirmationResult,
+    ToolConfirmationRequest,
     ToolPermissionContext,
     ToolPermissionDecision,
     evaluate_tool_permission,
@@ -318,6 +319,7 @@ class ToolManager:
         permission_mode: str,
         permission_context: ToolPermissionContext | None = None,
         confirmation: ToolConfirmationResult | None = None,
+        confirmation_handler: Callable[[ToolConfirmationRequest], Awaitable[ToolConfirmationResult]] | None = None,
     ) -> ToolResult:
         """校验并执行一次工具调用，把所有可预期失败转换为结构化 ToolResult。"""
         if not isinstance(call, ToolCall):
@@ -363,6 +365,12 @@ class ToolManager:
                 call_id,
             )
             return self._failure(call_id, "工具确认结果不合法。")
+        if confirmation_handler is not None and not callable(confirmation_handler):
+            LOGGER.warning(
+                "[manager.py][ToolManager.execute] 确认处理器无效，call_id=%r",
+                call_id,
+            )
+            return self._failure(call_id, "工具确认界面不可用。")
 
         definition = self.get(call.name)
         if definition is None:
@@ -400,6 +408,27 @@ class ToolManager:
             context=context,
             confirmation=confirmation,
         )
+        if decision.status == "confirmation_required" and confirmation_handler is not None:
+            assert decision.confirmation_request is not None
+            LOGGER.info(
+                "[manager.py][ToolManager.execute] 等待用户确认，call_id=%r，tool=%r，confirmation_id=%s",
+                call_id, call.name, decision.confirmation_request.request_id,
+            )
+            try:
+                confirmation = await confirmation_handler(decision.confirmation_request)
+            except asyncio.CancelledError:
+                LOGGER.info(
+                    "[manager.py][ToolManager.execute] 等待确认时任务已取消，call_id=%r，tool=%r",
+                    call_id, call.name,
+                )
+                raise
+            decision = evaluate_tool_permission(
+                call,
+                definition,
+                permission_mode=permission_mode,
+                context=context,
+                confirmation=confirmation,
+            )
         decision = self._consume_confirmation(decision, confirmation)
         if decision.status != "allowed":
             request_id = (
@@ -430,6 +459,12 @@ class ToolManager:
                 definition.handler(arguments),
                 timeout=self.timeout_seconds,
             )
+        except asyncio.CancelledError:
+            LOGGER.info(
+                "[manager.py][ToolManager.execute] 取消信号已传递给工具，call_id=%r，tool=%r",
+                call_id, call.name,
+            )
+            raise
         except (TimeoutError, asyncio.TimeoutError):
             LOGGER.warning(
                 "[manager.py][ToolManager.execute] 工具执行超时，call_id=%r，tool=%r",

@@ -462,6 +462,50 @@ class YanAgentHandler(BaseHTTPRequestHandler):
             if path == "/poll":
                 self._json({"status": "success", "has_content": False})
                 return
+            if path == "/tool-confirmation":
+                allowed = {"confirmation_id", "run_id", "decision"}
+                if any(type(key) is not str or key not in allowed for key in payload):
+                    raise RequestValidationError(reason="unknown_field", field="body")
+                confirmation_id = payload.get("confirmation_id")
+                run_id = payload.get("run_id")
+                decision = payload.get("decision")
+                if type(confirmation_id) is not str or not confirmation_id:
+                    raise RequestValidationError(reason="invalid", field="request_id")
+                if type(run_id) is not str or not run_id:
+                    raise RequestValidationError(reason="invalid", field="request_id")
+                if type(decision) is not str or decision not in {"approved", "rejected"}:
+                    raise RequestValidationError(reason="invalid", field="body")
+                accepted = self.runtime.resolve_tool_confirmation(
+                    confirmation_id=confirmation_id,
+                    run_id=run_id,
+                    approved=decision == "approved",
+                )
+                self._json({"status": "success", "accepted": accepted})
+                return
+            if path == "/runs/instructions":
+                allowed = {"request_id", "session_id", "content"}
+                if any(type(key) is not str or key not in allowed for key in payload):
+                    raise RequestValidationError(reason="unknown_field", field="body")
+                request_value = payload.get("request_id")
+                session_value = payload.get("session_id")
+                content = payload.get("content")
+                if type(request_value) is not str or not request_value or len(request_value) > 128:
+                    raise RequestValidationError(reason="invalid", field="request_id")
+                if type(session_value) is not str or not session_value or len(session_value) > 256:
+                    raise RequestValidationError(reason="invalid", field="session_id")
+                if type(content) is not str or not content.strip() or len(content) > 200_000:
+                    raise RequestValidationError(reason="invalid", field="message")
+                queued = self.runtime.queue_instruction(
+                    request_id=request_value,
+                    session_id=session_value,
+                    content=content,
+                )
+                self._json({
+                    "status": "success",
+                    "accepted": queued is not None,
+                    **(queued or {}),
+                })
+                return
             if path == "/cancel":
                 allowed = {"request_id", "session_id", "lang"}
                 if any(type(key) is not str or key not in allowed for key in payload):

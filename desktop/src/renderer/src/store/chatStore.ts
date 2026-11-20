@@ -5,6 +5,7 @@ import { sessionOwner } from './sessionStore'
 import { cfgFor } from './sessionSettingsStore'
 import { findAgent } from './agentStore'
 import { notifyRunDone } from '../lib/taskNotify'
+import { askConfirm } from './confirmStore'
 import { parseAttachmentMarkers } from '../lib/fileKind'
 import { handoffPayload } from '../lib/handoff'
 import { t } from '../i18n'
@@ -64,6 +65,7 @@ interface ChatState {
 
 // EventSource instances kept outside the store (not serializable).
 const streams: Record<string, EventSource> = {}
+const runInstructionOutcomes: Record<string, { status: 'injected' | 'rejected'; userSeq?: number }> = {}
 
 // A backend restarting after a crash is back within seconds; after a minute
 // the history is left to load on the next visit to the session.
@@ -357,6 +359,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     // Every bubble this turn opened: a bubble replaced when the floor changes
     // hands again is no longer `main` or in `peers`, but still has to settle.
     const opened = new Set<string>([botId])
+    const openedInstructionCheckpoints = new Set<string>()
 
     const openBubble = (agentId?: string): Speaker => {
       const id = uid('assistant')
@@ -565,6 +568,63 @@ export const useChatStore = create<ChatState>((set, get) => {
           }))
           break
 
+        case 'confirmation_required': {
+          if (!data.confirmation_id || !data.run_id) break
+          void (async () => {
+            const approved = await askConfirm({
+              titleKey: 'tool_confirm_title',
+              msgKey: 'tool_confirm_message',
+              vars: {
+                tool: data.tool || 'tool',
+                risk: data.risk_level || 'unknown',
+                scope: data.scope || 'unknown',
+              },
+              okKey: 'tool_confirm_allow',
+              tone: 'danger',
+            })
+            try {
+              await apiClient.resolveToolConfirmation({
+                confirmationId: data.confirmation_id!,
+                runId: data.run_id!,
+                decision: approved ? 'approved' : 'rejected',
+              })
+            } catch (error) {
+              console.warn('[chatStore] 工具确认结果提交失败', error)
+            }
+          })()
+          break
+        }
+
+        case 'instruction_injected':
+          if (data.instruction_id) {
+            runInstructionOutcomes[data.instruction_id] = {
+              status: 'injected',
+              userSeq: data.user_seq,
+            }
+            patchMessages(sid, (msgs) => msgs.map((message) =>
+              message.extras?.run_instruction_id === data.instruction_id
+                ? { ...message, userSeq: data.user_seq ?? message.userSeq }
+                : message
+            ))
+          }
+          if (data.checkpoint_id && !openedInstructionCheckpoints.has(data.checkpoint_id)) {
+            openedInstructionCheckpoints.add(data.checkpoint_id)
+            updateMsg(sid, main.id, (message) => ({ ...message, isStreaming: false }))
+            main = openBubble(main.agentId)
+          }
+          break
+
+        case 'instruction_rejected':
+          if (data.instruction_id) {
+            runInstructionOutcomes[data.instruction_id] = { status: 'rejected' }
+            patchMessages(sid, (msgs) => msgs.map((message) =>
+              message.extras?.run_instruction_id === data.instruction_id
+                ? { ...message, error: t('run_instruction_rejected'), extras: undefined }
+                : message
+            ))
+          }
+          break
+
         // A tool call made inside a sub agent, filed under that sub agent's
         // step so its minutes of work can be followed rather than guessed at.
         // Ignored when the step is gone: a sub agent cancelled on a timeout
@@ -763,6 +823,50 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
 
     send: async (sid, text, attachments) => {
+      const activeRun = get().sessions[sid]
+      if (activeRun?.isStreaming) {
+        if (!activeRun.requestId || attachments.length > 0 || !text.trim()) return
+        const queuedMessage: ChatMessage = {
+          id: uid('user'),
+          role: 'user',
+          content: text,
+          timestamp: Date.now() / 1000,
+          extras: { run_instruction_pending: true },
+        }
+        patchMessages(sid, (msgs) => [...msgs, queuedMessage])
+        try {
+          const result = await apiClient.addRunInstruction({
+            requestId: activeRun.requestId,
+            sessionId: sid,
+            content: text,
+          })
+          if (result.accepted && result.instruction_id) {
+            const outcome = runInstructionOutcomes[result.instruction_id]
+            updateMsg(sid, queuedMessage.id, (message) => outcome?.status === 'rejected'
+              ? { ...message, error: t('run_instruction_rejected'), extras: undefined }
+              : {
+                  ...message,
+                  userSeq: outcome?.userSeq ?? message.userSeq,
+                  extras: { run_instruction_id: result.instruction_id },
+                }
+            )
+            delete runInstructionOutcomes[result.instruction_id]
+          } else {
+            updateMsg(sid, queuedMessage.id, (message) => ({
+              ...message,
+              error: t('run_instruction_rejected'),
+              extras: undefined,
+            }))
+          }
+        } catch (error) {
+          updateMsg(sid, queuedMessage.id, (message) => ({
+            ...message,
+            error: `${error}`,
+            extras: undefined,
+          }))
+        }
+        return
+      }
       const userMsg: ChatMessage = {
         id: uid('user'),
         role: 'user',

@@ -30,7 +30,11 @@ from yanagent.errors import (
 from yanagent.models.provider import ModelProvider
 from yanagent.sessions.store import SessionStore
 from yanagent.tools.manager import ToolManager
-from yanagent.tools.permissions import ToolPermissionContext
+from yanagent.tools.permissions import (
+    ToolConfirmationRequest,
+    ToolConfirmationResult,
+    ToolPermissionContext,
+)
 
 
 LOGGER = logging.getLogger("yanagent.agent_loop")
@@ -43,6 +47,8 @@ MAX_CONFIGURED_CONSECUTIVE_FAILURES = 1_000
 ModelTurn = Callable[[Sequence[Message], Sequence[dict[str, Any]]], Awaitable[ModelReply]]
 ToolStartObserver = Callable[[ToolCall, int, int, int], None]
 ToolEndObserver = Callable[[ToolCall, ToolResult, int, int, int, float], None]
+ConfirmationHandler = Callable[[ToolConfirmationRequest], Awaitable[ToolConfirmationResult]]
+CheckpointObserver = Callable[[], Awaitable[Sequence[Message]]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +103,8 @@ class AgentLoop:
         model_turn: ModelTurn | None = None,
         on_tool_start: ToolStartObserver | None = None,
         on_tool_end: ToolEndObserver | None = None,
+        confirmation_handler: ConfirmationHandler | None = None,
+        on_checkpoint: CheckpointObserver | None = None,
     ) -> None:
         """注入循环依赖、可选流式轮次及观察器，并校验所有运行限制。"""
         if not callable(getattr(model, "complete", None)):
@@ -111,6 +119,10 @@ class AgentLoop:
             raise TypeError("on_tool_start 必须是可调用对象或 None")
         if on_tool_end is not None and not callable(on_tool_end):
             raise TypeError("on_tool_end 必须是可调用对象或 None")
+        if confirmation_handler is not None and not callable(confirmation_handler):
+            raise TypeError("confirmation_handler 必须是可调用对象或 None")
+        if on_checkpoint is not None and not callable(on_checkpoint):
+            raise TypeError("on_checkpoint 必须是可调用对象或 None")
         if (
             type(max_model_turns) is not int
             or not 1 <= max_model_turns <= MAX_CONFIGURED_MODEL_TURNS
@@ -138,6 +150,8 @@ class AgentLoop:
         self.model_turn = model_turn or self._complete_model_turn
         self.on_tool_start = on_tool_start
         self.on_tool_end = on_tool_end
+        self.confirmation_handler = confirmation_handler
+        self.on_checkpoint = on_checkpoint
 
     async def _complete_model_turn(
         self,
@@ -215,6 +229,18 @@ class AgentLoop:
         consecutive_failures = 0
 
         while True:
+            if self.on_checkpoint is not None:
+                injected = list(await self.on_checkpoint())
+                if injected:
+                    working.extend(
+                        Message.from_dict(message.to_dict()) for message in injected
+                    )
+                    validate_conversation(working)
+                    LOGGER.info(
+                        "[agent_loop.py][AgentLoop._run_loop] 安全检查点注入追加指令，"
+                        "request_id=%s，消息数=%d",
+                        request_id, len(injected),
+                    )
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 self._raise_total_timeout(request_id)
@@ -289,6 +315,20 @@ class AgentLoop:
                     request_id=request_id,
                     stage="final_assistant",
                 )
+                working.append(Message.from_dict(assistant.to_dict()))
+                if self.on_checkpoint is not None:
+                    injected = list(await self.on_checkpoint())
+                    if injected:
+                        working.extend(
+                            Message.from_dict(message.to_dict()) for message in injected
+                        )
+                        validate_conversation(working)
+                        LOGGER.info(
+                            "[agent_loop.py][AgentLoop._run_loop] 最终回答保存后收到追加指令，"
+                            "同一 Run 继续处理，request_id=%s，消息数=%d",
+                            request_id, len(injected),
+                        )
+                        continue
                 LOGGER.info(
                     "[agent_loop.py][AgentLoop.run] 模型工具循环完成，"
                     "request_id=%s，turns=%d，累计用量字段=%s，assistant_sequence=%s",
@@ -381,6 +421,7 @@ class AgentLoop:
                                 call,
                                 permission_mode=permission_mode,
                                 permission_context=permission_context,
+                                confirmation_handler=self.confirmation_handler,
                             ),
                             timeout=remaining,
                         )

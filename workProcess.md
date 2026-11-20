@@ -1940,3 +1940,58 @@ Electron/React chatStore
 - P05-03 接入确认 UI、批准/拒绝回传、运行中追加指令和工具取消传播；当前保存的 `ask` 且无确认界面仍安全拒绝。
 - P05-06 建立工具执行状态持久化、崩溃后已有步骤识别及显式继续/重试入口；P04-05 只保证半记录可解释，不自动恢复副作用。
 
+## 2026-11-20：P05-03 任务控制
+
+### 实际完成的内容
+
+- 在桌面流式路径接入工具批准/拒绝：运行时发出确认事件，桌面打开确认框并提交决定；后端按 confirmation ID 与 Run ID 校验一次性结果，只有批准后才运行工具。拒绝结果会作为工具失败回到 Agent Loop。
+- 完成取消传播：用户取消活动流式 Run 后，取消信号沿 Runtime、AgentLoop、ToolManager 传递到工具等待/执行协程；工具 manager 记录取消并继续抛出 `CancelledError`，运行时完成 Run 终态和 SSE 收尾。
+- 增加运行中纯文本追加：接口校验 Run 和 Session 归属，限制文本长度；先将指令和 queued 状态保存到 Run 元数据，再登记内存队列并通知桌面。
+- AgentLoop 在模型轮次间检查追加队列，并在最终 Assistant 保存后再检查一次。检查点将消息按序追加到 Session，更新 Run 指令状态与 Session 序号后才发出注入事件；结束前未注入的追加指令标记为 rejected，桌面显示未接收状态。
+- 桌面流式输入在运行期间允许继续发送纯文本，附件禁用；确认框连接现有全局确认组件；SSE 与 HTTP 响应通过 `instruction_id` 处理先后到达竞态。
+- 更新 P05 状态和路线图，新增 `docs/P05_03_TASK_CONTROL.md`。实现范围限定为桌面流式路径；非流式桌面请求目前没有运行中取消或追加指令入口。
+
+### 涉及的文件
+
+- `yanagent/tools/manager.py`
+- `yanagent/chat.py`
+- `yanagent/events.py`
+- `yanagent/runtime/agent_loop.py`
+- `yanagent/runtime/streaming.py`
+- `yanagent/runtime/bridge.py`
+- `yanagent/sessions/runs.py`
+- `app.py`
+- `desktop/src/renderer/src/api/client.ts`
+- `desktop/src/renderer/src/components/ChatInput.tsx`
+- `desktop/src/renderer/src/i18n.ts`
+- `desktop/src/renderer/src/store/chatStore.ts`
+- `desktop/src/renderer/src/types.ts`
+- `docs/DEVELOPMENT_REQUIREMENTS.md`
+- `docs/IMPLEMENTATION_ROADMAP.md`
+- `docs/P05_02_IDENTITY_CONCURRENCY.md`
+- `docs/P05_03_TASK_CONTROL.md`
+- `workProcess.md`
+
+### 验证结果
+
+- `python -X utf8 -m compileall -q app.py yanagent` 通过；`git diff --check` 通过。Git 仅提示部分文件工作区换行符将由 LF 转为 CRLF。
+- 未新增或运行自动化测试，未启动桌面或进行 HTTP/SSE、真实工具批准/拒绝联调；取消竞争、指令排序和交互结果仍需行为验证。
+- 当前追加指令使用 Run 元数据与 Session 消息两处持久化，不是跨表原子事务；崩溃间隙处理留给 P05-06。异步工具若屏蔽取消，或外部副作用已提交，协作式取消不能回滚。
+- P05-02 预先列出的非流式显式取消跟踪没有在此实现；桌面当前流式交互具备停止按钮，非流式接口没有可用的运行中停止入口。以后开放该交互时，需要请求开始前将 Run ID 提供给客户端。
+
+### 岗位要求关联与实践证据
+
+- 对应 `docs/TARGET_ROLES.md` 的“工具调用与执行管控”（XM-职责1、XM-职责6、DYQ-职责2～3、TX-职责1）、“路由、任务调度与多入口”（XM-职责1～2、DYG-职责2、TX-职责1）及“可用性、稳定性与可观测性”（XM-职责6～7、TX-职责3）。
+- 代码证据是 Run 范围确认、一次性批准回传、ToolManager 取消传播、检查点追加消息和持久化状态/序号。验证证据只有 Python 编译和 diff 空白检查，不代表测试覆盖或实际运行稳定性；未实现远程身份认证、非流式运行中停止或外部副作用回滚。
+- 面试可说明的取舍：追加文本先持久化排队，再只在完整模型轮次之间进入上下文，并在写入 Session 和 Run 状态后通知前端；这避免把用户消息插入尚未闭合的 Assistant/Tool 消息序列，但不声称两个存储写入是原子事务。
+
+### 难点评分
+
+整体难度：**8/10**。最难的是在多个并发面上保持同一条追加指令的归属和顺序：HTTP 请求可能与 SSE 事件以不同顺序抵达前端；Run 可在指令写入 Run 元数据后、检查点注入前结束；AgentLoop 还必须避开尚未闭合的工具调用消息。实现用 `instruction_id` 贯穿 HTTP、Run 元数据、内存队列、Session 消息和 SSE；先落排队记录，检查点依次写 Session 消息、更新指令状态/序号、最后发事件。确认决策同样绑定 Run 与一次性确认 ID；取消沿 async Task 传至确认 Future 和工具 handler，并由流运行时统一做终态收尾。
+
+### 后续事项
+
+- 补并运行确认批准/拒绝、确认等待中取消、工具执行中取消、最终回复边界追加、结束后追加被拒绝等行为测试。
+- 如果提供非流式桌面模式，先让调用方在发起请求前拿到 Run ID，再实现同一任务取消入口。
+- 下一项为 P05-04：上下文 Token 预算和压缩。
+

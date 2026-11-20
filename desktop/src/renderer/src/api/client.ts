@@ -329,6 +329,38 @@ class ApiClient {
     })
   }
 
+  /** Submit a one-use approval decision for the exact running tool request. */
+  async resolveToolConfirmation(opts: {
+    confirmationId: string
+    runId: string
+    decision: 'approved' | 'rejected'
+  }): Promise<{ status: string; accepted: boolean }> {
+    return this.request('/tool-confirmation', {
+      method: 'POST',
+      body: JSON.stringify({
+        confirmation_id: opts.confirmationId,
+        run_id: opts.runId,
+        decision: opts.decision,
+      }),
+    })
+  }
+
+  /** Queue a user instruction for injection at the running Agent's next safe checkpoint. */
+  async addRunInstruction(opts: {
+    requestId: string
+    sessionId: string
+    content: string
+  }): Promise<{ status: string; accepted: boolean; instruction_id?: string }> {
+    return this.request('/runs/instructions', {
+      method: 'POST',
+      body: JSON.stringify({
+        request_id: opts.requestId,
+        session_id: opts.sessionId,
+        content: opts.content,
+      }),
+    })
+  }
+
   // EventSource can't set an Authorization header, so append the auth token as
   // a query param for SSE endpoints (the backend accepts it there).
   private withToken(url: string): string {

@@ -193,6 +193,44 @@ class AgentBridge:
             return None
         return runtime.wait_events(request_id, cursor, timeout=timeout)
 
+    def resolve_tool_confirmation(
+        self,
+        *,
+        confirmation_id: str,
+        run_id: str,
+        approved: bool,
+        user_id: str = "local",
+        agent_id: str = "default",
+    ) -> bool:
+        """只向指定身份实例提交与 Run 匹配的一次批准或拒绝。"""
+        runtime = self._existing_instance(user_id, agent_id)
+        if runtime is None:
+            return False
+        return runtime.resolve_tool_confirmation(
+            confirmation_id=confirmation_id,
+            run_id=run_id,
+            approved=approved,
+        )
+
+    def queue_instruction(
+        self,
+        *,
+        request_id: str,
+        session_id: str,
+        content: str,
+        user_id: str = "local",
+        agent_id: str = "default",
+    ) -> dict[str, str] | None:
+        """把追加指令路由到目标身份的活动 Run，由其安全检查点注入。"""
+        runtime = self._existing_instance(user_id, agent_id)
+        if runtime is None:
+            return None
+        return runtime.queue_instruction(
+            request_id=request_id,
+            session_id=session_id,
+            content=content,
+        )
+
     def cancel_with_details(
         self,
         *,

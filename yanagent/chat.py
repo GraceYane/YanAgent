@@ -546,6 +546,7 @@ class YanAgentApplication:
         prepared: PreparedChat,
         *,
         request_id: str,
+        confirmation_ui_available: bool = False,
     ) -> ToolPermissionContext:
         """用可信运行身份构造流式和非流式共用的工具权限上下文。"""
         identity = self._runtime_identity(prepared, request_id=request_id)
@@ -555,7 +556,7 @@ class YanAgentApplication:
             user_id=identity.user_id,
             agent_id=identity.agent_id,
             session_id=identity.session_id,
-            confirmation_ui_available=False,
+            confirmation_ui_available=confirmation_ui_available,
         )
 
     async def finish_chat(

@@ -169,6 +169,38 @@ class RunStore:
             str(_identifier(session_id)),
         )
 
+    async def queue_instruction(
+        self, request_id: str, session_id: str, instruction_id: str, content: str,
+    ) -> bool:
+        """把运行中追加指令先写入 Run 元数据，供安全检查点注入。"""
+        if type(content) is not str or not content.strip() or len(content) > 200_000:
+            raise SessionValidationError()
+        return await asyncio.to_thread(
+            self._queue_instruction_sync,
+            str(_identifier(request_id)), str(_identifier(session_id)),
+            str(_identifier(instruction_id)), content,
+        )
+
+    async def finish_instruction(
+        self,
+        request_id: str,
+        session_id: str,
+        instruction_id: str,
+        *,
+        status: str,
+        sequence: int | None = None,
+    ) -> bool:
+        """持久化追加指令已注入或因 Run 结束而未注入的状态。"""
+        if status not in {"injected", "rejected"}:
+            raise SessionValidationError()
+        if sequence is not None and (type(sequence) is not int or sequence < 0):
+            raise SessionValidationError()
+        return await asyncio.to_thread(
+            self._finish_instruction_sync,
+            str(_identifier(request_id)), str(_identifier(session_id)),
+            str(_identifier(instruction_id)), status, sequence,
+        )
+
     def recover_unfinished_on_startup(self) -> int:
         """启动接流量前把当前作用域遗留的 queued/running Run 标记为 interrupted。"""
         timestamp = self._timestamp()
@@ -327,6 +359,96 @@ class RunStore:
             len(runs),
         )
         return runs
+
+    def _queue_instruction_sync(
+        self, request_id: str, session_id: str, instruction_id: str, content: str,
+    ) -> bool:
+        """在单个事务内验证 Run 活动状态并保存追加指令。"""
+        try:
+            with self.database.transaction(immediate=True) as connection:
+                row = connection.execute(
+                    "SELECT metadata_json FROM runs WHERE request_id = ? AND user_id = ? "
+                    "AND agent_id = ? AND session_id = ? AND status = 'running'",
+                    (request_id, self.user_id, self.agent_id, session_id),
+                ).fetchone()
+                if row is None:
+                    return False
+                metadata = _decode_json_object(row["metadata_json"])
+                instructions = metadata.setdefault("run_instructions", [])
+                if type(instructions) is not list:
+                    raise SessionStorageError()
+                if any(
+                    type(item) is dict and item.get("instruction_id") == instruction_id
+                    for item in instructions
+                ):
+                    return False
+                instructions.append({
+                    "instruction_id": instruction_id,
+                    "content": content,
+                    "status": "queued",
+                    "sequence": None,
+                    "created_at": self._timestamp(),
+                })
+                connection.execute(
+                    "UPDATE runs SET metadata_json = ? WHERE request_id = ? AND user_id = ? "
+                    "AND agent_id = ? AND session_id = ? AND status = 'running'",
+                    (
+                        _json_object(metadata), request_id, self.user_id,
+                        self.agent_id, session_id,
+                    ),
+                )
+        except AgentError:
+            raise
+        except (sqlite3.Error, TypeError, ValueError, RecursionError) as error:
+            self._log_storage_error("_queue_instruction_sync", error)
+            raise SessionStorageError() from None
+        LOGGER.info(
+            "[runs.py][RunStore._queue_instruction_sync] 追加指令已持久化，request_id=%s，instruction_id=%s",
+            request_id, instruction_id,
+        )
+        return True
+
+    def _finish_instruction_sync(
+        self,
+        request_id: str,
+        session_id: str,
+        instruction_id: str,
+        status: str,
+        sequence: int | None,
+    ) -> bool:
+        """按完整 Run 归属更新追加指令状态和注入后的消息序号。"""
+        try:
+            with self.database.transaction(immediate=True) as connection:
+                row = connection.execute(
+                    "SELECT metadata_json FROM runs WHERE request_id = ? AND user_id = ? "
+                    "AND agent_id = ? AND session_id = ?",
+                    (request_id, self.user_id, self.agent_id, session_id),
+                ).fetchone()
+                if row is None:
+                    return False
+                metadata = _decode_json_object(row["metadata_json"])
+                instructions = metadata.get("run_instructions", [])
+                if type(instructions) is not list:
+                    raise SessionStorageError()
+                for item in instructions:
+                    if type(item) is dict and item.get("instruction_id") == instruction_id:
+                        item["status"] = status
+                        item["sequence"] = sequence
+                        connection.execute(
+                            "UPDATE runs SET metadata_json = ? WHERE request_id = ? "
+                            "AND user_id = ? AND agent_id = ? AND session_id = ?",
+                            (
+                                _json_object(metadata), request_id, self.user_id,
+                                self.agent_id, session_id,
+                            ),
+                        )
+                        return True
+        except AgentError:
+            raise
+        except (sqlite3.Error, TypeError, ValueError, RecursionError) as error:
+            self._log_storage_error("_finish_instruction_sync", error)
+            raise SessionStorageError() from None
+        return False
 
     def _select_run(
         self,

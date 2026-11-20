@@ -369,7 +369,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
   const handleSubmit = useCallback(() => {
     const trimmed = text.trim()
     if (!trimmed && attachments.length === 0) return
-    if (isStreaming) return
+    if (isStreaming && attachments.length > 0) return
     onSend(trimmed, attachments)
     setText('')
     setAttachments([])
@@ -679,7 +679,11 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     }
   }, [])
 
-  const canSend = !isStreaming && !compacting && (!!text.trim() || attachments.length > 0)
+  const canSend = !compacting && (
+    isStreaming
+      ? !!text.trim() && attachments.length === 0
+      : !!text.trim() || attachments.length > 0
+  )
 
   return (
     <div className="flex-shrink-0 border-t border-default bg-surface px-4 py-3">
@@ -961,14 +965,25 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
               </Tooltip>
             )}
             {isStreaming ? (
-              <Tooltip label={t('msg_stop')}>
-                <button
-                  onClick={onStop}
-                  className="flex-shrink-0 w-9 h-9 flex items-center justify-center rounded-btn bg-surface-2 text-content hover:bg-inset-2 cursor-pointer transition-colors relative -top-px"
-                >
-                  <Square size={14} className="fill-current" />
-                </button>
-              </Tooltip>
+              <>
+                <Tooltip label={t('run_instruction_send')}>
+                  <button
+                    onClick={handleSubmit}
+                    disabled={!canSend}
+                    className="flex-shrink-0 w-9 h-9 flex items-center justify-center rounded-btn bg-accent text-white hover:bg-accent-hover disabled:bg-surface-2 disabled:text-content-disabled disabled:cursor-not-allowed cursor-pointer transition-none [&_*]:transition-none relative -top-px"
+                  >
+                    <PaperPlaneIcon size={14} />
+                  </button>
+                </Tooltip>
+                <Tooltip label={t('msg_stop')}>
+                  <button
+                    onClick={onStop}
+                    className="flex-shrink-0 w-9 h-9 flex items-center justify-center rounded-btn bg-surface-2 text-content hover:bg-inset-2 cursor-pointer transition-colors relative -top-px"
+                  >
+                    <Square size={14} className="fill-current" />
+                  </button>
+                </Tooltip>
+              </>
             ) : (
               <Tooltip label={t('chat_send')}>
                 <button

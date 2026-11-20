@@ -404,6 +404,10 @@ export type StreamEventType =
   | 'tool_start'
   | 'tool_progress'
   | 'tool_end'
+  | 'confirmation_required'
+  | 'instruction_queued'
+  | 'instruction_injected'
+  | 'instruction_rejected'
   | 'subagent_step'
   | 'peer_start'
   | 'peer_end'
@@ -425,6 +429,13 @@ export interface StreamEvent {
   content?: string
   tool?: string
   tool_call_id?: string
+  confirmation_id?: string
+  run_id?: string
+  instruction_id?: string
+  checkpoint_id?: string
+  user_seq?: number
+  risk_level?: string
+  scope?: string
   arguments?: Record<string, unknown>
   status?: string
   result?: string

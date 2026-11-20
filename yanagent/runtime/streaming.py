@@ -7,6 +7,7 @@ import concurrent.futures
 import logging
 import threading
 import time
+import uuid
 from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
@@ -15,16 +16,34 @@ from yanagent.chat import PreparedChat, YanAgentApplication
 from yanagent.contracts import Message, ModelReply, ToolCall, ToolResult
 from yanagent.errors import (
     AgentError, EmptyModelResponseError, ModelResponseError, ModelTimeoutError,
-    SessionStorageError,
+    RequestValidationError, SessionStorageError,
 )
 from yanagent.events import ClientEventType, RunEvent
 from yanagent.runtime.agent_loop import AgentLoop
 from yanagent.sessions.runs import TerminalRunStatus
+from yanagent.tools.permissions import ToolConfirmationRequest, ToolConfirmationResult
 
 
 LOGGER = logging.getLogger("yanagent.runtime")
 MAX_RUN_EVENTS = 20_000
 ResultType = TypeVar("ResultType")
+
+
+@dataclass(frozen=True, slots=True)
+class RunInstruction:
+    """记录一条等待当前 Run 安全检查点注入的用户追加指令。"""
+
+    instruction_id: str
+    content: str
+
+
+@dataclass
+class PendingConfirmation:
+    """保存唯一确认请求及其等待结果的协程 Future。"""
+
+    request: ToolConfirmationRequest
+    future: asyncio.Future[ToolConfirmationResult]
+    decided: bool = False
 
 
 @dataclass
@@ -39,6 +58,8 @@ class RunRecord:
     _finished_at: float | None = field(default=None, repr=False)
     _cancel_requested: bool = field(default=False, repr=False)
     _state: str = field(default="queued", repr=False)
+    _accepting_instructions: bool = field(default=False, repr=False)
+    _pending_instructions: list[RunInstruction] = field(default_factory=list, repr=False)
     _future: concurrent.futures.Future[None] | None = field(default=None, repr=False)
     _condition: threading.Condition = field(default_factory=threading.Condition, repr=False)
 
@@ -67,6 +88,7 @@ class RunRecord:
             if event.terminal:
                 self._terminal = True
                 self._state = "terminal"
+                self._accepting_instructions = False
                 self._finished_at = time.monotonic()
             self._condition.notify_all()
             return event
@@ -94,9 +116,10 @@ class RunRecord:
             future = self._future
         if future is not None:
             future.cancel()
-        timer = threading.Timer(0.1, self._ensure_cancel_terminal)
-        timer.daemon = True
-        timer.start()
+        if previous_state == "queued":
+            timer = threading.Timer(0.1, self._ensure_cancel_terminal)
+            timer.daemon = True
+            timer.start()
         return previous_state
 
     def mark_running(self) -> bool:
@@ -112,6 +135,40 @@ class RunRecord:
         """读取排队、运行或终态，供取消逻辑区分任务所处阶段。"""
         with self._condition:
             return self._state
+
+    def queue_instruction(self, instruction: RunInstruction) -> bool:
+        """仅在运行态接受新指令；排队、取消或终态 Run 均拒绝追加。"""
+        with self._condition:
+            if (
+                self._state != "running" or not self._accepting_instructions
+                or self._terminal or self._cancel_requested
+            ):
+                return False
+            self._pending_instructions.append(instruction)
+            self._condition.notify_all()
+            return True
+
+    def set_accepting_instructions(self, accepting: bool) -> None:
+        """在 Run 持久化就绪后开放追加，并在结束/取消时关闭入口。"""
+        with self._condition:
+            self._accepting_instructions = (
+                accepting and not self._terminal and not self._cancel_requested
+            )
+
+    def take_instructions(self) -> list[RunInstruction]:
+        """在安全检查点原子取出当前已持久化等待注入的指令。"""
+        with self._condition:
+            instructions = list(self._pending_instructions)
+            self._pending_instructions.clear()
+            return instructions
+
+    def restore_instructions(self, instructions: list[RunInstruction]) -> None:
+        """持久化注入失败时按原顺序放回待处理队列。"""
+        with self._condition:
+            known = {item.instruction_id for item in self._pending_instructions}
+            self._pending_instructions = [
+                item for item in instructions if item.instruction_id not in known
+            ] + self._pending_instructions
 
     def _ensure_cancel_terminal(self) -> None:
         """兜底处理协程尚未进入函数体便取消的竞态，避免订阅者永久等待。"""
@@ -161,6 +218,8 @@ class AgentRuntime:
         self._runs_lock = threading.RLock()
         self._runs: dict[str, RunRecord] = {}
         self._session_queues: dict[tuple[str, str, str], tuple[asyncio.Lock, int]] = {}
+        self._confirmations_lock = threading.RLock()
+        self._confirmations: dict[str, PendingConfirmation] = {}
         self._thread = threading.Thread(
             target=self._run_loop, name="yanagent-async-runtime", daemon=True,
         )
@@ -259,6 +318,125 @@ class AgentRuntime:
             "status": "success", "request_id": request_id, "stream": True,
             "speaker": "default", "received_session_id": prepared.session_id,
         }
+
+    async def _request_tool_confirmation(
+        self,
+        record: RunRecord,
+        request: ToolConfirmationRequest,
+    ) -> ToolConfirmationResult:
+        """发出需确认事件并等待同一 Run 的一次性批准或拒绝结果。"""
+        future: asyncio.Future[ToolConfirmationResult] = self._loop.create_future()
+        pending = PendingConfirmation(request=request, future=future)
+        with self._confirmations_lock:
+            if request.request_id in self._confirmations:
+                raise ModelResponseError()
+            self._confirmations[request.request_id] = pending
+        try:
+            record.append("confirmation_required", {
+                "confirmation_id": request.request_id,
+                "run_id": request.run_id,
+                "tool_call_id": request.tool_call_id,
+                "tool": request.tool_name,
+                "risk_level": request.risk_level,
+                "scope": request.scope,
+            })
+            LOGGER.info(
+                "[streaming.py][AgentRuntime._request_tool_confirmation] 已等待工具确认，"
+                "request_id=%s，tool_call_id=%s，tool=%s",
+                request.run_id, request.tool_call_id, request.tool_name,
+            )
+            return await future
+        finally:
+            with self._confirmations_lock:
+                if self._confirmations.get(request.request_id) is pending:
+                    del self._confirmations[request.request_id]
+
+    def resolve_tool_confirmation(
+        self, *, confirmation_id: str, run_id: str, approved: bool,
+    ) -> bool:
+        """校验 Run 归属并原子消费一次确认决定，再唤醒等待中的工具执行。"""
+        if type(approved) is not bool:
+            return False
+        with self._confirmations_lock:
+            pending = self._confirmations.get(confirmation_id)
+            if (
+                pending is None or pending.request.run_id != run_id or pending.decided
+            ):
+                return False
+            pending.decided = True
+        result = ToolConfirmationResult(
+            request_id=confirmation_id,
+            decision="approved" if approved else "rejected",
+        )
+
+        def finish_confirmation() -> None:
+            """在 Runtime 事件循环中安全完成确认 Future。"""
+            if not pending.future.done():
+                pending.future.set_result(result)
+
+        try:
+            self._loop.call_soon_threadsafe(finish_confirmation)
+        except RuntimeError:
+            return False
+        LOGGER.info(
+            "[streaming.py][AgentRuntime.resolve_tool_confirmation] 用户已提交确认结果，"
+            "request_id=%s，confirmation_id=%s，approved=%s",
+            run_id, confirmation_id, approved,
+        )
+        return True
+
+    def queue_instruction(
+        self, *, request_id: str, session_id: str, content: str,
+    ) -> dict[str, str] | None:
+        """把追加指令持久化到 Run 元数据，等待 AgentLoop 安全检查点注入。"""
+        if type(content) is not str or not content.strip() or len(content) > 200_000:
+            raise RequestValidationError(reason="invalid", field="message")
+        with self._runs_lock:
+            record = self._runs.get(request_id)
+        if record is None or record.session_id != session_id:
+            return None
+        instruction = RunInstruction(uuid.uuid4().hex, content)
+        future = asyncio.run_coroutine_threadsafe(
+            self._queue_instruction(record, instruction), self._loop,
+        )
+        try:
+            return future.result(timeout=10.0)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise ModelTimeoutError() from None
+
+    async def _queue_instruction(
+        self, record: RunRecord, instruction: RunInstruction,
+    ) -> dict[str, str] | None:
+        """先持久化追加文本，再开放给检查点读取，避免先注入后落库。"""
+        if record.state != "running":
+            return None
+        run_store = self.application.run_store
+        if run_store is not None:
+            persisted = await run_store.queue_instruction(
+                record.request_id,
+                record.session_id,
+                instruction.instruction_id,
+                instruction.content,
+            )
+            if not persisted:
+                return None
+        if not record.queue_instruction(instruction):
+            if run_store is not None:
+                await run_store.finish_instruction(
+                    record.request_id, record.session_id,
+                    instruction.instruction_id, status="rejected",
+                )
+            return None
+        record.append("instruction_queued", {
+            "instruction_id": instruction.instruction_id,
+        })
+        LOGGER.info(
+            "[streaming.py][AgentRuntime._queue_instruction] 追加指令已排队等待检查点，"
+            "request_id=%s，instruction_id=%s",
+            record.request_id, instruction.instruction_id,
+        )
+        return {"request_id": record.request_id, "instruction_id": instruction.instruction_id}
 
     async def _run_in_session_queue(
         self,
@@ -419,6 +597,85 @@ class AgentRuntime:
                 "tool_call_total": total,
             })
 
+        async def inject_pending_instructions() -> Sequence[Message]:
+            """在无悬空 ToolCall 的检查点落库并注入追加用户指令。"""
+            pending = record.take_instructions()
+            if not pending:
+                return ()
+            messages = [
+                Message(
+                    role="user",
+                    content=item.content,
+                    metadata={
+                        "request_id": record.request_id,
+                        "run_instruction_id": item.instruction_id,
+                        "injected_at_checkpoint": True,
+                    },
+                )
+                for item in pending
+            ]
+            checkpoint_id = uuid.uuid4().hex
+            try:
+                stored = (
+                    await self.application.session_store.append(
+                        prepared.session_id, messages,
+                    )
+                    if self.application.session_store is not None
+                    else []
+                )
+                for index, item in enumerate(pending):
+                    sequence = stored[index].sequence if stored else None
+                    if self.application.run_store is not None:
+                        await self.application.run_store.finish_instruction(
+                            record.request_id,
+                            prepared.session_id,
+                            item.instruction_id,
+                            status="injected",
+                            sequence=sequence,
+                        )
+                    record.append("instruction_injected", {
+                        "instruction_id": item.instruction_id,
+                        "user_seq": sequence,
+                        "checkpoint_id": checkpoint_id,
+                    })
+                LOGGER.info(
+                    "[streaming.py][AgentRuntime._run_stream] 安全检查点追加指令已持久化并注入，"
+                    "request_id=%s，数量=%d，首序号=%s",
+                    record.request_id, len(pending),
+                    stored[0].sequence if stored else "<无仓储>",
+                )
+                return messages
+            except Exception:
+                record.restore_instructions(pending)
+                LOGGER.exception(
+                    "[streaming.py][AgentRuntime._run_stream] 追加指令注入失败并保留待处理状态，"
+                    "request_id=%s，数量=%d",
+                    record.request_id, len(pending),
+                )
+                raise
+
+        async def request_confirmation(
+            request: ToolConfirmationRequest,
+        ) -> ToolConfirmationResult:
+            """把当前 Run 的工具确认请求交给 SSE 桌面界面并等待决定。"""
+            return await self._request_tool_confirmation(record, request)
+
+        async def reject_uninjected_instructions() -> None:
+            """Run 结束或失败时明确标记尚未到安全检查点的追加指令。"""
+            pending = record.take_instructions()
+            for item in pending:
+                if self.application.run_store is not None:
+                    await self.application.run_store.finish_instruction(
+                        record.request_id,
+                        prepared.session_id,
+                        item.instruction_id,
+                        status="rejected",
+                    )
+                record.append("instruction_rejected", {
+                    "instruction_id": item.instruction_id,
+                    "reason": "run_finished_before_checkpoint",
+                })
+
         try:
             LOGGER.info(
                 "[yanDebug][02-流任务执行][streaming.py][AgentRuntime._run_stream] "
@@ -432,6 +689,7 @@ class AgentRuntime:
             run_started = await self.application.start_run(
                 prepared, request_id=record.request_id,
             )
+            record.set_accepting_instructions(True)
             loop_result = await AgentLoop(
                 model=prepared.provider,
                 tools=self.application.tool_manager,
@@ -439,6 +697,8 @@ class AgentRuntime:
                 model_turn=stream_model_turn,
                 on_tool_start=emit_tool_start,
                 on_tool_end=emit_tool_end,
+                confirmation_handler=request_confirmation,
+                on_checkpoint=inject_pending_instructions,
             ).run(
                 messages=context.messages,
                 tool_schemas=context.tools,
@@ -448,8 +708,11 @@ class AgentRuntime:
                 permission_context=self.application.tool_permission_context(
                     prepared,
                     request_id=record.request_id,
+                    confirmation_ui_available=True,
                 ),
             )
+            record.set_accepting_instructions(False)
+            await reject_uninjected_instructions()
             if run_started:
                 await self.application.finish_run(
                     record.request_id,
@@ -476,6 +739,8 @@ class AgentRuntime:
                 len(loop_result.reply.content),
             )
         except asyncio.CancelledError:
+            record.set_accepting_instructions(False)
+            await reject_uninjected_instructions()
             if run_started:
                 await self._finish_run_after_error(
                     record.request_id,
@@ -493,6 +758,8 @@ class AgentRuntime:
                 record.request_id,
             )
         except AgentError as error:
+            record.set_accepting_instructions(False)
+            await reject_uninjected_instructions()
             if run_started:
                 await self._finish_run_after_error(
                     record.request_id,
@@ -510,6 +777,8 @@ class AgentRuntime:
                 record.request_id, error.code,
             )
         except Exception:
+            record.set_accepting_instructions(False)
+            await reject_uninjected_instructions()
             if run_started:
                 await self._finish_run_after_error(
                     record.request_id,
