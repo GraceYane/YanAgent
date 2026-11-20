@@ -300,11 +300,15 @@ class YanAgentApplication:
         return {"status": "success", "applied": config.to_dict()}
 
     async def chat(
-        self, payload: dict[str, Any], *, request_id: str | None = None,
+        self,
+        payload: dict[str, Any],
+        *,
+        request_id: str | None = None,
+        prepared: PreparedChat | None = None,
     ) -> dict[str, Any]:
-        """校验一条桌面消息，调用非流式 Provider 并返回内联完整回答。"""
+        """校验一条桌面消息，使用固定配置快照调用 Provider 并返回完整回答。"""
         request_id = request_id or f"run-{uuid.uuid4().hex}"
-        prepared = self.prepare_chat(payload)
+        prepared = prepared or self.prepare_chat(payload)
         LOGGER.info(
             "[chat.py][YanAgentApplication.chat] 开始普通聊天请求，request_id=%s，provider=%s，model=%s",
             request_id,

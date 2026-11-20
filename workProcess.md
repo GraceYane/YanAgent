@@ -1886,6 +1886,53 @@ Electron/React chatStore
 - P05-02：身份范围路由、同一 Session 排队、不同 Session 并发及排队取消语义。
 - P05-03 以后：运行控制、上下文预算、重试与恢复。
 
+## 2026-11-20：P05-02 身份与并发
+
+### 实际完成的内容
+
+- `AgentBridge` 按 `(user_id, agent_id)` 创建并缓存运行实例；非默认身份使用独立的 `SessionStore` 和 `RunStore`，复用数据库、模型配置、Provider 工厂、工具目录和上下文构建器。
+- 流式和非流式聊天统一按 `(user_id, agent_id, session_id)` 进入 Runtime 异步队列。同一完整键串行执行；不同 Session 或身份键可分别推进，不共用队列锁。
+- 非流式请求在入队前生成 `PreparedChat`，请求的配置与 Provider 快照不会因排队期间修改配置而变化。
+- 流式 `RunRecord` 增加 queued/running/terminal 状态。在锁前取消会完成为 `cancelled_before_start`，不进入模型/工具循环；运行中取消继续走已有协程取消路径。`/cancel` 返回总取消数及排队/运行中分类字段。
+- Bridge 对事件读取和取消只查询已有身份实例，不因无效查询新建实例；身份范围分开后，跨身份读取不到对方 Run。
+- 桌面 HTTP 入口仍固定为本地 `local/default`；标准 Bridge `RunRequest` 可以选择路由身份，但该字段不是身份认证凭证。
+- 更新 P05 阶段状态，新增 `docs/P05_02_IDENTITY_CONCURRENCY.md`，并修正 P05-01 文档中的后续阶段说明。
+
+### 涉及的文件
+
+- `yanagent/runtime/bridge.py`
+- `yanagent/runtime/streaming.py`
+- `yanagent/chat.py`
+- `app.py`
+- `docs/DEVELOPMENT_REQUIREMENTS.md`
+- `docs/IMPLEMENTATION_ROADMAP.md`
+- `docs/P05_01_BRIDGE.md`
+- `docs/P05_02_IDENTITY_CONCURRENCY.md`
+- `workProcess.md`
+
+### 验证结果
+
+- `python -X utf8 -m compileall -q app.py yanagent` 通过，确认 Python 文件可编译。
+- 未新增或运行自动化测试，也未启动桌面或进行双模型/真实并发联调；同会话顺序、不同会话并发、身份仓储隔离和取消竞态目前是实现，不应描述为已通过行为验证。
+- 桌面 HTTP 接口仍只路由 `local/default`。没有新增用户认证或开放客户端自报 user_id；其他身份隔离目前通过 Bridge API 和各自仓储实现。
+
+### 岗位要求关联与实践证据
+
+- 对应 `docs/TARGET_ROLES.md` 的 Session/上下文数据隔离及路由/任务调度条目：缓存键包含 user/agent，队列键再加入 session，数据库仓储也按身份作用域创建；取消记录并反馈排队与运行中两种阶段。
+- 当前证据是实现和 Python 编译结果；没有并发运行测试，不能声称已实测避免消息交错或具备线上多租户认证。
+- 面试可讲的设计点：以身份作用域拆分 Runtime 与持久化仓储，以三元组队列键保证同 Session 串行；锁只在等待期间阻塞同键任务，不同键在同一事件循环中并发让出执行。
+
+### 难点评分
+
+整体难度：**8/10**。主要难点是让非流式与流式共享同一 Session 顺序，同时让不同 Session 并发，并正确处理取消和拿锁之间的竞态。Runtime 在自己的事件循环内按完整三元组管理异步锁；RunRecord 用条件锁原子读取/切换状态，取消时记录生效前状态，据此反馈排队取消或运行中取消。流式任务在拿到 Session 锁后才把 RunRecord 切换到 running；排队阶段被取消会生成未启动终态。身份实例用 scoped stores 避免同名 Session 跨用户共用历史。
+
+### 尚未完成的事项
+
+- 补并运行同 Session 顺序、不同 Session 并发、用户/Agent 仓储隔离、取消排队/运行任务及 HTTP 响应兼容的行为测试。
+- 当前取消分类是基于流式 RunRecord；非流式同步 HTTP 请求仍未注册可取消的 RunRecord，非流式请求的显式取消跟踪留给 P05-03。
+- 多用户 HTTP 身份认证未实现；接入远程入口前必须由可信身份层构造 RunRequest。
+- P05-03：完整任务控制、工具取消传播、追加指令安全检查点和批准/拒绝 UI。
+
 ### 后续事项
 
 - 下一项严格执行 P05-01：将 P01 临时任务管理收口为正式 AgentBridge，明确任务、配置快照、实例缓存、事件订阅和资源释放边界。

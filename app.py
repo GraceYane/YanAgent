@@ -478,10 +478,10 @@ class YanAgentHandler(BaseHTTPRequestHandler):
                     raise RequestValidationError(reason="invalid", field="session_id")
                 if request_value is None and session_value is None:
                     raise RequestValidationError(reason="missing", field="request_id")
-                cancelled = self.runtime.cancel(
+                cancellation = self.runtime.cancel_with_details(
                     request_id=request_value, session_id=session_value,
                 )
-                self._json({"status": "success", "cancelled": cancelled})
+                self._json({"status": "success", **cancellation})
                 return
             self._json({
                 "status": "not_implemented",

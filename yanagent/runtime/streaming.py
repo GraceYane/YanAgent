@@ -38,6 +38,7 @@ class RunRecord:
     _terminal: bool = field(default=False, repr=False)
     _finished_at: float | None = field(default=None, repr=False)
     _cancel_requested: bool = field(default=False, repr=False)
+    _state: str = field(default="queued", repr=False)
     _future: concurrent.futures.Future[None] | None = field(default=None, repr=False)
     _condition: threading.Condition = field(default_factory=threading.Condition, repr=False)
 
@@ -65,6 +66,7 @@ class RunRecord:
             self._events.append(event)
             if event.terminal:
                 self._terminal = True
+                self._state = "terminal"
                 self._finished_at = time.monotonic()
             self._condition.notify_all()
             return event
@@ -80,9 +82,14 @@ class RunRecord:
 
     def cancel(self) -> bool:
         """请求取消活动任务；重复取消或已结束返回 False。"""
+        return self.request_cancel() is not None
+
+    def request_cancel(self) -> str | None:
+        """原子记录取消并返回取消生效前的状态，终态或重复取消返回 None。"""
         with self._condition:
             if self._terminal or self._cancel_requested:
-                return False
+                return None
+            previous_state = self._state
             self._cancel_requested = True
             future = self._future
         if future is not None:
@@ -90,15 +97,35 @@ class RunRecord:
         timer = threading.Timer(0.1, self._ensure_cancel_terminal)
         timer.daemon = True
         timer.start()
-        return True
+        return previous_state
+
+    def mark_running(self) -> bool:
+        """在获得会话队列后原子切换为运行态；已取消任务不能启动。"""
+        with self._condition:
+            if self._terminal or self._cancel_requested:
+                return False
+            self._state = "running"
+            return True
+
+    @property
+    def state(self) -> str:
+        """读取排队、运行或终态，供取消逻辑区分任务所处阶段。"""
+        with self._condition:
+            return self._state
 
     def _ensure_cancel_terminal(self) -> None:
         """兜底处理协程尚未进入函数体便取消的竞态，避免订阅者永久等待。"""
         if not self.terminal:
+            queued = self.state == "queued"
             try:
-                self.append("cancelled", {"content": ""})
+                self.append("cancelled", {
+                    "content": "",
+                    **({"reason": "cancelled_while_queued"} if queued else {}),
+                })
                 self.append("done", {
-                    "content": "", "finish_reason": "cancelled", "usage": {},
+                    "content": "",
+                    "finish_reason": "cancelled_before_start" if queued else "cancelled",
+                    "usage": {},
                 })
             except RuntimeError:
                 # 正常取消分支可能刚好先写入终态。
@@ -133,6 +160,7 @@ class AgentRuntime:
         self._close_lock = threading.Lock()
         self._runs_lock = threading.RLock()
         self._runs: dict[str, RunRecord] = {}
+        self._session_queues: dict[tuple[str, str, str], tuple[asyncio.Lock, int]] = {}
         self._thread = threading.Thread(
             target=self._run_loop, name="yanagent-async-runtime", daemon=True,
         )
@@ -153,12 +181,28 @@ class AgentRuntime:
         self._loop.run_until_complete(self._loop.shutdown_asyncgens())
         self._loop.close()
 
-    def complete(self, payload: dict[str, Any], *, request_id: str) -> dict[str, Any]:
+    def complete(
+        self,
+        payload: dict[str, Any],
+        *,
+        request_id: str,
+        queue_key: tuple[str, str, str] | None = None,
+    ) -> dict[str, Any]:
         """在常驻循环中执行非流式调用，替代每个请求临时 ``asyncio.run``。"""
         self._ensure_open()
-        timeout = self.application.load_config().request_timeout
+        prepared = self.application.prepare_chat(payload)
+        selected_queue_key = queue_key or (
+            "local", "default", prepared.session_id,
+        )
+        timeout = prepared.config.request_timeout
         future = asyncio.run_coroutine_threadsafe(
-            self.application.chat(payload, request_id=request_id), self._loop,
+            self._run_in_session_queue(
+                self.application.chat(
+                    payload, request_id=request_id, prepared=prepared,
+                ),
+                selected_queue_key,
+            ),
+            self._loop,
         )
         try:
             return future.result(timeout=timeout + 1.0)
@@ -185,7 +229,13 @@ class AgentRuntime:
             future.cancel()
             raise SessionStorageError() from None
 
-    def start_stream(self, payload: dict[str, Any], *, request_id: str) -> dict[str, Any]:
+    def start_stream(
+        self,
+        payload: dict[str, Any],
+        *,
+        request_id: str,
+        queue_key: tuple[str, str, str] | None = None,
+    ) -> dict[str, Any]:
         """校验后登记运行并调度流任务，立即返回供桌面端订阅的 request_id。"""
         self._ensure_open()
         prepared = self.application.prepare_chat(payload)
@@ -195,7 +245,10 @@ class AgentRuntime:
             if request_id in self._runs:
                 raise ValueError("request_id 不能重复")
             self._runs[request_id] = record
-        future = asyncio.run_coroutine_threadsafe(self._run_stream(record, prepared), self._loop)
+        selected_queue_key = queue_key or ("local", "default", prepared.session_id)
+        future = asyncio.run_coroutine_threadsafe(
+            self._run_stream_queued(record, prepared, selected_queue_key), self._loop,
+        )
         record.attach_future(future)
         LOGGER.info(
             "[yanDebug][02-流任务登记][streaming.py][AgentRuntime.start_stream] "
@@ -206,6 +259,76 @@ class AgentRuntime:
             "status": "success", "request_id": request_id, "stream": True,
             "speaker": "default", "received_session_id": prepared.session_id,
         }
+
+    async def _run_in_session_queue(
+        self,
+        operation: Coroutine[Any, Any, ResultType],
+        queue_key: tuple[str, str, str],
+    ) -> ResultType:
+        """按完整身份和 Session 键串行执行操作，不同键可并行推进。"""
+        lock, users = self._session_queues.get(queue_key, (asyncio.Lock(), 0))
+        self._session_queues[queue_key] = (lock, users + 1)
+        started = False
+        try:
+            async with lock:
+                started = True
+                return await operation
+        finally:
+            if not started:
+                operation.close()
+            current_lock, current_users = self._session_queues[queue_key]
+            if current_users <= 1:
+                del self._session_queues[queue_key]
+            else:
+                self._session_queues[queue_key] = (current_lock, current_users - 1)
+
+    async def _run_stream_queued(
+        self,
+        record: RunRecord,
+        prepared: PreparedChat,
+        queue_key: tuple[str, str, str],
+    ) -> None:
+        """排队等待会话锁，取消等待任务时写入明确的未启动终态。"""
+        lock, users = self._session_queues.get(queue_key, (asyncio.Lock(), 0))
+        self._session_queues[queue_key] = (lock, users + 1)
+        try:
+            async with lock:
+                if not record.mark_running():
+                    self._finish_queued_cancel(record)
+                    return
+                LOGGER.info(
+                    "[streaming.py][AgentRuntime._run_stream_queued] 排队任务开始运行，"
+                    "request_id=%s，session_id=%s",
+                    record.request_id, prepared.session_id,
+                )
+                await self._run_stream(record, prepared)
+        except asyncio.CancelledError:
+            self._finish_queued_cancel(record)
+        finally:
+            current_lock, current_users = self._session_queues[queue_key]
+            if current_users <= 1:
+                del self._session_queues[queue_key]
+            else:
+                self._session_queues[queue_key] = (current_lock, current_users - 1)
+
+    @staticmethod
+    def _finish_queued_cancel(record: RunRecord) -> None:
+        """为尚未启动就被取消的任务写出独立可识别的终态事件。"""
+        if record.terminal:
+            return
+        try:
+            record.append("cancelled", {
+                "content": "", "reason": "cancelled_while_queued",
+            })
+            record.append("done", {
+                "content": "", "finish_reason": "cancelled_before_start", "usage": {},
+            })
+            LOGGER.info(
+                "[streaming.py][AgentRuntime._finish_queued_cancel] 排队任务在执行前已取消，request_id=%s",
+                record.request_id,
+            )
+        except RuntimeError:
+            pass
 
     async def _run_stream(self, record: RunRecord, prepared: PreparedChat) -> None:
         """循环消费模型增量、执行完整工具调用，并转换为桌面流事件和稳定终态。"""
@@ -439,8 +562,10 @@ class AgentRuntime:
             record = self._runs.get(request_id)
         return None if record is None else record.wait(cursor, timeout)
 
-    def cancel(self, *, request_id: str | None = None, session_id: str | None = None) -> int:
-        """按 request_id 精确取消，缺少它时可取消同一会话的全部活动运行。"""
+    def cancel_with_details(
+        self, *, request_id: str | None = None, session_id: str | None = None,
+    ) -> dict[str, int]:
+        """按运行阶段分别统计取消的排队任务和运行中任务。"""
         self._sweep()
         with self._runs_lock:
             if request_id:
@@ -449,12 +574,28 @@ class AgentRuntime:
                 candidates = [run for run in self._runs.values() if run.session_id == session_id]
             else:
                 candidates = []
-        cancelled = sum(1 for run in candidates if run.cancel())
+        queued = running = 0
+        for run in candidates:
+            previous_state = run.request_cancel()
+            if previous_state is None:
+                continue
+            if previous_state == "queued":
+                queued += 1
+            else:
+                running += 1
         LOGGER.info(
-            "[streaming.py][AgentRuntime.cancel] 取消请求完成，request_id=%s，session_id=%s，数量=%d",
-            request_id or "<未提供>", session_id or "<未提供>", cancelled,
+            "[streaming.py][AgentRuntime.cancel_with_details] 取消请求完成，request_id=%s，"
+            "session_id=%s，排队取消=%d，运行中取消=%d",
+            request_id or "<未提供>", session_id or "<未提供>", queued, running,
         )
-        return cancelled
+        return {"cancelled": queued + running, "queued_cancelled": queued,
+                "running_cancelled": running}
+
+    def cancel(self, *, request_id: str | None = None, session_id: str | None = None) -> int:
+        """兼容旧接口，返回成功接受取消的任务总数。"""
+        return self.cancel_with_details(
+            request_id=request_id, session_id=session_id,
+        )["cancelled"]
 
     def _sweep(self) -> None:
         """惰性移除过期终态运行，活动任务永不因清理策略被误删。"""
