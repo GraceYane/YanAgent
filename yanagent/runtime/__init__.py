@@ -7,11 +7,15 @@ from typing import Any
 from .agent_loop import AgentLoop, AgentLoopResult
 
 
-__all__ = ["AgentLoop", "AgentLoopResult", "AgentRuntime", "RunRecord"]
+__all__ = ["AgentBridge", "AgentLoop", "AgentLoopResult", "AgentRuntime", "RunRecord"]
 
 
 def __getattr__(name: str) -> Any:
-    """按需导出流式 Runtime，同时让聊天应用可直接复用非流式 AgentLoop。"""
+    """按需导出 Bridge 和运行引擎，避免聊天应用导入时形成循环依赖。"""
+    if name == "AgentBridge":
+        from .bridge import AgentBridge
+
+        return AgentBridge
     if name in {"AgentRuntime", "RunRecord"}:
         from .streaming import AgentRuntime, RunRecord
 

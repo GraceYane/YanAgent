@@ -23,7 +23,7 @@ from yanagent.errors import (
     SessionNotFoundError,
     SessionStorageError, SessionValidationError, UnexpectedToolCallError,
 )
-from yanagent.runtime import AgentRuntime
+from yanagent.runtime import AgentBridge
 from yanagent.sessions import DesktopSessionService, RunStore, SessionStore
 from yanagent.storage import Database
 
@@ -104,12 +104,17 @@ class YanAgentHTTPServer(ThreadingHTTPServer):
             self.recovered_runs,
         )
         super().__init__(server_address, YanAgentHandler)
-        self.runtime = AgentRuntime(application)
+        self.bridge = AgentBridge(application)
+
+    @property
+    def runtime(self) -> AgentBridge:
+        """兼容旧 HTTP 路由属性名，实际统一指向 AgentBridge。"""
+        return self.bridge
 
     def server_close(self) -> None:
         """关闭监听套接字前幂等停止异步运行环境及其中的活动任务。"""
-        if hasattr(self, "runtime"):
-            self.runtime.close()
+        if hasattr(self, "bridge"):
+            self.bridge.close()
         super().server_close()
 
 
@@ -124,9 +129,9 @@ class YanAgentHandler(BaseHTTPRequestHandler):
         return cast(YanAgentHTTPServer, self.server).application
 
     @property
-    def runtime(self) -> AgentRuntime:
-        """获取该进程唯一的常驻异步运行环境。"""
-        return cast(YanAgentHTTPServer, self.server).runtime
+    def runtime(self) -> AgentBridge:
+        """获取该进程唯一的 AgentBridge 任务入口。"""
+        return cast(YanAgentHTTPServer, self.server).bridge
 
     @property
     def session_service(self) -> DesktopSessionService | None:

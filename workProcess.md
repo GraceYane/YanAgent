@@ -1841,6 +1841,51 @@ Electron/React chatStore
 - 不可以表述：一次 `deepseek-flash` 时间工具成功代表所有模型、工具或多工具组合都具有同等可靠性；Fake Provider 测试仍是确定性失败矩阵的主要证据。
 - 本次没有启动桌面做截图式视觉验收；证据是前端事件代码、HTTP 历史契约测试和 renderer/main 生产构建。视觉样式仍可由用户在正常桌面运行中复核，但不影响已验证的数据闭环。
 
+## 2026-11-20：P05-01 AgentBridge 收口
+
+### 实际完成的内容
+
+- 新增正式 `AgentBridge`，由 HTTP Server 持有并负责关闭；原有 `AgentRuntime` 作为内部执行引擎继续负责常驻事件循环、运行记录、SSE 事件、取消与过期清理。
+- Bridge 当前缓存一个 `("local", "default")` 实例。非默认用户或 Agent 请求返回明确的不支持错误，为 P05-02 身份路由留出扩展点。
+- 新增标准 `RunRequest → AgentBridge.dispatch() → RunResult` 非流式路径，复用现有 Agent Loop，并汇总最终正文、模型轮数、累计 Usage 和身份信息；缺少 request_id 时由 Bridge 生成。
+- 统一提供 HTTP 使用的非流式调用、流式任务登记、常驻循环协程执行、SSE 事件读取、取消和关闭方法。现有 HTTP 请求/响应格式保持不变，Handler 的旧 `runtime` 属性名兼容指向 Bridge。
+- 流式任务仍由运行引擎在开始时准备并固定 `PreparedChat` 配置与 Provider 快照；Bridge 负责统一入口和实例生命周期，不改变任务中的配置快照语义。
+- 更新 P05-01 状态及路线图，并新增 `docs/P05_01_BRIDGE.md` 说明范围边界。
+
+### 涉及的文件
+
+- `yanagent/runtime/bridge.py`
+- `yanagent/runtime/__init__.py`
+- `yanagent/runtime/streaming.py`（本次未修改；作为 Bridge 内部运行引擎）
+- `app.py`
+- `yanagent/errors.py`
+- `docs/P05_01_BRIDGE.md`
+- `docs/DEVELOPMENT_REQUIREMENTS.md`
+- `docs/IMPLEMENTATION_ROADMAP.md`
+- `workProcess.md`
+
+### 验证结果
+
+- 本次未新增或运行自动化测试；未做启动、HTTP/SSE 或真实模型联调。
+- 工作区在本次操作前已有 `README.md` 修改和 `.yan-loop-test-7_8fk6sw/data/yanagent.db` 删除，本次未触碰这些既有变更。
+- 当前实现按 P05-01 收口，不能据此宣称同 Session 排队、身份隔离或并发控制已经验证；这些仍属于 P05-02。
+
+### 岗位要求关联与实践证据
+
+- 对应 `docs/TARGET_ROLES.md` 的“Agent 核心闭环”和“路由、任务调度与多入口”：增加统一 Bridge 调度边界，连接标准 Run 契约、运行实例、任务入口、事件订阅和资源关闭。
+- 当前可证明的是代码结构已从 HTTP 直接持有 Runtime 改为持有 Bridge；自动化和运行证据尚未补充，不声称并发稳定性、身份隔离或多 Agent 已具备。
+- 面试可讲实现取舍：先用 Bridge 组合既有 Runtime，保持桌面 HTTP/SSE 协议兼容，逐步把任务入口和生命周期迁入统一边界；身份路由与排队策略留给单独阶段。
+
+### 难点评分
+
+整体难度：**6/10**。难点是既要为标准 `RunRequest/RunResult` 提供真正可调用的 Bridge 入口，又不能让本次架构调整破坏已运行的 HTTP/SSE 调用面。实现上由 Bridge 组合单个 Runtime，并集中转发任务、事件、取消和关闭；Server 改为持有 Bridge，Handler 保留原有 `runtime` 属性访问形式。缓存目前只有一个默认身份项，所以它是生命周期收口，不是完整身份路由。
+
+### 尚未完成的事项
+
+- 为 `dispatch`、默认身份限制、Bridge 关闭/重复关闭及 HTTP/SSE 兼容补行为测试并运行。
+- P05-02：身份范围路由、同一 Session 排队、不同 Session 并发及排队取消语义。
+- P05-03 以后：运行控制、上下文预算、重试与恢复。
+
 ### 后续事项
 
 - 下一项严格执行 P05-01：将 P01 临时任务管理收口为正式 AgentBridge，明确任务、配置快照、实例缓存、事件订阅和资源释放边界。

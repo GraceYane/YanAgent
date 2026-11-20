@@ -11,7 +11,7 @@ CONFIG_FIELDS = frozenset({
 })
 REQUEST_FIELDS = frozenset({
     "body", "session_id", "message", "stream", "attachments", "is_voice",
-    "agent_id", "speaker_agent_id", "updates", "action", "provider_id",
+    "user_id", "agent_id", "speaker_agent_id", "updates", "action", "provider_id",
     "capability", "model",
 })
 

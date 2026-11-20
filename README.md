@@ -80,6 +80,16 @@ npm install
 npm run dev
 ```
 
+后端在 PyCharm 里启动并停在调试状态后，**另开一个终端**启动桌面前端：
+
+```powershell
+cd C:\Users\1\Documents\ChatGPT\langgraph\code\YanAgent\desktop
+npm run dev:external
+```
+
+它会启动 Electron 桌面端，并连接你已经在 PyCharm 里启动的外部后端。调试时先启动后端，再运行这个命令。
+
+
 桌面端会自动从上一级目录启动 `app.py`。已有 `node_modules` 时，后续只需要执行 `npm run dev`。
 
 ## 推荐开发顺序
