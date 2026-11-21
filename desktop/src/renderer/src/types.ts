@@ -625,10 +625,12 @@ export interface ContextUsage {
   /** system + tools + history. May exceed `limit`: tool schemas are not budgeted. */
   used?: number
   messages?: number
+  reserved_output_tokens?: number
   breakdown?: {
     system: number
     tools: number
     history: number
+    memory?: number
     free: number
   }
 }

@@ -19,6 +19,7 @@ from yanagent.contracts import (
     Usage,
     validate_conversation,
 )
+from yanagent.context import estimate_context_usage, trim_complete_turns
 from yanagent.debug_log import yan_debug
 from yanagent.errors import (
     AgentLoopConsecutiveFailuresError,
@@ -26,6 +27,7 @@ from yanagent.errors import (
     AgentLoopTimeoutError,
     EmptyModelResponseError,
     ModelResponseError,
+    RequestValidationError,
 )
 from yanagent.models.provider import ModelProvider
 from yanagent.sessions.store import SessionStore
@@ -170,12 +172,30 @@ class AgentLoop:
         request_id: str,
         permission_mode: str,
         permission_context: ToolPermissionContext,
+        initial_usage: Usage | None = None,
+        context_window_tokens: int = 64_000,
+        reserved_output_tokens: int = 4_000,
+        max_context_turns: int = 20,
     ) -> AgentLoopResult:
         """在总超时内循环模型和工具，直到最终回答或稳定限制错误。"""
         selected_session = _identifier(session_id, "session_id")
         selected_request = _identifier(request_id, "request_id")
         if not isinstance(permission_context, ToolPermissionContext):
             raise TypeError("permission_context 必须是 ToolPermissionContext")
+        if initial_usage is not None:
+            try:
+                ModelReply(content="", usage=deepcopy(initial_usage))
+            except (ContractValidationError, TypeError):
+                raise ValueError("initial_usage 必须是合法 Token 用量对象") from None
+        if type(context_window_tokens) is not int or context_window_tokens < 1_024:
+            raise ValueError("context_window_tokens 必须至少为 1024")
+        if (
+            type(reserved_output_tokens) is not int
+            or not 0 <= reserved_output_tokens < context_window_tokens
+        ):
+            raise ValueError("reserved_output_tokens 必须小于上下文窗口")
+        if type(max_context_turns) is not int or max_context_turns < 1:
+            raise ValueError("max_context_turns 必须是正整数")
         if not isinstance(messages, (list, tuple)) or not messages:
             raise ValueError("messages 必须是非空列表或元组")
         if not isinstance(tool_schemas, (list, tuple)):
@@ -210,6 +230,10 @@ class AgentLoop:
             permission_mode=permission_mode,
             permission_context=permission_context,
             deadline=deadline,
+            initial_usage={} if initial_usage is None else deepcopy(initial_usage),
+            context_window_tokens=context_window_tokens,
+            reserved_output_tokens=reserved_output_tokens,
+            max_context_turns=max_context_turns,
         )
 
     async def _run_loop(
@@ -222,10 +246,14 @@ class AgentLoop:
         permission_mode: str,
         permission_context: ToolPermissionContext,
         deadline: float,
+        initial_usage: Usage,
+        context_window_tokens: int,
+        reserved_output_tokens: int,
+        max_context_turns: int,
     ) -> AgentLoopResult:
         """执行已校验的内部循环；同轮调用顺序执行并保持完整消息配对。"""
         turns = 0
-        usage: Usage = {}
+        usage: Usage = deepcopy(initial_usage)
         consecutive_failures = 0
 
         while True:
@@ -244,16 +272,24 @@ class AgentLoop:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 self._raise_total_timeout(request_id)
+            request_messages = self._fit_model_context(
+                working,
+                schemas,
+                request_id=request_id,
+                context_window_tokens=context_window_tokens,
+                reserved_output_tokens=reserved_output_tokens,
+                max_context_turns=max_context_turns,
+            )
             yan_debug(
                 "agent_loop.py",
                 "AgentLoop.run",
                 "准备发送模型轮次",
-                messages=working,
+                messages=request_messages,
                 tools=schemas,
             )
             try:
                 reply = await asyncio.wait_for(
-                    self.model_turn(working, schemas),
+                    self.model_turn(request_messages, schemas),
                     timeout=remaining,
                 )
             except (TimeoutError, asyncio.TimeoutError):
@@ -416,12 +452,23 @@ class AgentLoop:
                         call.name,
                     )
                     try:
+                        current_usage = estimate_context_usage(
+                            messages=working,
+                            tools=schemas,
+                            reserved_output=reserved_output_tokens,
+                        )
+                        available_result_tokens = max(
+                            0,
+                            context_window_tokens - current_usage.total_tokens - 16,
+                        )
+                        max_result_chars = int(available_result_tokens / 1.08)
                         result = await asyncio.wait_for(
                             self.tools.execute(
                                 call,
                                 permission_mode=permission_mode,
                                 permission_context=permission_context,
                                 confirmation_handler=self.confirmation_handler,
+                                max_result_chars=max_result_chars,
                             ),
                             timeout=remaining,
                         )
@@ -502,6 +549,65 @@ class AgentLoop:
                     self.max_consecutive_tool_failures,
                 )
                 raise AgentLoopConsecutiveFailuresError()
+
+    def _fit_model_context(
+        self,
+        messages: list[Message],
+        schemas: list[dict[str, Any]],
+        *,
+        request_id: str,
+        context_window_tokens: int,
+        reserved_output_tokens: int,
+        max_context_turns: int,
+    ) -> list[Message]:
+        """每轮请求前按预算裁剪完整旧轮次，不改写 AgentLoop 的持久化历史。"""
+        current = estimate_context_usage(
+            messages=messages,
+            tools=schemas,
+            reserved_output=reserved_output_tokens,
+        )
+        turns = [message for message in messages if message.role != "system"]
+        turn_count = sum(message.role == "user" for message in turns)
+        if current.total_tokens <= context_window_tokens and turn_count <= max_context_turns:
+            return messages
+
+        system_messages = [message for message in messages if message.role == "system"]
+        history_messages = [message for message in messages if message.role != "system"]
+        fixed = estimate_context_usage(
+            messages=system_messages,
+            tools=schemas,
+            reserved_output=reserved_output_tokens,
+        ).total_tokens
+        history_budget = max(0, context_window_tokens - fixed)
+        selected = trim_complete_turns(
+            history_messages,
+            token_budget=history_budget,
+            max_turns=max_context_turns,
+        )
+        bounded = [*system_messages, *selected]
+        try:
+            validate_conversation(bounded)
+        except ContractValidationError:
+            raise ModelResponseError() from None
+        final_usage = estimate_context_usage(
+            messages=bounded,
+            tools=schemas,
+            reserved_output=reserved_output_tokens,
+        )
+        if final_usage.total_tokens > context_window_tokens:
+            LOGGER.warning(
+                "[agent_loop.py][AgentLoop._fit_model_context] 当前完整轮次仍超过上下文预算，"
+                "request_id=%s，估算=%d，窗口=%d",
+                request_id, final_usage.total_tokens, context_window_tokens,
+            )
+            raise RequestValidationError(reason="too_large", field="message")
+        LOGGER.info(
+            "[agent_loop.py][AgentLoop._fit_model_context] 本轮模型输入已按完整轮次裁剪，"
+            "request_id=%s，估算 Token=%d，窗口=%d，消息数=%d→%d",
+            request_id, final_usage.total_tokens, context_window_tokens,
+            len(messages), len(bounded),
+        )
+        return bounded
 
     def _raise_total_timeout(self, request_id: str) -> None:
         """记录统一总超时日志并抛出稳定错误，不暴露正在处理的消息内容。"""

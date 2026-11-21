@@ -16,6 +16,7 @@ import ContextUsageDonut, {
 const LEGEND: { key: ContextSliceKey; labelKey: string }[] = [
   { key: 'system', labelKey: 'ctx_system' },
   { key: 'tools', labelKey: 'ctx_tools' },
+  { key: 'memory', labelKey: 'ctx_memory' },
   { key: 'history', labelKey: 'ctx_history' },
   { key: 'free', labelKey: 'ctx_free' },
 ]
@@ -247,7 +248,7 @@ const ContextUsagePopover: React.FC<ContextUsagePopoverProps> = ({
   const used = usage?.used ?? 0
   const percent = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0
   const miniSlices = hasCtx
-    ? LEGEND.map((l) => ({ key: l.key, value: breakdown![l.key] }))
+    ? LEGEND.map((l) => ({ key: l.key, value: breakdown![l.key] || 0 }))
     : undefined
 
   return (
@@ -316,7 +317,7 @@ const ContextUsagePopover: React.FC<ContextUsagePopoverProps> = ({
                 <div className="flex justify-center mb-2">
                   <ContextUsageDonut
                     percent={percent}
-                    slices={LEGEND.map((l) => ({ key: l.key, value: breakdown![l.key] }))}
+                    slices={LEGEND.map((l) => ({ key: l.key, value: breakdown![l.key] || 0 }))}
                   />
                 </div>
                 <div className="space-y-1">
@@ -327,7 +328,7 @@ const ContextUsagePopover: React.FC<ContextUsagePopoverProps> = ({
                         style={{ background: CONTEXT_SLICE_COLORS[l.key] }}
                       />
                       <span className="text-content-secondary flex-1 truncate">{t(l.labelKey)}</span>
-                      <span className="text-content tabular-nums">{formatTokens(breakdown![l.key])}</span>
+                      <span className="text-content tabular-nums">{formatTokens(breakdown![l.key] || 0)}</span>
                     </div>
                   ))}
                 </div>
@@ -335,6 +336,12 @@ const ContextUsagePopover: React.FC<ContextUsagePopoverProps> = ({
                   {t('ctx_used_of')
                     .replace('{used}', formatTokens(used))
                     .replace('{limit}', formatTokens(limit))}
+                  <div>
+                    {t('ctx_reserved_output').replace(
+                      '{tokens}',
+                      formatTokens(usage?.reserved_output_tokens ?? 0),
+                    )}
+                  </div>
                 </div>
 
                 {/* Actions */}

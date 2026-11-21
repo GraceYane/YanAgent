@@ -1993,5 +1993,63 @@ Electron/React chatStore
 
 - 补并运行确认批准/拒绝、确认等待中取消、工具执行中取消、最终回复边界追加、结束后追加被拒绝等行为测试。
 - 如果提供非流式桌面模式，先让调用方在发起请求前拿到 Run ID，再实现同一任务取消入口。
-- 下一项为 P05-04：上下文 Token 预算和压缩。
+- P05-04 已实现上下文预算；下一项为 P05-05：故障处理。
+
+## 2026-11-20：P05-04 上下文预算
+
+### 实际完成的内容
+
+- 在统一上下文层按 UTF-8 字节启发式估算系统提示、工具 Schema、对话消息、历史摘要和输出预留，并按完整 User 轮次分组。裁剪从最旧完整轮次开始，保留最新输入及其 Assistant/Tool 调用链，不修改时间线原文。
+- 新增配置化的上下文窗口、最大历史轮数和 Agent 模型轮数设置，并映射到桌面现有设置字段；默认估算窗口为 64,000 Token，默认输出预留为 4,000 Token。
+- 新聊天在预算或轮数超限时尝试让当前 Provider 总结被裁掉的完整旧轮次，将摘要边界和文本以 Session 元数据事务保存。摘要失败时本次请求降级为旧轮次裁剪，并保留原有历史及已有摘要。
+- AgentLoop 每轮模型请求前独立按窗口和轮数再次裁剪完整历史；工具执行前根据剩余输入预算向 ToolManager 传动态结果字符上限，结果不足以保留最低回写空间时不执行工具，避免产生无法写回上下文的副作用。
+- SessionStore 增加上下文状态读取/保存、清空边界和获取模型上下文历史的能力。清空只改变模型可见的上下文起点，不删除桌面历史；手动压缩保留最近两轮和全部原始记录。
+- 增加用量查询、上下文清空、手动摘要 HTTP 入口，并让桌面用量卡片显示系统提示、工具、历史、摘要记忆、可用输入预算和预留输出。
+- 自动摘要的模型用量并入随后 AgentLoop 的 Run 累计 Usage。手动摘要没有关联活动 Run，因此其 Token 用量当前不写入 Run 记录。
+
+### 涉及的文件
+
+- `app.py`
+- `yanagent/chat.py`
+- `yanagent/config/settings.py`
+- `yanagent/context.py`
+- `yanagent/errors.py`
+- `yanagent/runtime/agent_loop.py`
+- `yanagent/runtime/streaming.py`
+- `yanagent/sessions/store.py`
+- `yanagent/tools/manager.py`
+- `desktop/src/renderer/src/components/ContextUsageDonut.tsx`
+- `desktop/src/renderer/src/components/ContextUsagePopover.tsx`
+- `desktop/src/renderer/src/i18n.ts`
+- `desktop/src/renderer/src/types.ts`
+- `docs/DEVELOPMENT_REQUIREMENTS.md`
+- `docs/IMPLEMENTATION_ROADMAP.md`
+- `docs/P05_03_TASK_CONTROL.md`
+- `docs/P05_04_CONTEXT_BUDGET.md`
+- `workProcess.md`
+
+### 验证结果
+
+- `python -X utf8 -m compileall -q app.py yanagent` 通过；`git diff --check` 通过，仅有 Git 的 LF/CRLF 提示。
+- 尝试运行桌面 Renderer 构建，但 Vite/esbuild 无法读取其计算出的上级目录（`Access is denied`），因此前端生产构建未完成。这不表示前端构建成功。
+- 未新增或运行自动化测试，也未连接真实模型、调用工具、重启后检查摘要边界或实际操作桌面上下文卡片。
+- Token 数是每三字节约一个 Token 并加 8% 余量的启发式估算，不保证等于任何模型的 tokenizer 数；64,000 是应用默认值，不是模型服务商给出的真实上下文窗口。Provider 暂无统一输出 Token 限额参数。
+- 工具结果在 handler 返回之后截断，无法约束 handler 产生大结果时的临时峰值内存。行为验证仍需覆盖摘要成功/失败、清空后新消息、结果截断、轮次配对、上下文配置和身份隔离。
+- 保留工作区已有改动：`.yan-loop-test-7_8fk6sw/data/yanagent.db` 的删除状态没有恢复或覆盖。
+
+### 岗位要求关联与实践证据
+
+- 对应 `docs/TARGET_ROLES.md` 中“Session、上下文和数据隔离”（XM-职责1～2、DYG-职责2、DYQ-职责2）以及“性能与 Token 成本”（XM-职责7、DYG-职责1～2、TX-职责3）。实现将完整历史与模型上下文快照分开管理，摘要状态按 Session 持久化，并对输入、工具 Schema 与工具结果设置预算边界。
+- 证据限于代码静态编译与 diff 空白检查。没有 tokenizer 精确对照、Token 成本基线、压缩率、延迟或行为测试数据，不能声称已实际降低成本或完成运行稳定性验证。
+- 面试可讲的实现点：以完整 User 轮次为裁剪单位，避免把 Assistant 的 ToolCall 与 Tool Result 拆开；清空/压缩通过摘要边界和 Session 元数据实现，不破坏原始历史；模型调用前和工具结果回写前各做一次预算检查。
+
+### 难点评分
+
+整体难度：**9/10**。最难的是在“保留可回看的完整历史”和“限制每轮模型实际输入”之间划清边界，同时不能裁出半个工具调用循环。实现上用 Session 元数据记录摘要涵盖到的序号，用 User 消息划分完整对话轮次，模型请求只接收裁剪后的副本；每轮 AgentLoop 因工具调用而增加消息后重新估算，工具结果再根据剩余预算截断。另一个难点是预算统计横跨系统提示、独立 Schema、对话、摘要和输出预留；当前用明确标注的字节启发式保证无需绑定供应商 Tokenizer，但因此要坦诚保留估算误差边界。
+
+### 后续事项
+
+- 补并运行自动摘要成功/超时/空摘要降级、Session 摘要状态重启持久化、清空后新消息、单/多工具循环结果截断及预算不足不执行、配置边界与多身份隔离等行为测试。
+- 解决 Renderer 构建在当前受限环境中的上级目录读取问题，再完成 UI 构建与桌面交互验证。
+- 下一项按计划推进 P05-05：空响应策略、限流重试与退避、重复调用保护和连接断开处理。
 

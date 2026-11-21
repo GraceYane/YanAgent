@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from yanagent.contracts import ContractValidationError, Message
+from yanagent.context import trim_complete_turns
 from yanagent.errors import (
     AgentError,
     MessageNotFoundError,
@@ -310,8 +311,65 @@ class SessionStore:
         )
 
     async def context(self, session_id: str, *, token_budget: int) -> list[Message]:
-        """P05-04 才实现 Token 预算裁剪；P02-03 使用完整历史组装模型输入。"""
-        raise NotImplementedError("P05-04 将实现按 Token 预算选择模型上下文")
+        """按 Token 上限裁剪模型上下文，不改写或删除完整持久化历史。"""
+        if type(token_budget) is not int or token_budget < 0:
+            raise SessionValidationError()
+        state = await self.context_state(session_id)
+        start_sequence = max(
+            state["context_start_sequence"], state["summary_through_sequence"] + 1
+        )
+        records = await self.complete_history(session_id)
+        history = [
+            record.message for record in records if record.sequence >= start_sequence
+        ]
+        return trim_complete_turns(history, token_budget=token_budget)
+
+    async def context_state(self, session_id: str) -> dict[str, Any]:
+        """读取保存在 Session 元数据中的上下文清理边界和历史摘要。"""
+        record = await self.get(session_id)
+        context = record.metadata.get("context_state", {})
+        if type(context) is not dict:
+            raise SessionStorageError()
+        start = context.get("context_start_sequence", 0)
+        summarized = context.get("summary_through_sequence", -1)
+        summary = context.get("summary", "")
+        if (
+            type(start) is not int or start < 0
+            or type(summarized) is not int or summarized < -1
+            or type(summary) is not str
+        ):
+            raise SessionStorageError()
+        return {
+            "context_start_sequence": start,
+            "summary_through_sequence": summarized,
+            "summary": summary,
+        }
+
+    async def update_context_state(
+        self,
+        session_id: str,
+        *,
+        context_start_sequence: int,
+        summary_through_sequence: int,
+        summary: str,
+    ) -> None:
+        """事务性更新 Session 的摘要快照和上下文起始边界。"""
+        if (
+            type(context_start_sequence) is not int or context_start_sequence < 0
+            or type(summary_through_sequence) is not int or summary_through_sequence < -1
+            or type(summary) is not str or len(summary) > 50_000
+        ):
+            raise SessionValidationError()
+        await asyncio.to_thread(
+            self._update_context_state_sync,
+            _identifier(session_id), context_start_sequence,
+            summary_through_sequence, summary,
+        )
+
+    async def clear_context(self, session_id: str) -> int:
+        """将当前会话的模型上下文边界移到最新消息之后，完整历史仍保留。"""
+        selected_id = _identifier(session_id)
+        return await asyncio.to_thread(self._clear_context_sync, selected_id)
 
     async def delete(self, session_id: str) -> None:
         """删除当前作用域内的会话，关联消息由数据库外键级联删除。"""
@@ -722,6 +780,83 @@ class SessionStore:
             "[store.py][SessionStore._delete_sync] 会话及关联记录已删除，session_id=%s",
             session_id,
         )
+
+    def _update_context_state_sync(
+        self,
+        session_id: str,
+        context_start_sequence: int,
+        summary_through_sequence: int,
+        summary: str,
+    ) -> None:
+        """在事务内合并 Session 元数据并写入不可变历史的上下文快照。"""
+        try:
+            with self.database.transaction(immediate=True) as connection:
+                row = self._select_session(connection, session_id)
+                if row is None:
+                    raise SessionNotFoundError()
+                metadata = _decode_json_object(str(row["metadata_json"]))
+                metadata["context_state"] = {
+                    "context_start_sequence": context_start_sequence,
+                    "summary_through_sequence": summary_through_sequence,
+                    "summary": summary,
+                }
+                connection.execute(
+                    "UPDATE sessions SET metadata_json = ?, updated_at = ? "
+                    "WHERE user_id = ? AND agent_id = ? AND session_id = ?",
+                    (
+                        _json_object(metadata), self._timestamp(), self.user_id,
+                        self.agent_id, session_id,
+                    ),
+                )
+        except AgentError:
+            raise
+        except (sqlite3.Error, TypeError, ValueError, RecursionError) as error:
+            self._log_storage_error("_update_context_state_sync", error)
+            raise SessionStorageError() from None
+        LOGGER.info(
+            "[store.py][SessionStore._update_context_state_sync] 上下文摘要快照已保存，"
+            "session_id=%s，context_start_sequence=%d，summary_through_sequence=%d，摘要字符数=%d",
+            session_id, context_start_sequence, summary_through_sequence, len(summary),
+        )
+
+    def _clear_context_sync(self, session_id: str) -> int:
+        """原子读取会话末尾序号并清空摘要、设置新的上下文起点。"""
+        try:
+            with self.database.transaction(immediate=True) as connection:
+                row = self._select_session(connection, session_id)
+                if row is None:
+                    raise SessionNotFoundError()
+                latest = connection.execute(
+                    "SELECT MAX(sequence) FROM messages WHERE user_id = ? AND agent_id = ? "
+                    "AND session_id = ?",
+                    (self.user_id, self.agent_id, session_id),
+                ).fetchone()[0]
+                next_sequence = 0 if latest is None else int(latest) + 1
+                metadata = _decode_json_object(str(row["metadata_json"]))
+                metadata["context_state"] = {
+                    "context_start_sequence": next_sequence,
+                    "summary_through_sequence": next_sequence - 1,
+                    "summary": "",
+                }
+                connection.execute(
+                    "UPDATE sessions SET metadata_json = ?, updated_at = ? "
+                    "WHERE user_id = ? AND agent_id = ? AND session_id = ?",
+                    (
+                        _json_object(metadata), self._timestamp(), self.user_id,
+                        self.agent_id, session_id,
+                    ),
+                )
+        except AgentError:
+            raise
+        except (sqlite3.Error, TypeError, ValueError, RecursionError) as error:
+            self._log_storage_error("_clear_context_sync", error)
+            raise SessionStorageError() from None
+        LOGGER.info(
+            "[store.py][SessionStore._clear_context_sync] 模型上下文已清空但历史保留，"
+            "session_id=%s，context_start_sequence=%d",
+            session_id, next_sequence,
+        )
+        return next_sequence
 
     def _select_session(
         self, connection: sqlite3.Connection, session_id: str

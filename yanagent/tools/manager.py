@@ -287,12 +287,15 @@ class ToolManager:
         result.validate()
         return result
 
-    def _truncate_output(self, content: str) -> tuple[str, bool]:
+    def _truncate_output(
+        self, content: str, *, max_chars: int | None = None,
+    ) -> tuple[str, bool]:
         """按字符数截断工具输出，并把原始长度写入保留在上限内的标记。"""
-        if len(content) <= self.max_output_chars:
+        limit = self.max_output_chars if max_chars is None else max_chars
+        if len(content) <= limit:
             return content, False
         marker = f"\n...[工具输出已截断，原始字符数={len(content)}]"
-        prefix_length = self.max_output_chars - len(marker)
+        prefix_length = max(0, limit - len(marker))
         return content[:prefix_length] + marker, True
 
     def _consume_confirmation(
@@ -320,6 +323,7 @@ class ToolManager:
         permission_context: ToolPermissionContext | None = None,
         confirmation: ToolConfirmationResult | None = None,
         confirmation_handler: Callable[[ToolConfirmationRequest], Awaitable[ToolConfirmationResult]] | None = None,
+        max_result_chars: int | None = None,
     ) -> ToolResult:
         """校验并执行一次工具调用，把所有可预期失败转换为结构化 ToolResult。"""
         if not isinstance(call, ToolCall):
@@ -371,6 +375,14 @@ class ToolManager:
                 call_id,
             )
             return self._failure(call_id, "工具确认界面不可用。")
+        if max_result_chars is not None and (
+            type(max_result_chars) is not int or max_result_chars < 0
+        ):
+            LOGGER.warning(
+                "[manager.py][ToolManager.execute] 工具结果预算无效，call_id=%r，tool=%r",
+                call_id, call.name,
+            )
+            return self._failure(call_id, "工具结果预算不合法，本次工具未执行。")
 
         definition = self.get(call.name)
         if definition is None:
@@ -447,6 +459,18 @@ class ToolManager:
             )
             return self._failure(call_id, decision.message)
 
+        result_limit = min(
+            self.max_output_chars,
+            self.max_output_chars if max_result_chars is None else max_result_chars,
+        )
+        if result_limit < 128:
+            LOGGER.info(
+                "[manager.py][ToolManager.execute] 上下文预算不足，跳过工具执行，"
+                "call_id=%r，tool=%r，结果字符预算=%d",
+                call_id, call.name, result_limit,
+            )
+            return self._failure(call_id, "上下文剩余预算不足，本次工具未执行。")
+
         LOGGER.info(
             "[manager.py][ToolManager.execute] 开始执行工具，call_id=%r，"
             "tool=%r，timeout=%.3f",
@@ -500,7 +524,7 @@ class ToolManager:
                 type(content).__name__,
             )
             return self._failure(call_id, "工具返回了不支持的结果类型。")
-        output, truncated = self._truncate_output(content)
+        output, truncated = self._truncate_output(content, max_chars=result_limit)
         result = ToolResult(tool_call_id=call_id, content=output, is_error=False)
         result.validate()
         LOGGER.info(

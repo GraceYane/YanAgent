@@ -75,6 +75,13 @@ class AppConfig:
     api_key: str = field(default="", repr=False)
     request_timeout: float = 600.0
     permission_mode: str = "ask"
+    max_context_tokens: int = 64_000
+    max_context_turns: int = 20
+    max_agent_steps: int = 20
+    enable_thinking: bool = False
+    reasoning_effort_by_model: dict[str, str] = field(default_factory=dict)
+    subagent_enabled: bool = False
+    self_evolution_enabled: bool = False
 
     def __post_init__(self) -> None:
         """构造时统一校验类型、允许值及超时范围，不接受隐式类型转换。"""
@@ -90,6 +97,20 @@ class AppConfig:
             raise ConfigurationError(field="model_provider")
         if self.permission_mode not in {"deny", "ask", "allow"}:
             raise ConfigurationError(field="permission_mode")
+        if type(self.max_context_tokens) is not int or not 0 <= self.max_context_tokens <= 1_000_000:
+            raise ConfigurationError(field="max_context_tokens")
+        if type(self.max_context_turns) is not int or not 1 <= self.max_context_turns <= 500:
+            raise ConfigurationError(field="max_context_turns")
+        if type(self.max_agent_steps) is not int or not 1 <= self.max_agent_steps <= 999:
+            raise ConfigurationError(field="max_agent_steps")
+        for name in ("enable_thinking", "subagent_enabled", "self_evolution_enabled"):
+            if type(getattr(self, name)) is not bool:
+                raise ConfigurationError(field=name)
+        if type(self.reasoning_effort_by_model) is not dict or any(
+            type(key) is not str or not key.strip() or type(value) is not str
+            for key, value in self.reasoning_effort_by_model.items()
+        ):
+            raise ConfigurationError(field="model")
         if (
             type(self.request_timeout) not in (int, float)
             or not 0 < self.request_timeout <= 3600

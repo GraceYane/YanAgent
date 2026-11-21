@@ -5,6 +5,7 @@ import React from 'react'
 export const CONTEXT_SLICE_COLORS = {
   system: 'var(--accent-active)',
   tools: 'var(--accent)',
+  memory: 'var(--success)',
   history: 'var(--warning)',
   free: 'var(--border-strong)',
 } as const

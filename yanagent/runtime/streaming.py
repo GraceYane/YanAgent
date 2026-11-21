@@ -694,6 +694,13 @@ class AgentRuntime:
                 model=prepared.provider,
                 tools=self.application.tool_manager,
                 sessions=self.application.session_store,
+                max_model_turns=prepared.config.max_agent_steps + 1,
+                context_window_tokens=prepared.config.max_context_tokens or 64_000,
+                reserved_output_tokens=min(
+                    4_000,
+                    max(256, (prepared.config.max_context_tokens or 64_000) // 4),
+                ),
+                max_context_turns=prepared.config.max_context_turns,
                 model_turn=stream_model_turn,
                 on_tool_start=emit_tool_start,
                 on_tool_end=emit_tool_end,
@@ -710,6 +717,7 @@ class AgentRuntime:
                     request_id=record.request_id,
                     confirmation_ui_available=True,
                 ),
+                initial_usage=context.preparation_usage,
             )
             record.set_accepting_instructions(False)
             await reject_uninjected_instructions()

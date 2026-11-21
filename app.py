@@ -356,6 +356,14 @@ class YanAgentHandler(BaseHTTPRequestHandler):
                     until_sequence=until_sequence,
                 )))
                 return
+            if path.startswith("/api/sessions/") and path.endswith("/context_usage"):
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                self._validate_agent(self._query_text(query, "agent_id"))
+                session_id = self._session_id_from_path(path, suffix="/context_usage")
+                self._json(self.runtime.execute(
+                    self.application.context_usage(session_id),
+                ))
+                return
             if path == "/api/menu":
                 self._json({"status": "success", "menu": None})
                 return
@@ -432,6 +440,15 @@ class YanAgentHandler(BaseHTTPRequestHandler):
                 self._json(self.runtime.execute(self.session_service.generate_title(
                     session_id, user_message,
                 )))
+                return
+            if path.startswith("/api/sessions/") and path.endswith(("/clear_context", "/compact_context")):
+                if any(type(key) is not str or key not in {"agent_id"} for key in payload):
+                    raise RequestValidationError(reason="unknown_field", field="body")
+                self._validate_agent(payload.get("agent_id"))
+                action = "clear_context" if path.endswith("/clear_context") else "compact_context"
+                session_id = self._session_id_from_path(path, suffix=f"/{action}")
+                operation = getattr(self.application, action)(session_id)
+                self._json(self.runtime.execute(operation, timeout=180.0))
                 return
             if path == "/api/messages/delete":
                 if self.session_service is None:
