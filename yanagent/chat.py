@@ -8,7 +8,7 @@ import logging
 import threading
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from yanagent.config import AppConfig, ConfigStore, MASKED_SECRET
@@ -19,18 +19,21 @@ from yanagent.context import (
     estimate_context_usage,
     split_complete_turns,
 )
-from yanagent.contracts import Message, ModelReply
+from yanagent.contracts import Message, ModelReply, ToolResult
 from yanagent.errors import (
     AgentError,
     ConfigurationError,
     RequestValidationError,
     SessionAlreadyExistsError,
     SessionNotFoundError,
+    RunRecoveryError,
 )
 from yanagent.models import ModelProvider, OpenAICompatibleProvider
 from yanagent.runtime.agent_loop import AgentLoop
 from yanagent.sessions import RunStore, SessionStore, StoredMessage
 from yanagent.sessions.runs import TerminalRunStatus
+from yanagent.sessions.executions import ExecutionStore
+from yanagent.sessions.recovery import RecoveryService
 from yanagent.tools import ToolManager, ToolPermissionContext, register_safe_example_tools
 
 
@@ -54,6 +57,9 @@ class PreparedChat:
     message: Message
     config: AppConfig
     provider: ModelProvider
+    recovery_source: str | None = None
+    recovery_mode: str = "continue"
+    acknowledge_uncertain: bool = False
 
 
 @dataclass(frozen=True)
@@ -64,6 +70,8 @@ class ChatContext:
     tools: tuple[dict[str, Any], ...]
     user_sequence: int | None
     preparation_usage: dict[str, int | None] = field(default_factory=dict)
+    recovery_tool_attempts: dict[str, int] = field(default_factory=dict)
+    recovery_tool_results: dict[str, ToolResult] = field(default_factory=dict)
 
 
 def _require_text(
@@ -113,6 +121,11 @@ class YanAgentApplication:
         )
         self.session_store = session_store
         self.run_store = run_store
+        self.executions = None if run_store is None else ExecutionStore(run_store)
+        self.recovery = (
+            RecoveryService(run_store, session_store, self.executions)
+            if run_store is not None and session_store is not None and self.executions is not None else None
+        )
         if tool_manager is None:
             tool_manager = ToolManager()
             register_safe_example_tools(tool_manager)
@@ -332,13 +345,20 @@ class YanAgentApplication:
             prepared.config.model_provider,
             prepared.config.model or "<未配置>",
         )
-        context = await self.begin_chat(prepared, request_id=request_id)
-        run_started = await self.start_run(prepared, request_id=request_id)
+        run_started = False
         try:
+            if prepared.recovery_source is not None:
+                run_started = await self.start_recovery(prepared, request_id=request_id)
+            elif self.run_store is not None:
+                run_started = await self.run_store.mark_running(request_id, prepared.session_id)
+            context = await self.begin_chat(prepared, request_id=request_id)
+            if not run_started:
+                run_started = await self.start_run(prepared, request_id=request_id)
             loop_result = await AgentLoop(
                 model=prepared.provider,
                 tools=self.tool_manager,
                 sessions=self.session_store,
+                executions=self.executions,
                 max_model_turns=prepared.config.max_agent_steps + 1,
             ).run(
                 messages=context.messages,
@@ -351,6 +371,8 @@ class YanAgentApplication:
                     request_id=request_id,
                 ),
                 initial_usage=context.preparation_usage,
+                recovery_tool_attempts=context.recovery_tool_attempts,
+                recovery_tool_results=context.recovery_tool_results,
                 context_window_tokens=prepared.config.max_context_tokens or CONTEXT_WINDOW_TOKENS,
                 reserved_output_tokens=min(
                     RESERVED_OUTPUT_TOKENS,
@@ -423,6 +445,8 @@ class YanAgentApplication:
         """在用户消息落库后创建运行记录；无 RunStore 的离线模式返回 False。"""
         if self.run_store is None:
             return False
+        if await self.run_store.mark_running(request_id, prepared.session_id):
+            return True
         await self.run_store.create(
             request_id,
             prepared.session_id,
@@ -433,6 +457,57 @@ class YanAgentApplication:
             },
         )
         return True
+
+    async def queue_run(self, prepared: PreparedChat, *, request_id: str) -> bool:
+        """进入 Session 队列前记录 Run 和原始需求，重启后可显式恢复未启动任务。"""
+        if self.run_store is None or prepared.recovery_source is not None:
+            return False
+        prepared.config.require_model_ready()
+        await self._ensure_session(prepared.session_id)
+        await self.run_store.create(request_id, prepared.session_id, status="queued", metadata={
+            "provider": prepared.config.model_provider, "model": prepared.config.model,
+            "queued_message": prepared.message.content,
+        })
+        return True
+
+    def prepare_recovery(self, payload: dict[str, Any]) -> PreparedChat:
+        """为显式恢复构造配置快照，禁止调用方注入模型历史或越权工具结果。"""
+        _ensure_keys(payload, {"session_id", "source_request_id", "mode", "acknowledge_uncertain"})
+        if self.recovery is None:
+            raise RunRecoveryError()
+        session_id = _require_text(payload, "session_id")
+        source_id = _require_text(payload, "source_request_id")
+        mode = payload.get("mode", "continue")
+        acknowledged = payload.get("acknowledge_uncertain", False)
+        if type(mode) is not str or mode not in {"continue", "retry"} or type(acknowledged) is not bool:
+            raise RequestValidationError(reason="invalid", field="body")
+        text = (
+            "继续上次未完成的任务，使用历史里已记录的结果完成剩余部分。"
+            if mode == "continue" else
+            "重试上次任务的失败部分；只读查询可以重新获取，已完成的写操作不得重复执行。"
+        ) + "对于结果不确定的操作，请说明需要核对的内容，禁止声称成功或自动重做。"
+        prepared = self.prepare_chat({"session_id": session_id, "message": text, "stream": True})
+        prepared.config.require_model_ready()
+        return replace(prepared, recovery_source=source_id, recovery_mode=mode,
+                       acknowledge_uncertain=acknowledged)
+
+    async def start_recovery(self, prepared: PreparedChat, *, request_id: str) -> bool:
+        """在 Session 锁内原子创建恢复子 Run 与用户动作锚点，确保双击只接受一次。"""
+        if self.recovery is None or prepared.recovery_source is None:
+            raise RunRecoveryError()
+        await self.recovery.claim(
+            prepared.session_id, prepared.recovery_source, request_id, prepared.recovery_mode,
+            prepared.acknowledge_uncertain,
+            {"provider": prepared.config.model_provider, "model": prepared.config.model,
+             "recovery_message": prepared.message.content},
+        )
+        return True
+
+    async def run_diagnostics(self, session_id: str, request_id: str) -> dict[str, Any]:
+        """提供完整归属的执行诊断，隐藏不属于当前用户或 Agent 的任务。"""
+        if self.recovery is None:
+            raise RunRecoveryError()
+        return await self.recovery.describe(session_id, request_id)
 
     async def finish_run(
         self,
@@ -454,7 +529,7 @@ class YanAgentApplication:
                 status=status,
                 finish_reason=finish_reason,
                 error_code=error_code,
-                usage={} if usage is None else usage,
+                usage=usage,
             )
         except AgentError as error:
             if status == "completed":
@@ -511,7 +586,18 @@ class YanAgentApplication:
             request_id,
             prepared.session_id,
         )
+        if self.recovery is not None:
+            await self.recovery.reconcile_messages(prepared.session_id)
         stored = await self.session_store.complete_history(prepared.session_id)
+        recovery_anchor = None
+        if prepared.recovery_source is not None:
+            if not stored or stored[-1].message.role != "user" or stored[-1].message.metadata.get("request_id") != request_id:
+                raise RunRecoveryError()
+            recovery_anchor = stored.pop()
+        guard_attempts, guard_results = (
+            await self.recovery.guard_seed(prepared.session_id, prepared.recovery_source)
+            if self.recovery is not None else ({}, {})
+        )
         state = await self.session_store.context_state(prepared.session_id)
         first_sequence = max(
             state["context_start_sequence"], state["summary_through_sequence"] + 1
@@ -616,7 +702,8 @@ class YanAgentApplication:
             request_id, estimate.input_tokens, output_reserve,
             context_window, len(active_records),
         )
-        current_records = await self.session_store.append(prepared.session_id, [current])
+        current_records = ([recovery_anchor] if recovery_anchor is not None else
+                           await self.session_store.append(prepared.session_id, [current]))
         LOGGER.info(
             "[yanDebug][03-上下文已组装][chat.py][YanAgentApplication.begin_chat] "
             "统一上下文已组装且用户消息已落库，request_id=%s，session_id=%s，"
@@ -633,6 +720,8 @@ class YanAgentApplication:
             tools=assembled.tools,
             user_sequence=current_records[0].sequence,
             preparation_usage=preparation_usage,
+            recovery_tool_attempts=guard_attempts,
+            recovery_tool_results=guard_results,
         )
 
     def _assemble_model_context(

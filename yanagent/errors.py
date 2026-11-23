@@ -150,6 +150,20 @@ class RunAlreadyExistsError(AgentError):
     message = "该运行标识已存在，请重新发起任务。"
 
 
+class RunRecoveryError(AgentError):
+    """目标不属于当前会话、仍在运行、已有恢复任务或已被更新历史取代。"""
+
+    code = "run_recovery_unavailable"
+    message = "当前任务不能恢复：请确认它是本会话最新的失败、中断或取消任务，且没有已创建的恢复任务。"
+
+
+class RecoveryAcknowledgementRequiredError(AgentError):
+    """有执行结果不确定的写工具时，要求用户核对外部结果后明确确认。"""
+
+    code = "recovery_acknowledgement_required"
+    message = "存在可能已执行的写操作。请先核对外部结果再选择继续；程序不会自动重做这些操作。"
+
+
 class UnexpectedToolCallError(AgentError):
     """标识当前调用链收到工具请求，但尚未接入对应的工具循环。"""
 

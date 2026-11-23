@@ -22,6 +22,7 @@ from yanagent.errors import (
     RequestValidationError, RunAlreadyExistsError, SessionAlreadyExistsError,
     SessionNotFoundError,
     SessionStorageError, SessionValidationError, UnexpectedToolCallError,
+    RunRecoveryError, RecoveryAcknowledgementRequiredError,
 )
 from yanagent.runtime import AgentBridge
 from yanagent.sessions import DesktopSessionService, RunStore, SessionStore
@@ -60,7 +61,8 @@ def _http_status(error: AgentError) -> HTTPStatus:
         return HTTPStatus.FORBIDDEN
     if isinstance(error, (ModelNotFoundError, MessageNotFoundError, SessionNotFoundError)):
         return HTTPStatus.NOT_FOUND
-    if isinstance(error, (RunAlreadyExistsError, SessionAlreadyExistsError)):
+    if isinstance(error, (RunAlreadyExistsError, SessionAlreadyExistsError,
+                          RunRecoveryError, RecoveryAcknowledgementRequiredError)):
         return HTTPStatus.CONFLICT
     if isinstance(error, RateLimitError):
         return HTTPStatus.TOO_MANY_REQUESTS
@@ -372,6 +374,15 @@ class YanAgentHandler(BaseHTTPRequestHandler):
                     self.application.context_usage(session_id),
                 ))
                 return
+            if path.startswith("/api/sessions/") and path.endswith("/run_diagnostics"):
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                self._validate_agent(self._query_text(query, "agent_id"))
+                source_id = self._query_text(query, "request_id")
+                if not source_id:
+                    raise RequestValidationError(reason="missing", field="body")
+                session_id = self._session_id_from_path(path, suffix="/run_diagnostics")
+                self._json(self.runtime.execute(self.application.run_diagnostics(session_id, source_id)))
+                return
             if path == "/api/menu":
                 self._json({"status": "success", "menu": None})
                 return
@@ -423,6 +434,10 @@ class YanAgentHandler(BaseHTTPRequestHandler):
                 return
             if path == "/config":
                 self._json(self.application.save_config(payload))
+                return
+            if path == "/runs/recover":
+                request_id = f"run-{uuid.uuid4().hex}"
+                self._json(self.runtime.start_recovery(payload, request_id=request_id))
                 return
             if path == "/api/models":
                 self._json(self.application.save_model_action(payload))

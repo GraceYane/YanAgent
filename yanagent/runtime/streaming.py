@@ -256,12 +256,7 @@ class AgentRuntime:
         )
         timeout = prepared.config.request_timeout
         future = asyncio.run_coroutine_threadsafe(
-            self._run_in_session_queue(
-                self.application.chat(
-                    payload, request_id=request_id, prepared=prepared,
-                ),
-                selected_queue_key,
-            ),
+            self._complete_queued(payload, request_id, prepared, selected_queue_key),
             self._loop,
         )
         try:
@@ -269,6 +264,25 @@ class AgentRuntime:
         except concurrent.futures.TimeoutError:
             future.cancel()
             raise ModelTimeoutError() from None
+
+    async def _complete_queued(self, payload, request_id, prepared, queue_key):
+        """持久化普通任务排队状态，超时取消时也结束尚未启动的 Run。"""
+        try:
+            await self.application.queue_run(prepared, request_id=request_id)
+            return await self._run_in_session_queue(
+                self.application.chat(payload, request_id=request_id, prepared=prepared), queue_key,
+            )
+        except BaseException as error:
+            if self.application.run_store is not None:
+                run = await self.application.run_store.get(request_id, prepared.session_id)
+                if run is not None and run.status == "queued":
+                    await self.application.finish_run(
+                        request_id, prepared.session_id,
+                        status="cancelled" if isinstance(error, asyncio.CancelledError) else "failed",
+                        finish_reason="cancelled_before_start" if isinstance(error, asyncio.CancelledError) else "error",
+                        error_code=error.code if isinstance(error, AgentError) else None,
+                    )
+            raise
 
     def execute(
         self,
@@ -295,11 +309,14 @@ class AgentRuntime:
         *,
         request_id: str,
         queue_key: tuple[str, str, str] | None = None,
+        prepared: PreparedChat | None = None,
     ) -> dict[str, Any]:
         """校验后登记运行并调度流任务，立即返回供桌面端订阅的 request_id。"""
         self._ensure_open()
-        prepared = self.application.prepare_chat(payload)
+        prepared = prepared or self.application.prepare_chat(payload)
         self._sweep()
+        # HTTP 返回已接受之前，先保存普通任务的排队信息。
+        self.execute(self.application.queue_run(prepared, request_id=request_id))
         record = RunRecord(request_id=request_id, session_id=prepared.session_id)
         with self._runs_lock:
             if request_id in self._runs:
@@ -310,6 +327,16 @@ class AgentRuntime:
             self._run_stream_queued(record, prepared, selected_queue_key), self._loop,
         )
         record.attach_future(future)
+
+        def finish_unstarted_cancel(done) -> None:
+            """协程尚未进入函数体便取消时，补齐已经落库的 queued Run 终态。"""
+            if done.cancelled() and record.state == "queued":
+                asyncio.run_coroutine_threadsafe(self.application.finish_run(
+                    record.request_id, prepared.session_id, status="cancelled",
+                    finish_reason="cancelled_before_start",
+                ), self._loop)
+
+        future.add_done_callback(finish_unstarted_cancel)
         LOGGER.info(
             "[yanDebug][02-流任务登记][streaming.py][AgentRuntime.start_stream] "
             "流任务已登记，request_id=%s，session_id=%s",
@@ -473,6 +500,8 @@ class AgentRuntime:
         try:
             async with lock:
                 if not record.mark_running():
+                    await self.application.finish_run(record.request_id, prepared.session_id,
+                        status="cancelled", finish_reason="cancelled_before_start")
                     self._finish_queued_cancel(record)
                     return
                 LOGGER.info(
@@ -482,7 +511,12 @@ class AgentRuntime:
                 )
                 await self._run_stream(record, prepared)
         except asyncio.CancelledError:
+            await self.application.finish_run(record.request_id, prepared.session_id,
+                status="cancelled", finish_reason="cancelled_before_start")
             self._finish_queued_cancel(record)
+        except AgentError as error:
+            if not record.terminal:
+                record.append("error", {"code": error.code, "message": error.message, "reason": error.code})
         finally:
             current_lock, current_users = self._session_queues[queue_key]
             if current_users <= 1:
@@ -701,17 +735,23 @@ class AgentRuntime:
                 record.request_id,
                 prepared.session_id,
             )
+            if prepared.recovery_source is not None:
+                run_started = await self.application.start_recovery(prepared, request_id=record.request_id)
+            elif self.application.run_store is not None:
+                run_started = await self.application.run_store.mark_running(record.request_id, prepared.session_id)
             context = await self.application.begin_chat(
                 prepared, request_id=record.request_id,
             )
-            run_started = await self.application.start_run(
-                prepared, request_id=record.request_id,
-            )
+            if not run_started:
+                run_started = await self.application.start_run(
+                    prepared, request_id=record.request_id,
+                )
             record.set_accepting_instructions(True)
             loop_result = await AgentLoop(
                 model=prepared.provider,
                 tools=self.application.tool_manager,
                 sessions=self.application.session_store,
+                executions=self.application.executions,
                 max_model_turns=prepared.config.max_agent_steps + 1,
                 model_turn=stream_model_turn,
                 on_tool_start=emit_tool_start,
@@ -730,6 +770,8 @@ class AgentRuntime:
                     confirmation_ui_available=True,
                 ),
                 initial_usage=context.preparation_usage,
+                recovery_tool_attempts=context.recovery_tool_attempts,
+                recovery_tool_results=context.recovery_tool_results,
                 context_window_tokens=prepared.config.max_context_tokens or 64_000,
                 reserved_output_tokens=min(
                     4_000,
@@ -739,7 +781,7 @@ class AgentRuntime:
             )
             record.set_accepting_instructions(False)
             await reject_uninjected_instructions()
-            if run_started:
+            if run_started or self.application.run_store is not None:
                 await self.application.finish_run(
                     record.request_id,
                     prepared.session_id,
@@ -767,7 +809,7 @@ class AgentRuntime:
         except asyncio.CancelledError:
             record.set_accepting_instructions(False)
             await reject_uninjected_instructions()
-            if run_started:
+            if run_started or self.application.run_store is not None:
                 await self._finish_run_after_error(
                     record.request_id,
                     prepared.session_id,
@@ -786,7 +828,7 @@ class AgentRuntime:
         except AgentError as error:
             record.set_accepting_instructions(False)
             await reject_uninjected_instructions()
-            if run_started:
+            if run_started or self.application.run_store is not None:
                 await self._finish_run_after_error(
                     record.request_id,
                     prepared.session_id,
@@ -805,7 +847,7 @@ class AgentRuntime:
         except Exception:
             record.set_accepting_instructions(False)
             await reject_uninjected_instructions()
-            if run_started:
+            if run_started or self.application.run_store is not None:
                 await self._finish_run_after_error(
                     record.request_id,
                     prepared.session_id,

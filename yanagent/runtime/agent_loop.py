@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import logging
 import math
 from collections.abc import Awaitable, Callable, Sequence
@@ -35,6 +33,7 @@ from yanagent.errors import (
 from yanagent.retries import retry_delay
 from yanagent.models.provider import ModelProvider
 from yanagent.sessions.store import SessionStore
+from yanagent.sessions.executions import ExecutionStore, tool_fingerprint
 from yanagent.tools.manager import ToolManager
 from yanagent.tools.permissions import (
     ToolConfirmationRequest,
@@ -111,6 +110,7 @@ class AgentLoop:
         on_tool_end: ToolEndObserver | None = None,
         confirmation_handler: ConfirmationHandler | None = None,
         on_checkpoint: CheckpointObserver | None = None,
+        executions: ExecutionStore | None = None,
     ) -> None:
         """注入循环依赖、可选流式轮次及观察器，并校验所有运行限制。"""
         if not callable(getattr(model, "complete", None)):
@@ -158,6 +158,7 @@ class AgentLoop:
         self.on_tool_end = on_tool_end
         self.confirmation_handler = confirmation_handler
         self.on_checkpoint = on_checkpoint
+        self.executions = executions
 
     async def _complete_model_turn(
         self,
@@ -180,6 +181,8 @@ class AgentLoop:
         context_window_tokens: int = 64_000,
         reserved_output_tokens: int = 4_000,
         max_context_turns: int = 20,
+        recovery_tool_attempts: dict[str, int] | None = None,
+        recovery_tool_results: dict[str, ToolResult] | None = None,
     ) -> AgentLoopResult:
         """在总超时内循环模型和工具，直到最终回答或稳定限制错误。"""
         selected_session = _identifier(session_id, "session_id")
@@ -226,19 +229,27 @@ class AgentLoop:
             self.tools.timeout_seconds,
         )
         deadline = asyncio.get_running_loop().time() + self.total_timeout_seconds
-        return await self._run_loop(
-            working=working,
-            schemas=schemas,
-            session_id=selected_session,
-            request_id=selected_request,
-            permission_mode=permission_mode,
-            permission_context=permission_context,
-            deadline=deadline,
-            initial_usage={} if initial_usage is None else deepcopy(initial_usage),
-            context_window_tokens=context_window_tokens,
-            reserved_output_tokens=reserved_output_tokens,
-            max_context_turns=max_context_turns,
-        )
+        if self.executions is not None:
+            await self.executions.set_initial_usage(selected_request, selected_session, initial_usage or {})
+        try:
+            return await self._run_loop(
+                working=working,
+                schemas=schemas,
+                session_id=selected_session,
+                request_id=selected_request,
+                permission_mode=permission_mode,
+                permission_context=permission_context,
+                deadline=deadline,
+                initial_usage={} if initial_usage is None else deepcopy(initial_usage),
+                context_window_tokens=context_window_tokens,
+                reserved_output_tokens=reserved_output_tokens,
+                max_context_turns=max_context_turns,
+                recovery_tool_attempts=recovery_tool_attempts or {},
+                recovery_tool_results=recovery_tool_results or {},
+            )
+        finally:
+            if self.executions is not None:
+                await asyncio.shield(self.executions.close_active(selected_request, selected_session))
 
     async def _run_loop(
         self,
@@ -254,13 +265,15 @@ class AgentLoop:
         context_window_tokens: int,
         reserved_output_tokens: int,
         max_context_turns: int,
+        recovery_tool_attempts: dict[str, int],
+        recovery_tool_results: dict[str, ToolResult],
     ) -> AgentLoopResult:
         """执行已校验的内部循环；同轮调用顺序执行并保持完整消息配对。"""
         turns = 0
         usage: Usage = deepcopy(initial_usage)
         consecutive_failures = 0
-        tool_attempts: dict[str, int] = {}
-        tool_results: dict[str, ToolResult] = {}
+        tool_attempts: dict[str, int] = deepcopy(recovery_tool_attempts)
+        tool_results: dict[str, ToolResult] = deepcopy(recovery_tool_results)
 
         while True:
             if turns >= self.max_model_turns:
@@ -298,6 +311,7 @@ class AgentLoop:
             try:
                 reply, retry_usage = await self._model_with_retry(
                     request_messages, schemas, deadline=deadline, request_id=request_id,
+                    session_id=session_id,
                 )
                 usage = _merge_usage(usage, retry_usage)
             except (TimeoutError, asyncio.TimeoutError):
@@ -395,6 +409,8 @@ class AgentLoop:
                 stage="assistant_tool_call",
             )
             working.append(Message.from_dict(assistant.to_dict()))
+            if self.executions is not None:
+                await self.executions.plan_tools(request_id, session_id, reply.tool_calls, self.tools)
             LOGGER.info(
                 "[agent_loop.py][AgentLoop._run_loop] Assistant 工具请求组已保存，"
                 "request_id=%s，turn=%d，工具调用数=%d",
@@ -496,6 +512,12 @@ class AgentLoop:
                         else:
                             # 调用前登记：即使超时或异常也不能假定写操作没有副作用。
                             tool_attempts[fingerprint] = count + 1
+
+                            async def mark_executing() -> None:
+                                """权限批准后，先持久化执行状态再允许 handler 开始。"""
+                                if self.executions is not None:
+                                    await self.executions.start_tool(request_id, call.id)
+
                             result = await asyncio.wait_for(
                                 self.tools.execute(
                                     call,
@@ -503,6 +525,7 @@ class AgentLoop:
                                     permission_context=permission_context,
                                     confirmation_handler=self.confirmation_handler,
                                     max_result_chars=max_result_chars,
+                                    on_execute=mark_executing,
                                 ),
                                 timeout=remaining,
                             )
@@ -526,6 +549,11 @@ class AgentLoop:
                     0.0,
                     asyncio.get_running_loop().time() - tool_started_at,
                 )
+                if self.executions is not None:
+                    await self.executions.finish(
+                        self.executions.tool_step_id(request_id, call.id), result=result,
+                        duration_ms=int(execution_time * 1000),
+                    )
                 tool_message = result.to_message()
                 tool_message.name = call.name
                 tool_message.metadata.update({
@@ -589,11 +617,29 @@ class AgentLoop:
     @staticmethod
     def _tool_fingerprint(call: ToolCall) -> str:
         """按工具名和排序后的 JSON 参数生成指纹，忽略模型更换的调用 ID。"""
-        encoded = json.dumps(
-            [call.name, call.arguments], ensure_ascii=False, sort_keys=True,
-            separators=(",", ":"), allow_nan=False,
+        return tool_fingerprint(call)
+
+    async def _observed_model_turn(self, messages, schemas, request_id, session_id, attempt):
+        """记录每次模型尝试的状态、耗时与已知用量，失败时也保留观测信息。"""
+        if self.executions is None:
+            return await self.model_turn(messages, schemas)
+        step_id = await self.executions.start_model(request_id, session_id, attempt)
+        started = asyncio.get_running_loop().time()
+        try:
+            reply = await self.model_turn(messages, schemas)
+        except BaseException as error:
+            await asyncio.shield(self.executions.finish(
+                step_id, error_code=error.code if isinstance(error, AgentError) else
+                    "cancelled" if isinstance(error, asyncio.CancelledError) else "unexpected_error",
+                duration_ms=int((asyncio.get_running_loop().time() - started) * 1000),
+            ))
+            raise
+        await self.executions.finish(
+            step_id, usage=reply.usage,
+            error_code="empty_model_response" if not reply.tool_calls and not reply.content.strip() else None,
+            duration_ms=int((asyncio.get_running_loop().time() - started) * 1000),
         )
-        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        return reply
 
     async def _model_with_retry(
         self,
@@ -602,6 +648,7 @@ class AgentLoop:
         *,
         deadline: float,
         request_id: str,
+        session_id: str,
     ) -> tuple[ModelReply, Usage]:
         """仅重发当前模型输入；重试等待可取消且始终受 Run 总期限约束。"""
         retry_usage: Usage = {}
@@ -611,7 +658,8 @@ class AgentLoop:
                 self._raise_total_timeout(request_id)
             try:
                 reply = await asyncio.wait_for(
-                    self.model_turn(deepcopy(list(messages)), deepcopy(list(schemas))),
+                    self._observed_model_turn(deepcopy(list(messages)), deepcopy(list(schemas)),
+                                              request_id, session_id, attempt + 1),
                     timeout=remaining,
                 )
                 if not reply.tool_calls and not reply.content.strip():

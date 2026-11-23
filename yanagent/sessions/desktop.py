@@ -99,6 +99,17 @@ class DesktopSessionService:
             for group in self._turn_groups(records)
             for payload in self._turn_payloads(group, runs_by_request)
         ]
+        represented = {record.message.metadata.get("request_id") for record in records}
+        for run in runs:
+            queued_text = run.metadata.get("queued_message")
+            if run.request_id in represented or not isinstance(queued_text, str) or run.status == "completed":
+                continue
+            # 排队任务尚未写 User Message 时，也能在重启后的历史中定位与恢复。
+            messages.append({"role": "user", "content": queued_text, "created_at": _seconds(run.created_at)})
+            messages.extend(self._attach_run_diagnostics([{
+                "role": "assistant", "content": "", "created_at": _seconds(run.created_at),
+                "steps": [], "run_state": self._unfinished_run_state(run),
+            }], run))
         selected_page = page
         if until_sequence is not None:
             target_index = next(
@@ -253,13 +264,28 @@ class DesktopSessionService:
         payloads = [] if user is None else [self._message_payload(user)]
         if has_tool_process:
             payloads.append(self._tool_process_payload(process, run))
-            return payloads
+            return self._attach_run_diagnostics(payloads, run)
         if process:
             payloads.extend(self._message_payload(record) for record in process)
-            return payloads
+            return self._attach_run_diagnostics(payloads, run)
         run_state = self._unfinished_run_state(run)
         if run_state is not None:
             payloads.append(self._empty_run_payload(records[0], run, run_state))
+        return self._attach_run_diagnostics(payloads, run)
+
+    def _attach_run_diagnostics(self, payloads: list[dict[str, Any]], run: StoredRun | None) -> list[dict[str, Any]]:
+        """给过程气泡附加 Run 定位、已知用量和耗时，让重启后的失败可诊断。"""
+        if run is None:
+            return payloads
+        for payload in payloads:
+            if payload.get("role") != "assistant":
+                continue
+            payload["run_id"] = run.request_id
+            payload["recovery_available"] = run.status in {"failed", "cancelled", "interrupted"} and not run.metadata.get("recovered_by")
+            payload["run_error_code"] = run.error_code
+            payload.setdefault("usage", run.usage)
+            payload["duration_ms"] = (None if run.started_at is None or run.finished_at is None else
+                                      max(0, run.finished_at - run.started_at))
         return payloads
 
     def _request_id(self, records: list[StoredMessage]) -> str | None:

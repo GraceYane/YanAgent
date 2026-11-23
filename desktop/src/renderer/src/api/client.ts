@@ -30,6 +30,7 @@ import type {
   HistoryPage,
   UserMessageIndex,
   ContextUsage,
+  RunDiagnostics,
   ModelsData,
   ModelsAction,
   KnowledgeList,
@@ -367,6 +368,23 @@ class ApiClient {
     if (!this.authToken) return url
     const sep = url.includes('?') ? '&' : '?'
     return `${url}${sep}token=${encodeURIComponent(this.authToken)}`
+  }
+
+  async getRunDiagnostics(sessionId: string, requestId: string, agentId?: string): Promise<RunDiagnostics> {
+    return this.request(this.scoped(
+      `/api/sessions/${encodeURIComponent(sessionId)}/run_diagnostics?request_id=${encodeURIComponent(requestId)}`,
+      agentId,
+    ))
+  }
+
+  async recoverRun(sessionId: string, requestId: string, mode: 'continue' | 'retry', acknowledged: boolean): Promise<{
+    status: string; stream: boolean; request_id: string; message?: string
+  }> {
+    return this.request('/runs/recover', {
+      method: 'POST',
+      body: JSON.stringify({ session_id: sessionId, source_request_id: requestId,
+        mode, acknowledge_uncertain: acknowledged }),
+    })
   }
 
   createSSEStream(requestId: string): EventSource {

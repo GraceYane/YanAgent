@@ -2107,3 +2107,68 @@ Electron/React chatStore
 - 当前去重只针对同 Run 的同工具同 JSON 参数；语义相同但参数表达不同、新 Run 或崩溃后需要持久化幂等键与业务侧核对，不能依赖本表。
 - 桌面自动重连需要实际断网/恢复操作验收；真实模型 429、服务器故障和长期运行仍需外部环境验证。旧阶段完整验收不因本次模块回归自动通过。
 
+## 2026-11-23：P05-06 恢复与观测
+
+### 实际完成的内容
+
+- 将数据库前向升级至 Schema v3，新增 run_steps 保存每次模型尝试和工具步骤，包含完整 user/agent/session/request 归属、pending/running/completed/failed/uncertain/skipped 状态、错误码、已知 Usage、开始/结束时间和耗时。既有 v1/v2 迁移内容保持原样，通过新增迁移保留历史与 Run。
+- 普通任务在进入 Session 队列前持久化 queued Run。普通流式任务在 HTTP 返回已接受之前保存排队信息和原始用户需求；取得会话锁后转 running，排队取消也写终态。尚未写 User Message 的排队任务可以在桌面历史中定位，并在用户显式恢复时补回原需求。
+- AgentLoop 对每次模型请求及重试分别登记步骤，收到响应后保存已知 Token，模型失败或取消时仍保留错误及此前用量。准备阶段成功摘要的用量在循环开始时初始化，摘要请求本身尚不单独记为模型步骤；未知服务端计费不猜测。
+- 工具执行采用先意图、再执行状态、后结果的持久化顺序。同轮工具意图批量保存；ToolManager 在权限、确认和预算通过后、handler 前等待持久化回调，日志写入失败便阻止 handler。工具结果先写日志再写 Session，支持识别“工具已完成但 Tool Message 尚未写入”的崩溃间隙。
+- 进入 handler 后的错误、取消、超时和崩溃均保守标为 uncertain；尚未进入 handler 的调用收口为 skipped。运行收尾及启动恢复只更改记录，不执行工具或回滚外部副作用。
+- 恢复服务只补齐尾部缺少的 Tool Message。已完成结果直接复用日志；未启动调用明确标注未执行；旧版本没有执行日志的调用与不确定调用明确要求核对，不伪造成功。新普通任务也会保护当前会话尚未解决的不确定写指纹。
+- 增加显式继续与重试入口：按最新 Session Run 和完整身份校验，在同一事务内占用来源、创建新 request_id 的子 Run、关联 parent_request_id 并保存恢复 User 锚点。恢复子 Run 继承祖先已完成写操作保护，不能因模型更换 call ID 重新执行。原 Run 保留原终态，通过 recovered_by 关联后续任务。
+- 不确定写操作只开放核对后的继续路径；用户确认表示基于现有记录继续，不解除不确定写操作的保护，也不允许自动重试这些写操作。只读失败可通过显式重试重新获取；已知未执行操作由模型重新决定。
+- 启动恢复会识别最终 Assistant 已保存的任务为 completed，避免再次请求模型；还会按 run_instruction_id 修复追加指令已写 Session、尚未更新 Run 的间隙，其余遗留排队指令标为 rejected，防止重复注入。
+- 新增诊断 GET 和恢复 POST 接口；桌面实时/历史气泡提供“执行记录与恢复”，展示任务及步骤耗时、已知 Token、错误码、状态与可用动作。恢复提交后仍复用原有 SSE、取消及 Session 排队机制。
+- 更新需求、路线图和 P05-05 后续说明，新增 docs/P05_06_RECOVERY_OBSERVABILITY.md。P05 实现范围已齐，整体仍待专项产品验收；下一开发项为 P06-01。
+
+### 涉及的文件
+
+- `yanagent/storage/database.py`：Schema v3 执行步骤表与归属索引。
+- `yanagent/sessions/executions.py`：执行步骤仓储、规范参数指纹、状态和用量累计。
+- `yanagent/sessions/recovery.py`：诊断、尾部工具结果重建、写保护继承及原子恢复子 Run。
+- `yanagent/sessions/runs.py`：queued/running 转换、保留失败用量、启动步骤和追加指令恢复、已保存最终答案识别。
+- `yanagent/sessions/desktop.py`：Run 诊断定位、历史耗时与 Token、没有消息锚点的排队任务展示。
+- `yanagent/chat.py`：准备恢复快照、排队持久化、恢复锚点复用、步骤依赖和保护上下文传递。
+- `yanagent/runtime/agent_loop.py`：模型尝试与工具执行日志、失败/取消收尾、继承保护及结果先日志后回写。
+- `yanagent/runtime/streaming.py`、`yanagent/runtime/bridge.py`：排队生命周期、恢复路由、取消前置间隙及隔离实例启动恢复。
+- `yanagent/tools/manager.py`、`yanagent/errors.py`、`app.py`：handler 前日志回调、受控恢复错误和诊断/恢复 HTTP 入口。
+- `desktop/src/renderer/src/components/RunDiagnostics.tsx`、`components/MessageBubble.tsx`、`pages/ChatPage.tsx`、`api/client.ts`、`store/chatStore.ts`、`types.ts`、`i18n.ts`：执行记录、恢复动作、外部结果核对确认与界面状态。
+- `tests/test_run_recovery.py`、`tests/test_database.py`、`tests/test_chat_history.py`：14 项恢复专项、v2 升级保留 Run 验证，以及长历史摘要预设适配。
+- `docs/DEVELOPMENT_REQUIREMENTS.md`、`docs/IMPLEMENTATION_ROADMAP.md`、`docs/P05_05_FAILURE_HANDLING.md`、`docs/P05_06_RECOVERY_OBSERVABILITY.md`、`workProcess.md`。
+
+### 参考源码与设计取舍
+
+- 检查 CowAgentByYan 的 agent/protocol/agent_stream.py 中取消/中断时补齐工具结果的代码，以及 agent/memory/conversation_store.py 中 unfinished_runs 与历史状态聚合。参考 HEAD 为 1fa66340，检查时没有受跟踪文件差异。
+- 本项目增加独立执行日志，将“从未启动”和“可能产生副作用但没有可靠结果”区分开。SQLite 可以原子保护本地恢复占用、子 Run 与消息锚点，不能把外部写操作和本地提交组成跨系统事务，所以运行中崩溃必须保留不确定状态。
+- 不从任意 Python 指令地址继续，而是以完整模型/工具消息为边界创建新 Run。已完成写操作结果可复用，待执行操作重新交给模型决策；不确定写操作保持保护并要求人工核对，避免将异常解释成没有执行。
+- 模型步骤耗时使用单调时钟；取消收尾/重启遗留步骤只能根据保存的墙钟时间估算，重启数值可能含停机时间。任务耗时不包含排队等待；工具步骤耗时包含权限确认等待与执行。
+
+### 验证结果
+
+- 最终 `unittest discover -s tests -q` 全量 **236 项通过**，约 25 秒。包含新增 14 项恢复专项、1 项 v2→v3 迁移测试；使用真实 SQLite、仓储重建、Fake Provider、本机 HTTP/SSE 和实际 Session 队列，没有调用真实模型或写入外部业务系统。
+- 覆盖工具完成后尚未写 Tool Message、进入 handler 前后崩溃、旧版本无日志、写保护跨恢复祖先继承、日志失败不运行 handler、取消后未知副作用、失败 Run 已知 Token/错误保留、双重恢复只成功一次、身份/Session 隔离、已保存答案识别、追加指令持久化间隙、排队需求恢复、HTTP 恢复子任务与已接受排队任务取消终态。
+- 首轮全量回归发现 P02 的 501 条历史测试仍假设所有原文直接发模型，缺少 P05-04 摘要响应预设；修改为验证完整历史被读取并进入摘要、原始记录仍为 503 条。HTTP 专项也发现恢复路由没有分配新 Run ID，已修正并通过真实回环接口验收。
+- Python 静态编译和 git diff --check 通过。Renderer 生产构建通过，保留已有字体引用、Browserslist 和 bundle 体积提示。
+- TypeScript 全量静态检查未通过，报错来自既有 ChannelsPage.tsx 的 IconComponent size 类型与 Lucide 不兼容，以及 types.ts 中重复 user_seq；用 HEAD 核对为本次修改前已有代码。本次新增恢复组件和操作没有被报告类型错误；没有把 Vite 构建通过等同于全仓 TypeScript 类型检查通过。
+- 测试和构建在允许本机回环连接、父目录读取的审批环境执行；受限 Windows 的 socketpair 阻塞问题沿用 P05-05 已定位的结论，没有更改操作系统权限或测试依赖。
+- 未启动 Electron 点击操作、强杀真实模型服务、执行真实写工具或核验外部系统副作用。崩溃测试以数据库时点与新仓储实例模拟重启，不能证明业务系统恰好执行一次。
+
+### 岗位要求关联与实践证据
+
+- 对应 TARGET_ROLES.md 的“可用性、稳定性与可观测性”（XM-职责6～7、DYQ-职责2～3、TX-职责3）、“工具调用与执行管控”（XM-职责1、XM-职责6、DYQ-职责2～3、TX-职责1）、“Session、上下文和数据隔离”（XM-职责1～2、DYG-职责2、DYQ-职责2）及“性能与 Token 成本”（XM-职责7、TX-职责3）的相关部分。
+- 实现证据包括模型尝试/工具步骤与 Run 关联、错误与耗时落库、已知用量保留、恢复父子关系、工具状态机、归属查询及同 Session 原子恢复。运行证据是 236 项离线测试、真实本机 HTTP 恢复链路与 Renderer 构建；未测量线上恢复率、真实供应商成本降低或长时间稳定性。
+- 面试可讲的边界：已完成结果能从日志补回，已进入 handler 但没有返回结果不能判为未执行；外部副作用与 SQLite 无法自动组成原子事务，因此保留 uncertain 并要求核对。恢复入口创建新 Run、继承写保护，不删除原执行轨迹，也不重放整个工具循环。
+
+### 难点评分
+
+整体难度：**9/10**。最难的是对崩溃间隙作正确判断：Assistant 调用已保存但意图未登记、意图已登记但 handler 未启动、handler 已产生副作用但日志未完成、日志已完成但 Tool Message 未写入，都需要不同处理。实现采用 pending→running→completed 的持久化边界，先日志后消息；日志不足时只收敛到 uncertain，绝不伪造成功。第二个难点是恢复与并发：沿用 Session 队列锁，并把来源占用、子 Run 与恢复 User 锚点放入同一事务；恢复祖先中的写指纹持续传入新的 AgentLoop，阻止跨重启或换 call ID 后的盲目重复。第三个难点是让错误路径也留下可信观测数据：每次模型尝试单独记录，已知 Usage 在失败前即累计，Run 终态不再覆盖成空对象，取消时补齐步骤状态。
+
+### 尚未完成的事项
+
+- P05-01～P05-04 仍有专项产品验收待补，尤其是桌面批准/拒绝、追加指令时序和长对话摘要交互；本项全量离线回归不自动代替这些验收。
+- 尚未实现外部副作用跨系统原子提交、语义等价参数去重或业务幂等键。未知写操作的保护不会仅凭继续确认解除，当前没有独立人工裁决外部结果的接口。
+- 恢复仅接受同一 Session 最新失败/中断/取消 Run，使用当前配置；不支持多进程共同操作同一数据库的分布式运行租约。摘要请求暂不单独生成步骤，供应商未返回的失败请求 Token 无法准确记录。
+- 需补 Electron 真机点击及外部副作用核对验收；全仓 TypeScript 基线问题单独处理。下一开发项为 P06-01：多模型与备用链。
+

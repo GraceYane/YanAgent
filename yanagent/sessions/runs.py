@@ -151,7 +151,7 @@ class RunStore:
             status,
             finish_reason,
             error_code,
-            _json_object({} if usage is None else usage),
+            None if usage is None else _json_object(usage),
         )
 
     async def get(self, request_id: str, session_id: str) -> StoredRun | None:
@@ -161,6 +161,22 @@ class RunStore:
             str(_identifier(request_id)),
             str(_identifier(session_id)),
         )
+
+    async def mark_running(self, request_id: str, session_id: str) -> bool:
+        """在拿到 Session 锁后将持久化排队任务转成 running。"""
+        return await asyncio.to_thread(self._mark_running_sync, request_id, session_id)
+
+    def _mark_running_sync(self, request_id: str, session_id: str) -> bool:
+        """按完整归属执行一次性 queued 到 running 转换。"""
+        try:
+            with self.database.transaction(immediate=True) as conn:
+                return conn.execute(
+                    "UPDATE runs SET status='running',started_at=? WHERE request_id=? AND user_id=? "
+                    "AND agent_id=? AND session_id=? AND status='queued'",
+                    (self._timestamp(), request_id, self.user_id, self.agent_id, session_id),
+                ).rowcount == 1
+        except sqlite3.Error:
+            raise SessionStorageError() from None
 
     async def list_for_session(self, session_id: str) -> list[StoredRun]:
         """按创建顺序读取当前作用域会话的全部 Run，供历史过程恢复批量关联。"""
@@ -206,6 +222,45 @@ class RunStore:
         timestamp = self._timestamp()
         try:
             with self.database.transaction(immediate=True) as connection:
+                connection.execute(
+                    "UPDATE run_steps SET status=CASE WHEN status='pending' THEN 'skipped' "
+                    "WHEN kind='tool' THEN 'uncertain' ELSE 'failed' END,finished_at=?,"
+                    "duration_ms=CASE WHEN started_at IS NULL THEN 0 ELSE MAX(0,?-started_at) END,"
+                    "error_code='process_restarted' WHERE user_id=? AND agent_id=? "
+                    "AND status IN ('pending','running') AND request_id IN "
+                    "(SELECT request_id FROM runs WHERE user_id=? AND agent_id=? "
+                    "AND status IN ('queued','running'))",
+                    (timestamp, timestamp, self.user_id, self.agent_id, self.user_id, self.agent_id),
+                )
+                active = connection.execute(
+                    "SELECT request_id,session_id,metadata_json FROM runs WHERE user_id=? "
+                    "AND agent_id=? AND status IN ('queued','running')",
+                    (self.user_id, self.agent_id),
+                ).fetchall()
+                for run in active:
+                    metadata = _decode_json_object(run["metadata_json"])
+                    instructions = metadata.get("run_instructions", [])
+                    messages = connection.execute(
+                        "SELECT sequence,metadata_json,role,tool_calls_json FROM messages WHERE user_id=? AND agent_id=? "
+                        "AND session_id=? ORDER BY sequence", (self.user_id, self.agent_id, run["session_id"]),
+                    ).fetchall()
+                    injected = {
+                        _decode_json_object(message["metadata_json"]).get("run_instruction_id"): message["sequence"]
+                        for message in messages
+                    }
+                    for item in instructions:
+                        if item.get("status") == "queued":
+                            sequence = injected.get(item.get("instruction_id"))
+                            item.update(status="injected" if sequence is not None else "rejected",
+                                        sequence=sequence, recovery_reason="process_restarted")
+                    connection.execute("UPDATE runs SET metadata_json=? WHERE request_id=?",
+                                       (_json_object(metadata), run["request_id"]))
+                    own = [m for m in messages if _decode_json_object(m["metadata_json"]).get("request_id") == run["request_id"]]
+                    if own and own[-1]["role"] == "assistant" and not json.loads(own[-1]["tool_calls_json"] or "[]"):
+                        connection.execute(
+                            "UPDATE runs SET status='completed',finished_at=?,finish_reason='recovered_saved_answer',"
+                            "error_code=NULL WHERE request_id=?", (timestamp, run["request_id"]),
+                        )
                 cursor = connection.execute(
                     "UPDATE runs SET status = 'interrupted', finished_at = ?, "
                     "finish_reason = 'process_restarted', error_code = 'run_interrupted' "
@@ -284,14 +339,14 @@ class RunStore:
         status: TerminalRunStatus,
         finish_reason: str | None,
         error_code: str | None,
-        usage_json: str,
+        usage_json: str | None,
     ) -> bool:
         """同步完成 Run，只允许当前作用域的活动状态发生一次终态转换。"""
         try:
             with self.database.transaction(immediate=True) as connection:
                 cursor = connection.execute(
                     "UPDATE runs SET status = ?, finished_at = ?, finish_reason = ?, "
-                    "error_code = ?, usage_json = ? "
+                    "error_code = ?, usage_json = COALESCE(?, usage_json) "
                     "WHERE request_id = ? AND user_id = ? AND agent_id = ? "
                     "AND session_id = ? AND status IN ('queued', 'running')",
                     (

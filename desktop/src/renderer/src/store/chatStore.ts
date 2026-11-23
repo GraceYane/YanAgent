@@ -44,6 +44,7 @@ interface ChatState {
 
   send: (sid: string, text: string, attachments: Attachment[]) => Promise<void>
   cancel: (sid: string) => Promise<void>
+  recover: (sid: string, sourceRequestId: string, mode: 'continue' | 'retry') => Promise<void>
   regenerate: (sid: string, botMessageId: string) => Promise<void>
   editUserMessage: (sid: string, messageId: string) => { text: string; attachments: Attachment[] } | null
   deleteMessage: (sid: string, userSeq: number, cascade: boolean) => Promise<void>
@@ -314,6 +315,10 @@ function historyToMessage(m: HistoryMessage): ChatMessage {
     usage: m.usage,
     isCancelled: cancelled || undefined,
     runState: m.run_state,
+    runId: m.run_id,
+    recoveryAvailable: m.recovery_available,
+    durationMs: m.duration_ms,
+    runErrorCode: m.run_error_code,
     attachments: attachments.length > 0 ? attachments : undefined,
     artifacts: artifacts.length > 0 ? artifacts : undefined,
   }
@@ -337,6 +342,7 @@ export const useChatStore = create<ChatState>((set, get) => {
 
   /** Attach an EventSource for a request and wire all SSE events to a bot message. */
   const attachStream = (sid: string, requestId: string, botId: string) => {
+    updateMsg(sid, botId, (m) => ({ ...m, runId: requestId }))
     const es = apiClient.createSSEStream(requestId)
     streams[sid] = es
     let tailTimer: ReturnType<typeof setTimeout> | null = null
@@ -783,7 +789,8 @@ export const useChatStore = create<ChatState>((set, get) => {
           if (userCancelled || detached()) {
             updateMsg(sid, main.id, (m) => ({ ...m, isStreaming: false }))
           } else {
-            updateMsg(sid, main.id, (m) => ({ ...m, error: data.message || 'stream error', isStreaming: false }))
+            updateMsg(sid, main.id, (m) => ({ ...m, error: data.message || 'stream error', isStreaming: false,
+              runId: requestId, recoveryAvailable: true }))
             notifyRunDone(sid, 'error', data.message || 'stream error')
           }
           finishStream()
@@ -943,6 +950,39 @@ export const useChatStore = create<ChatState>((set, get) => {
       } catch (err) {
         updateMsg(sid, botId, (m) => ({ ...m, error: `${err}`, isStreaming: false }))
         patchSession(sid, { isStreaming: false })
+      }
+    },
+
+    recover: async (sid, sourceRequestId, mode) => {
+      if (get().sessions[sid]?.isStreaming) return
+      const plan = await apiClient.getRunDiagnostics(sid, sourceRequestId, sessionOwner(sid) || undefined)
+      if (!(mode === 'continue' ? plan.can_continue : plan.can_retry)) throw new Error(t('run_recovery_unavailable'))
+      let acknowledged = false
+      if (plan.requires_acknowledgement) {
+        acknowledged = await askConfirm({ titleKey: 'run_recovery_title', msgKey: 'run_recovery_warning',
+          okKey: 'run_recovery_ack', tone: 'primary' })
+        if (!acknowledged) return
+      }
+      // 先锁定输入避免连续点击；后端仍会在 Session 锁内原子核对恢复资格。
+      patchSession(sid, { isStreaming: true })
+      let botId: string | null = null
+      try {
+        const res = await apiClient.recoverRun(sid, sourceRequestId, mode, acknowledged)
+        if (res.status !== 'success' || !res.request_id) throw new Error(res.message || t('run_recovery_unavailable'))
+        botId = uid('assistant')
+        const id = botId
+        patchMessages(sid, (msgs) => [
+          ...msgs.map((m) => m.runId === sourceRequestId ? { ...m, recoveryAvailable: false } : m),
+          { id: uid('user'), role: 'user', content: t(mode === 'continue' ? 'run_continue' : 'run_retry'), timestamp: Date.now() / 1000 },
+          { id, role: 'assistant', content: '', timestamp: Date.now() / 1000, isStreaming: true,
+            steps: [], runId: res.request_id },
+        ])
+        patchSession(sid, { requestId: res.request_id })
+        attachStream(sid, res.request_id, id)
+      } catch (error) {
+        patchSession(sid, { isStreaming: false, requestId: null })
+        if (botId) updateMsg(sid, botId, (m) => ({ ...m, isStreaming: false, error: String(error) }))
+        throw error
       }
     },
 

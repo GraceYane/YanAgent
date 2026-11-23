@@ -17,7 +17,7 @@ from pathlib import Path
 LOGGER = logging.getLogger("yanagent.storage")
 DATA_DIR_ENV = "YANAGENT_DATA_DIR"
 DATABASE_FILENAME = "yanagent.db"
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 class DatabaseInitializationError(RuntimeError):
@@ -166,6 +166,36 @@ MIGRATIONS = (
 )
 
 
+MIGRATIONS += (
+    Migration(
+        version=3,
+        name="durable_run_steps",
+        statements=(
+            """
+            CREATE TABLE run_steps (
+                step_id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL REFERENCES runs(request_id) ON DELETE CASCADE,
+                user_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('model', 'tool')),
+                status TEXT NOT NULL CHECK(status IN
+                    ('pending', 'running', 'completed', 'failed', 'uncertain', 'skipped')),
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                finished_at INTEGER,
+                duration_ms INTEGER,
+                error_code TEXT,
+                data_json TEXT NOT NULL DEFAULT '{}',
+                usage_json TEXT NOT NULL DEFAULT '{}'
+            )
+            """,
+            "CREATE INDEX idx_run_steps_owner ON run_steps(user_id, agent_id, session_id, request_id)",
+        ),
+    ),
+)
+
+
 REQUIRED_COLUMNS = {
     "schema_migrations": {"version", "name", "checksum", "applied_at"},
     "sessions": {
@@ -181,6 +211,11 @@ REQUIRED_COLUMNS = {
         "request_id", "user_id", "agent_id", "session_id", "parent_request_id", "status",
         "created_at", "started_at", "finished_at", "finish_reason", "error_code", "usage_json",
         "metadata_json",
+    },
+    "run_steps": {
+        "step_id", "request_id", "user_id", "agent_id", "session_id", "kind", "status",
+        "created_at", "started_at", "finished_at", "duration_ms", "error_code",
+        "data_json", "usage_json",
     },
 }
 
@@ -350,7 +385,7 @@ class Database:
             raise
 
     def _validate_schema(self, connection: sqlite3.Connection) -> None:
-        """验证版本连续性以及四张核心表的关键列，拒绝半迁移数据库。"""
+        """验证版本连续性及全部核心表关键列，拒绝半迁移数据库。"""
         versions = [
             int(row[0])
             for row in connection.execute(

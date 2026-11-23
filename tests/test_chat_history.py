@@ -192,7 +192,10 @@ class ChatHistoryTests(unittest.TestCase):
         _run(self.sessions.append(
             "long", [Message(role="user", content=f"历史-{index}") for index in range(501)]
         ))
-        fake = FakeProvider([ModelReply(content="已收到", finish_reason="stop")])
+        fake = FakeProvider([
+            ModelReply(content="较早历史已概括", finish_reason="stop"),
+            ModelReply(content="已收到", finish_reason="stop"),
+        ])
 
         _run(
             self._application(fake).chat(
@@ -200,9 +203,11 @@ class ChatHistoryTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(len(fake.calls[0].messages), 503)
-        self.assertEqual(fake.calls[0].messages[1].content, "历史-0")
-        self.assertEqual(fake.calls[0].messages[-1].content, "当前消息")
+        # 完整历史必须被读取，P05-04 允许把超出轮数的旧部分送去摘要。
+        self.assertIn("历史-0", fake.calls[0].messages[-1].content)
+        self.assertIn("较早历史已概括", fake.calls[1].messages[0].content)
+        self.assertEqual(fake.calls[1].messages[-1].content, "当前消息")
+        self.assertEqual(len(_run(self.sessions.complete_history("long"))), 503)
 
 
 class ChatHistoryHttpTests(unittest.TestCase):

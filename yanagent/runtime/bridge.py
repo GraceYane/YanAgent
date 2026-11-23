@@ -74,6 +74,7 @@ class AgentBridge:
             context_builder=self.application.context_builder,
         )
         self._applications[key] = application
+        application.recover_runs_on_startup()
         return application
 
     def _instance_for(self, user_id: str, agent_id: str) -> AgentRuntime:
@@ -170,6 +171,18 @@ class AgentBridge:
             payload,
             request_id=request_id,
             queue_key=(user_id, agent_id, session_id),
+        )
+
+    def start_recovery(
+        self, payload: dict[str, Any], *, request_id: str,
+        user_id: str = "local", agent_id: str = "default",
+    ) -> dict[str, Any]:
+        """按完整身份和 Session 锁调度显式恢复，禁止前端自行拼装历史执行。"""
+        runtime = self._instance_for(user_id, agent_id)
+        prepared = runtime.application.prepare_recovery(payload)
+        return runtime.start_stream(
+            {}, request_id=request_id, prepared=prepared,
+            queue_key=(user_id, agent_id, prepared.session_id),
         )
 
     def execute(

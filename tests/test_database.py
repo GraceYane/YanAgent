@@ -124,6 +124,7 @@ class DatabaseSchemaTests(unittest.TestCase):
         }
         legacy_columns["sessions"].remove("message_count")
         legacy_columns["messages"].remove("is_error")
+        legacy_columns.pop("run_steps", None)
         with (
             patch.object(database_module, "CURRENT_SCHEMA_VERSION", 1),
             patch.object(database_module, "MIGRATIONS", (first_migration,)),
@@ -189,6 +190,27 @@ class DatabaseSchemaTests(unittest.TestCase):
                     ") VALUES (?, ?, ?, ?, ?, ?)",
                     ("r1", "u", "a", "s", "unknown", 1),
                 )
+
+    def test_v2_database_upgrades_to_durable_steps_without_losing_runs(self) -> None:
+        """Schema v2 原有 Run 升级后仍存在，并创建 v3 执行日志表。"""
+        legacy_columns = {table: set(columns) for table, columns in database_module.REQUIRED_COLUMNS.items()
+                          if table != 'run_steps'}
+        with (
+            patch.object(database_module, 'CURRENT_SCHEMA_VERSION', 2),
+            patch.object(database_module, 'MIGRATIONS', database_module.MIGRATIONS[:2]),
+            patch.object(database_module, 'REQUIRED_COLUMNS', legacy_columns),
+        ):
+            legacy = Database(data_dir=self.data_dir, environ={})
+            legacy.initialize()
+            with legacy.connection() as conn:
+                conn.execute("INSERT INTO sessions(user_id,agent_id,session_id,created_at,updated_at) VALUES('u','a','s',1,1)")
+                conn.execute("INSERT INTO runs(request_id,user_id,agent_id,session_id,status,created_at) "
+                             "VALUES('old-run','u','a','s','running',1)")
+        upgraded = Database(data_dir=self.data_dir, environ={})
+        self.assertEqual(upgraded.initialize().schema_version, 3)
+        with upgraded.connection() as conn:
+            self.assertEqual(conn.execute("SELECT status FROM runs WHERE request_id='old-run'").fetchone()[0], 'running')
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM run_steps").fetchone()[0], 0)
 
     def test_future_schema_version_is_rejected(self) -> None:
         """旧程序遇到更高版本数据库时必须停止，不能尝试降级写入。"""

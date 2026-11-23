@@ -201,6 +201,10 @@ export interface ChatMessage {
   isCancelled?: boolean
   /** A reply that never reached its answer: cut off (a crash, a quit) or still running. */
   runState?: RunState
+  runId?: string
+  recoveryAvailable?: boolean
+  durationMs?: number | null
+  runErrorCode?: string | null
   error?: string
   /** request_id of a server-pushed (scheduler) message, used to dedupe polls. */
   pushRequestId?: string
@@ -586,6 +590,30 @@ export interface HistoryMessage {
   usage?: MessageUsage
   /** Set on an assistant turn whose run stopped short of its answer. */
   run_state?: RunState
+  run_id?: string
+  recovery_available?: boolean
+  duration_ms?: number | null
+  run_error_code?: string | null
+}
+
+export interface RunDiagnostics {
+  request_id: string
+  run_status: string
+  duration_ms: number | null
+  error_code?: string | null
+  usage: Record<string, number | null>
+  can_continue: boolean
+  can_retry: boolean
+  requires_acknowledgement: boolean
+  steps: Array<{
+    step_id: string
+    kind: 'model' | 'tool'
+    status: string
+    duration_ms: number | null
+    error_code?: string | null
+    data: { call?: { name: string }; attempt?: number }
+    usage: Record<string, number | null>
+  }>
 }
 
 export type RunState = 'interrupted' | 'running'

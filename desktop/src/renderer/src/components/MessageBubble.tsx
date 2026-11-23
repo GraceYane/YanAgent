@@ -14,9 +14,11 @@ import Tooltip from './Tooltip'
 import { useAgentStore, findAgent } from '../store/agentStore'
 import { useSessionSettingsStore, selectSharedConversation } from '../store/sessionSettingsStore'
 import { product } from '@product'
+import RunDiagnostics from './RunDiagnostics'
 
 interface MessageBubbleProps {
   message: ChatMessage
+  sessionId?: string
   onRegenerate?: (id: string) => void
   onEdit?: (id: string) => void
   onDelete?: (msg: ChatMessage) => void
@@ -73,6 +75,7 @@ function usageLabel(usage?: MessageUsage): string {
 
 const MessageBubble: React.FC<MessageBubbleProps> = ({
   message,
+  sessionId,
   onRegenerate,
   onEdit,
   onDelete,
@@ -231,6 +234,10 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({
                 </div>
               )}
             </div>
+          )}
+
+          {sessionId && message.runId && !message.isStreaming && (
+            <RunDiagnostics sessionId={sessionId} requestId={message.runId} />
           )}
 
           {/* Final answer */}

@@ -408,6 +408,7 @@ const ChatPage: React.FC<ChatPageProps> = ({ baseUrl }) => {
                 >
                   <MessageBubble
                     message={msg}
+                    sessionId={activeId}
                     // A teammate's bubble is part of the asking Agent's turn, not
                     // a turn of its own: regenerating it would re-run the whole
                     // turn, which the asking Agent's own bubble already offers.

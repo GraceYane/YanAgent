@@ -330,6 +330,7 @@ class ToolManager:
         confirmation: ToolConfirmationResult | None = None,
         confirmation_handler: Callable[[ToolConfirmationRequest], Awaitable[ToolConfirmationResult]] | None = None,
         max_result_chars: int | None = None,
+        on_execute: Callable[[], Awaitable[None]] | None = None,
     ) -> ToolResult:
         """校验并执行一次工具调用，把所有可预期失败转换为结构化 ToolResult。"""
         if not isinstance(call, ToolCall):
@@ -477,6 +478,9 @@ class ToolManager:
             )
             return self._failure(call_id, "上下文剩余预算不足，本次工具未执行。")
 
+        if on_execute is not None:
+            # 持久化失败必须阻止 handler；不能吞掉错误后继续产生副作用。
+            await on_execute()
         LOGGER.info(
             "[manager.py][ToolManager.execute] 开始执行工具，call_id=%r，"
             "tool=%r，timeout=%.3f",
