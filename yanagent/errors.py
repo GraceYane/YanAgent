@@ -25,11 +25,14 @@ class AgentError(Exception):
     message = "Agent 操作失败。"
     retryable = False
 
-    def __init__(self, *, status_code: int | None = None) -> None:
+    def __init__(
+        self, *, status_code: int | None = None, retry_after_seconds: float | None = None,
+    ) -> None:
         """仅保存合法的上游 HTTP 错误状态，不接受任意异常正文。"""
         self.status_code = (
             status_code if type(status_code) is int and 400 <= status_code <= 599 else None
         )
+        self.retry_after_seconds = retry_after_seconds
         super().__init__(self.message)
 
     def to_dict(self) -> dict[str, Any]:
@@ -212,7 +215,7 @@ class InvalidRequestError(AgentError):
 
 
 class RateLimitError(AgentError):
-    """标识上游限流；可重试只是提示，不自动发起重试。"""
+    """标识上游限流；AgentLoop 可在总期限内执行有限退避重试。"""
 
     code = "rate_limit"
     message = "模型服务请求受限，请稍后重试并检查配额。"
@@ -254,6 +257,13 @@ class ModelRefusalError(ModelResponseError):
 
     code = "model_refusal"
     message = "模型拒绝回答或输出被过滤，请调整请求。"
+
+
+class ModelStreamInterruptedError(ModelResponseError):
+    """标识已有增量输出的模型流失败，禁止自动重放造成重复文字或调用。"""
+
+    code = "model_stream_interrupted"
+    message = "模型流在输出过程中中断，已保留已接收的内容，请核对后重新发起请求。"
 
 
 class ModelServerError(AgentError):

@@ -131,6 +131,7 @@ class ToolDefinition:
     parallel_safe: bool = False
     scope: ToolScope = "session"
     requires_confirmation: bool = False
+    read_only: bool = False
 
     def __post_init__(self) -> None:
         """构造时验证元数据并保存独立 Schema，防止外部字典后改污染定义。"""
@@ -156,6 +157,8 @@ class ToolDefinition:
             raise ToolDefinitionError("工具 scope 不受支持")
         if type(self.requires_confirmation) is not bool:
             raise ToolDefinitionError("工具 requires_confirmation 必须是布尔值")
+        if type(self.read_only) is not bool:
+            raise ToolDefinitionError("工具 read_only 必须是布尔值")
         object.__setattr__(self, "description", self.description.strip())
         object.__setattr__(self, "parameters", _normalize_parameters(self.parameters))
 
@@ -175,6 +178,7 @@ class ToolDefinition:
             "parallel_safe": self.parallel_safe,
             "scope": self.scope,
             "requires_confirmation": self.requires_confirmation,
+            "read_only": self.read_only,
         }
 
 
@@ -218,6 +222,7 @@ class ToolManager:
             parallel_safe=definition.parallel_safe,
             scope=definition.scope,
             requires_confirmation=definition.requires_confirmation,
+            read_only=definition.read_only,
         )
         with self._lock:
             if snapshot.name in self._definitions:
@@ -253,6 +258,7 @@ class ToolManager:
                 parallel_safe=definition.parallel_safe,
                 scope=definition.scope,
                 requires_confirmation=definition.requires_confirmation,
+                read_only=definition.read_only,
             )
 
     def names(self) -> tuple[str, ...]:
@@ -463,7 +469,7 @@ class ToolManager:
             self.max_output_chars,
             self.max_output_chars if max_result_chars is None else max_result_chars,
         )
-        if result_limit < 128:
+        if max_result_chars is not None and max_result_chars < 128:
             LOGGER.info(
                 "[manager.py][ToolManager.execute] 上下文预算不足，跳过工具执行，"
                 "call_id=%r，tool=%r，结果字符预算=%d",

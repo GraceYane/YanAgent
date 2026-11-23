@@ -253,18 +253,25 @@ class YanAgentHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
 
-    def _sse_data(self, payload: dict[str, Any]) -> None:
+    def _sse_data(self, payload: dict[str, Any], *, event_id: int | None = None) -> None:
         """写出一条桌面端按 onmessage 消费的匿名 SSE JSON 事件。"""
         body = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-        self.wfile.write(f"data: {body}\n\n".encode("utf-8"))
+        prefix = f"id: {event_id}\n" if event_id is not None else ""
+        self.wfile.write(f"{prefix}data: {body}\n\n".encode("utf-8"))
         self.wfile.flush()
 
     def _stream(self, request_id: str) -> None:
-        """从 cursor=0 回放并跟随一个运行，直至 done/error 终态。"""
+        """按 Last-Event-ID 续传已有 Run；订阅连接断开不重建任务或执行工具。"""
+        last_id = self.headers.get("Last-Event-ID", "0")
+        if len(last_id) > 10 or not last_id.isascii() or not last_id.isdigit():
+            raise RequestValidationError(reason="invalid", field="body")
+        cursor = int(last_id)
+        try:
+            batch = self.runtime.wait_events(request_id, cursor, timeout=0)
+        except ValueError:
+            raise RequestValidationError(reason="invalid", field="body") from None
         self._sse_headers()
-        cursor = 0
         while True:
-            batch = self.runtime.wait_events(request_id, cursor, timeout=15.0)
             if batch is None:
                 self._sse_data({
                     "type": "error", "reason": "unknown_request",
@@ -276,10 +283,11 @@ class YanAgentHandler(BaseHTTPRequestHandler):
                 self.wfile.write(b": keepalive\n\n")
                 self.wfile.flush()
             for event in events:
-                self._sse_data(event.to_dict())
-                cursor += 1
+                self._sse_data(event.to_dict(), event_id=event.sequence + 1)
+                cursor = event.sequence + 1
             if terminal:
                 return
+            batch = self.runtime.wait_events(request_id, cursor, timeout=15.0)
 
     def do_OPTIONS(self) -> None:  # noqa: N802 - 标准库处理器约定的方法名
         """响应浏览器跨域预检。"""
@@ -389,7 +397,7 @@ class YanAgentHandler(BaseHTTPRequestHandler):
                 "status": "not_implemented",
                 "message": f"Scaffold endpoint not implemented: GET {path}",
             }, HTTPStatus.NOT_IMPLEMENTED)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
             LOGGER.info("[app.py][YanAgentHandler.do_GET] SSE 客户端已断开，运行继续在后台执行")
         except AgentError as error:
             self._error(error)

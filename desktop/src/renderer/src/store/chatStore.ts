@@ -340,6 +340,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     const es = apiClient.createSSEStream(requestId)
     streams[sid] = es
     let tailTimer: ReturnType<typeof setTimeout> | null = null
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null
     // Set on a user-initiated cancel so a trailing error event doesn't fire a
     // spurious "task failed" notification.
     let userCancelled = false
@@ -426,6 +427,8 @@ export const useChatStore = create<ChatState>((set, get) => {
     }
 
     const closeStream = () => {
+      if (reconnectTimer) clearTimeout(reconnectTimer)
+      reconnectTimer = null
       if (tailTimer) {
         clearTimeout(tailTimer)
         tailTimer = null
@@ -797,10 +800,20 @@ export const useChatStore = create<ChatState>((set, get) => {
       void reloadAfterDrop(sid)
     }
 
+    es.onopen = () => {
+      // EventSource 会携带 Last-Event-ID 续传同一个 Run。
+      if (reconnectTimer) clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
     es.onerror = () => {
-      // Stream closed (often the normal end after `done`/tail). Finalize.
-      if (ended) finishStream()
-      else dropStream()
+      if (ended) {
+        finishStream()
+      } else if (es.readyState === EventSource.CONNECTING) {
+        // 短暂断线保留气泡及工具卡片，最多等待 30 秒自动续传。
+        if (!reconnectTimer) reconnectTimer = setTimeout(dropStream, 30_000)
+      } else {
+        dropStream()
+      }
     }
   }
 

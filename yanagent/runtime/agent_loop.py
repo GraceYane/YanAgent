@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import math
 from collections.abc import Awaitable, Callable, Sequence
@@ -22,6 +24,7 @@ from yanagent.contracts import (
 from yanagent.context import estimate_context_usage, trim_complete_turns
 from yanagent.debug_log import yan_debug
 from yanagent.errors import (
+    AgentError,
     AgentLoopConsecutiveFailuresError,
     AgentLoopMaxTurnsError,
     AgentLoopTimeoutError,
@@ -29,6 +32,7 @@ from yanagent.errors import (
     ModelResponseError,
     RequestValidationError,
 )
+from yanagent.retries import retry_delay
 from yanagent.models.provider import ModelProvider
 from yanagent.sessions.store import SessionStore
 from yanagent.tools.manager import ToolManager
@@ -255,8 +259,12 @@ class AgentLoop:
         turns = 0
         usage: Usage = deepcopy(initial_usage)
         consecutive_failures = 0
+        tool_attempts: dict[str, int] = {}
+        tool_results: dict[str, ToolResult] = {}
 
         while True:
+            if turns >= self.max_model_turns:
+                raise AgentLoopMaxTurnsError()
             if self.on_checkpoint is not None:
                 injected = list(await self.on_checkpoint())
                 if injected:
@@ -288,10 +296,10 @@ class AgentLoop:
                 tools=schemas,
             )
             try:
-                reply = await asyncio.wait_for(
-                    self.model_turn(request_messages, schemas),
-                    timeout=remaining,
+                reply, retry_usage = await self._model_with_retry(
+                    request_messages, schemas, deadline=deadline, request_id=request_id,
                 )
+                usage = _merge_usage(usage, retry_usage)
             except (TimeoutError, asyncio.TimeoutError):
                 self._raise_total_timeout(request_id)
             yan_debug(
@@ -397,6 +405,7 @@ class AgentLoop:
 
             failure_limit_reached = False
             total_limit_reached = False
+            current_tool_messages: list[Message] = []
             for index, call in enumerate(reply.tool_calls):
                 tool_started_at = asyncio.get_running_loop().time()
                 if self.on_tool_start is not None:
@@ -453,7 +462,7 @@ class AgentLoop:
                     )
                     try:
                         current_usage = estimate_context_usage(
-                            messages=working,
+                            messages=[*request_messages, assistant, *current_tool_messages],
                             tools=schemas,
                             reserved_output=reserved_output_tokens,
                         )
@@ -462,16 +471,42 @@ class AgentLoop:
                             context_window_tokens - current_usage.total_tokens - 16,
                         )
                         max_result_chars = int(available_result_tokens / 1.08)
-                        result = await asyncio.wait_for(
-                            self.tools.execute(
-                                call,
-                                permission_mode=permission_mode,
-                                permission_context=permission_context,
-                                confirmation_handler=self.confirmation_handler,
-                                max_result_chars=max_result_chars,
-                            ),
-                            timeout=remaining,
-                        )
+                        fingerprint = self._tool_fingerprint(call)
+                        count = tool_attempts.get(fingerprint, 0)
+                        definition = self.tools.get(call.name)
+                        limit = 3 if definition is not None and definition.read_only else 1
+                        if count >= limit:
+                            previous = tool_results.get(fingerprint)
+                            detail = (
+                                f"上次记录为{'失败' if previous.is_error else '成功'}："
+                                f"{previous.content[:512]}"
+                                if previous is not None else "此前结果不确定。"
+                            )
+                            result = ToolResult(
+                                tool_call_id=call.id,
+                                content=f"本 Run 内相同工具和参数已达到执行上限，本次未执行。{detail}"
+                                "请根据已有结果继续，禁止盲目重复操作；必要时请用户核对。",
+                                is_error=True,
+                            )
+                            LOGGER.warning(
+                                "[agent_loop.py][AgentLoop._run_loop] 拦截重复工具请求，"
+                                "request_id=%s，tool=%s，已尝试=%d，上限=%d",
+                                request_id, call.name, count, limit,
+                            )
+                        else:
+                            # 调用前登记：即使超时或异常也不能假定写操作没有副作用。
+                            tool_attempts[fingerprint] = count + 1
+                            result = await asyncio.wait_for(
+                                self.tools.execute(
+                                    call,
+                                    permission_mode=permission_mode,
+                                    permission_context=permission_context,
+                                    confirmation_handler=self.confirmation_handler,
+                                    max_result_chars=max_result_chars,
+                                ),
+                                timeout=remaining,
+                            )
+                            tool_results[fingerprint] = deepcopy(result)
                     except (TimeoutError, asyncio.TimeoutError):
                         total_limit_reached = True
                         result = ToolResult(
@@ -513,6 +548,7 @@ class AgentLoop:
                     stage="tool_result",
                 )
                 working.append(Message.from_dict(tool_message.to_dict()))
+                current_tool_messages.append(tool_message)
                 if self.on_tool_end is not None:
                     self.on_tool_end(
                         call,
@@ -549,6 +585,57 @@ class AgentLoop:
                     self.max_consecutive_tool_failures,
                 )
                 raise AgentLoopConsecutiveFailuresError()
+
+    @staticmethod
+    def _tool_fingerprint(call: ToolCall) -> str:
+        """按工具名和排序后的 JSON 参数生成指纹，忽略模型更换的调用 ID。"""
+        encoded = json.dumps(
+            [call.name, call.arguments], ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False,
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    async def _model_with_retry(
+        self,
+        messages: Sequence[Message],
+        schemas: Sequence[dict[str, Any]],
+        *,
+        deadline: float,
+        request_id: str,
+    ) -> tuple[ModelReply, Usage]:
+        """仅重发当前模型输入；重试等待可取消且始终受 Run 总期限约束。"""
+        retry_usage: Usage = {}
+        for attempt in range(3):
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                self._raise_total_timeout(request_id)
+            try:
+                reply = await asyncio.wait_for(
+                    self.model_turn(deepcopy(list(messages)), deepcopy(list(schemas))),
+                    timeout=remaining,
+                )
+                if not reply.tool_calls and not reply.content.strip():
+                    retry_usage = _merge_usage(retry_usage, reply.usage)
+                    raise EmptyModelResponseError()
+                return reply, retry_usage
+            except AgentError as error:
+                delay = retry_delay(error, attempt)
+                if delay is None:
+                    raise
+                remaining = deadline - asyncio.get_running_loop().time()
+                if delay >= remaining:
+                    LOGGER.warning(
+                        "[agent_loop.py][AgentLoop._model_with_retry] 剩余期限不足以退避，"
+                        "request_id=%s，错误码=%s", request_id, error.code,
+                    )
+                    raise
+                LOGGER.warning(
+                    "[agent_loop.py][AgentLoop._model_with_retry] 仅重试当前模型请求，"
+                    "request_id=%s，错误码=%s，重试=%d，等待秒数=%.3f",
+                    request_id, error.code, attempt + 1, delay,
+                )
+                await asyncio.sleep(delay)
+        raise EmptyModelResponseError()
 
     def _fit_model_context(
         self,

@@ -496,7 +496,10 @@ class NonStreamingAgentLoopTests(unittest.TestCase):
 
     def test_empty_model_reply_fails_once_instead_of_completing_empty_run(self) -> None:
         """空文本且无工具调用不能冒充最终答案，Run 进入稳定失败终态。"""
-        fake = FakeProvider([ModelReply(content="   ", finish_reason="stop")])
+        fake = FakeProvider([
+            ModelReply(content="   ", finish_reason="stop"),
+            ModelReply(content="", finish_reason="stop"),
+        ])
 
         with self.assertRaises(EmptyModelResponseError):
             _run(self._application(fake).chat(

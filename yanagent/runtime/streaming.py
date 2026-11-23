@@ -8,6 +8,7 @@ import logging
 import threading
 import time
 import uuid
+from contextlib import aclosing
 from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
@@ -16,7 +17,7 @@ from yanagent.chat import PreparedChat, YanAgentApplication
 from yanagent.contracts import Message, ModelReply, ToolCall, ToolResult
 from yanagent.errors import (
     AgentError, EmptyModelResponseError, ModelResponseError, ModelTimeoutError,
-    RequestValidationError, SessionStorageError,
+    ModelStreamInterruptedError, RequestValidationError, SessionStorageError,
 )
 from yanagent.events import ClientEventType, RunEvent
 from yanagent.runtime.agent_loop import AgentLoop
@@ -527,28 +528,45 @@ class AgentRuntime:
                 len(messages),
                 len(tools),
             )
-            async for event in prepared.provider.stream(messages, tools=tools):
-                if event.kind == "text_delta":
-                    turn_content.append(event.content)
-                    content.append(event.content)
-                    record.append("delta", {"content": event.content})
-                elif event.kind == "tool_call_delta":
-                    # Provider 在 completed 前负责拼接并校验全部参数；此处绝不提前执行。
-                    LOGGER.debug(
-                        "[streaming.py][AgentRuntime._run_stream] 收到工具调用增量，等待完整参数，"
-                        "request_id=%s，tool_index=%s，参数增量字符数=%d",
-                        record.request_id,
-                        event.tool_index,
-                        len(event.arguments_delta),
+            saw_delta = False
+            try:
+                async with aclosing(prepared.provider.stream(messages, tools=tools)) as stream:
+                    async for event in stream:
+                        if event.kind in {"text_delta", "tool_call_delta"}:
+                            saw_delta = True
+                        if event.kind == "text_delta":
+                            turn_content.append(event.content)
+                            content.append(event.content)
+                            record.append("delta", {"content": event.content})
+                        elif event.kind == "tool_call_delta":
+                            # Provider 在 completed 前负责拼接并校验全部参数；此处绝不提前执行。
+                            LOGGER.debug(
+                                "[streaming.py][AgentRuntime._run_stream] 收到工具调用增量，等待完整参数，"
+                                "request_id=%s，tool_index=%s，参数增量字符数=%d",
+                                record.request_id,
+                                event.tool_index,
+                                len(event.arguments_delta),
+                            )
+                        elif event.kind == "completed":
+                            if completed_reply is not None or event.reply is None:
+                                raise ModelResponseError()
+                            completed_reply = event.reply
+            except AgentError:
+                if saw_delta:
+                    LOGGER.warning(
+                        "[streaming.py][AgentRuntime._run_stream] 模型流已有增量后失败，禁止自动重放，"
+                        "request_id=%s", record.request_id,
                     )
-                elif event.kind == "completed":
-                    if completed_reply is not None or event.reply is None:
-                        raise ModelResponseError()
-                    completed_reply = event.reply
+                    raise ModelStreamInterruptedError() from None
+                raise
             if completed_reply is None:
+                if saw_delta:
+                    raise ModelStreamInterruptedError()
                 raise EmptyModelResponseError()
             if completed_reply.content != "".join(turn_content):
                 raise ModelResponseError()
+            if saw_delta and not completed_reply.tool_calls and not completed_reply.content.strip():
+                raise ModelStreamInterruptedError()
             if completed_reply.tool_calls:
                 record.append("message_end", {
                     "has_tool_calls": True,
@@ -695,12 +713,6 @@ class AgentRuntime:
                 tools=self.application.tool_manager,
                 sessions=self.application.session_store,
                 max_model_turns=prepared.config.max_agent_steps + 1,
-                context_window_tokens=prepared.config.max_context_tokens or 64_000,
-                reserved_output_tokens=min(
-                    4_000,
-                    max(256, (prepared.config.max_context_tokens or 64_000) // 4),
-                ),
-                max_context_turns=prepared.config.max_context_turns,
                 model_turn=stream_model_turn,
                 on_tool_start=emit_tool_start,
                 on_tool_end=emit_tool_end,
@@ -718,6 +730,12 @@ class AgentRuntime:
                     confirmation_ui_available=True,
                 ),
                 initial_usage=context.preparation_usage,
+                context_window_tokens=prepared.config.max_context_tokens or 64_000,
+                reserved_output_tokens=min(
+                    4_000,
+                    max(256, (prepared.config.max_context_tokens or 64_000) // 4),
+                ),
+                max_context_turns=prepared.config.max_context_turns,
             )
             record.set_accepting_instructions(False)
             await reject_uninjected_instructions()

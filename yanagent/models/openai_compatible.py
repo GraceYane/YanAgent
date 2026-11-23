@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import aclosing
+
 import json
 import logging
 import math
@@ -405,15 +407,16 @@ class OpenAICompatibleProvider(NonStreamingProvider):
             payload=request_payload,
             timeout=timeout,
         )
-        async for raw in stream:
-            if raw.strip() == "[DONE]":
-                saw_done = True
-                break
-            data = strict_json_loads(raw)
-            if type(data) is not dict:
-                raise ModelResponseError()
-            for event in builder.add(data):
-                yield event
+        async with aclosing(stream):
+            async for raw in stream:
+                if raw.strip() == "[DONE]":
+                    saw_done = True
+                    break
+                data = strict_json_loads(raw)
+                if type(data) is not dict:
+                    raise ModelResponseError()
+                for event in builder.add(data):
+                    yield event
         if not saw_done:
             raise ModelResponseError()
         reply = builder.finish()

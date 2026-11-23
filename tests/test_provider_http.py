@@ -35,6 +35,8 @@ class LocalHandler(BaseHTTPRequestHandler):
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
+            if status == 429:
+                self.send_header("Retry-After", "7")
             self.end_headers()
             self.wfile.write(raw)
             return
@@ -168,6 +170,17 @@ class LocalHttpTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(error_type) as caught:
                 await self.provider(model).complete([Message("user", "hi")])
             self.assertNotIn("test-secret", str(caught.exception))
+        self.assertEqual(len(self.server.received), 2)
+
+    async def test_retry_after_survives_json_and_sse_error_mapping(self) -> None:
+        """两种传输保留服务端退避秒数，Provider 本身不重复发送。"""
+        with self.assertRaises(RateLimitError) as caught:
+            await self.provider('limited').complete([Message('user', 'hi')])
+        self.assertEqual(caught.exception.retry_after_seconds, 7)
+        with self.assertRaises(RateLimitError) as caught:
+            async for _event in self.provider('limited').stream([Message('user', 'hi')]):
+                pass
+        self.assertEqual(caught.exception.retry_after_seconds, 7)
         self.assertEqual(len(self.server.received), 2)
 
     async def test_real_http_stream_errors_are_classified_without_body_leak(self) -> None:

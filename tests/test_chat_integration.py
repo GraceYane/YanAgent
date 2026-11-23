@@ -418,7 +418,10 @@ class ChatStreamingErrorHttpTests(unittest.TestCase):
         ]
         self.expected_codes = [error.code for error in errors] + ["empty_model_response"]
         self.fake = FakeProvider(
-            [], stream_outcomes=[[error] for error in errors] + [[]],
+            [], stream_outcomes=(
+                [[error] for error in errors[:-1]]
+                + [[RateLimitError()]] * 3 + [[], []]
+            ),
         )
         application = YanAgentApplication(store, provider_factory=lambda _config: self.fake)
         self.server = create_server("127.0.0.1", 0, application=application)
@@ -448,7 +451,7 @@ class ChatStreamingErrorHttpTests(unittest.TestCase):
 
     def _read_events(self, request_id: str) -> list[dict[str, object]]:
         """读取某个 request_id 的全部 SSE JSON 事件。"""
-        with urlopen(self.base_url + f"/stream?request_id={request_id}", timeout=3) as response:
+        with urlopen(self.base_url + f"/stream?request_id={request_id}", timeout=8) as response:
             lines = response.read().decode("utf-8").splitlines()
         return [json.loads(line[6:]) for line in lines if line.startswith("data: ")]
 

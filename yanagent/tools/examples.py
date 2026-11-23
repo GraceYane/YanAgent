@@ -205,6 +205,7 @@ def current_time_definition() -> ToolDefinition:
         handler=current_time_handler,
         risk_level="low",
         parallel_safe=True,
+        read_only=True,
         scope="global",
         requires_confirmation=False,
     )
@@ -233,6 +234,7 @@ def calculator_definition() -> ToolDefinition:
         handler=calculator_handler,
         risk_level="low",
         parallel_safe=True,
+        read_only=True,
         scope="global",
         requires_confirmation=False,
     )

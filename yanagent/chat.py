@@ -340,12 +340,6 @@ class YanAgentApplication:
                 tools=self.tool_manager,
                 sessions=self.session_store,
                 max_model_turns=prepared.config.max_agent_steps + 1,
-                context_window_tokens=prepared.config.max_context_tokens or CONTEXT_WINDOW_TOKENS,
-                reserved_output_tokens=min(
-                    RESERVED_OUTPUT_TOKENS,
-                    max(256, (prepared.config.max_context_tokens or CONTEXT_WINDOW_TOKENS) // 4),
-                ),
-                max_context_turns=prepared.config.max_context_turns,
             ).run(
                 messages=context.messages,
                 tool_schemas=context.tools,
@@ -357,6 +351,12 @@ class YanAgentApplication:
                     request_id=request_id,
                 ),
                 initial_usage=context.preparation_usage,
+                context_window_tokens=prepared.config.max_context_tokens or CONTEXT_WINDOW_TOKENS,
+                reserved_output_tokens=min(
+                    RESERVED_OUTPUT_TOKENS,
+                    max(256, (prepared.config.max_context_tokens or CONTEXT_WINDOW_TOKENS) // 4),
+                ),
+                max_context_turns=prepared.config.max_context_turns,
             )
             reply = loop_result.reply
             assistant_sequence = loop_result.assistant_sequence

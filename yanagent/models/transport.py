@@ -16,6 +16,7 @@ from yanagent.errors import (
     AgentError, InvalidRequestError, ModelConnectionError, ModelResponseError, ModelTimeoutError,
     map_http_error,
 )
+from yanagent.retries import parse_retry_after
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -108,9 +109,12 @@ class UrllibJsonTransport:
                 raw = response.read(self.max_response_bytes + 1)
         except HTTPError as error:
             status = error.code
+            retry_after = parse_retry_after(error.headers.get("Retry-After") if error.headers else None)
             error.close()
             if type(status) is int and 400 <= status <= 599:
-                raise map_http_error(status) from None
+                mapped = map_http_error(status)
+                mapped.retry_after_seconds = retry_after
+                raise mapped from None
             raise ModelResponseError() from None
         except URLError as error:
             if isinstance(error.reason, TimeoutError):
@@ -285,12 +289,14 @@ class UrllibSseTransport:
             publish(_WorkerItem("end"))
         except HTTPError as error:
             status = error.code
+            retry_after = parse_retry_after(error.headers.get("Retry-After") if error.headers else None)
             error.close()
-            publish(_WorkerItem(
-                "error",
+            mapped = (
                 map_http_error(status) if type(status) is int and 400 <= status <= 599
-                else ModelResponseError(),
-            ))
+                else ModelResponseError()
+            )
+            mapped.retry_after_seconds = retry_after
+            publish(_WorkerItem("error", mapped))
         except URLError as error:
             mapped = (
                 ModelTimeoutError()
