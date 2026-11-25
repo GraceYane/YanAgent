@@ -6,6 +6,8 @@ import json
 import logging
 import signal
 import uuid
+import hmac
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, cast
@@ -27,6 +29,8 @@ from yanagent.errors import (
 from yanagent.runtime import AgentBridge
 from yanagent.sessions import DesktopSessionService, RunStore, SessionStore
 from yanagent.storage import Database
+from yanagent.workspace_paths import WorkspaceError, WorkspaceAccessError
+from yanagent.workspaces import WorkspaceBusyError
 
 
 LOGGER = logging.getLogger("yanagent.http")
@@ -51,6 +55,10 @@ def empty_sessions_payload() -> dict[str, Any]:
 
 def _http_status(error: AgentError) -> HTTPStatus:
     """将内部稳定错误类型映射为 HTTP 状态，正文仍使用统一错误对象。"""
+    if isinstance(error, WorkspaceBusyError):
+        return HTTPStatus.CONFLICT
+    if isinstance(error, WorkspaceError):
+        return HTTPStatus.BAD_REQUEST
     if isinstance(error, (
         RequestValidationError, ConfigurationError, InvalidRequestError, SessionValidationError,
     )):
@@ -125,6 +133,88 @@ class YanAgentHandler(BaseHTTPRequestHandler):
 
     server_version = "YanAgent/0.1"
 
+    def _workspace(self):
+        """文件接口只接受桌面主进程取得的凭证，不能由任意网页跨域读盘。"""
+        service = self.application.workspaces
+        token = self.headers.get('X-YanAgent-Workspace', '')
+        if service is None or not hmac.compare_digest(token, service.access_token):
+            raise WorkspaceAccessError()
+        return service
+
+    def _workspace_get(self, path, parsed):
+        """处理项目选择器、文件树、有限搜索及只读文本预览。"""
+        if path == '/api/workspace/access':
+            if self.headers.get('Origin') is not None or self.headers.get('Sec-Fetch-Site') is not None or self.application.workspaces is None:
+                raise WorkspaceAccessError()
+            self._json({'token': self.application.workspaces.access_token})
+            return True
+        if not (path.startswith('/api/workspace/') or path == '/api/projects'):
+            return False
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        self._validate_agent(self._query_text(query, 'agent_id'))
+        session = self._query_text(query, 'session', allow_empty=True) or ''
+        value = self._query_text(query, 'path', maximum=4096, allow_empty=True) or ''
+        if path == '/api/workspace/preview':
+            service = self.application.workspaces
+            expires = self._query_int(query, 'expires', minimum=0)
+            token = self._query_text(query, 'token') or ''
+            if service is None:
+                raise WorkspaceAccessError()
+            result = service.preview(session, value, expires, token)
+            body = result['content'].encode('utf-8')
+            self.send_response(HTTPStatus.OK)
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Content-Security-Policy', "sandbox; default-src 'none'")
+            self.send_header('Referrer-Policy', 'no-referrer')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-YanAgent-Preview-Limited', '1' if result['truncated'] or result['lossy'] else '0')
+            self.send_header('Access-Control-Expose-Headers', 'X-YanAgent-Preview-Limited')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(body)
+            return True
+        service = self._workspace()
+        if path == '/api/projects':
+            result = service.state(session)
+        elif path == '/api/workspace/tree':
+            result = service.tree(session, value)
+        elif path == '/api/workspace/resolve':
+            result = service.resolve(session, value)
+        elif path == '/api/workspace/read':
+            result = service.read(session, value)
+        elif path == '/api/workspace/search':
+            result = service.search(session, self._query_text(query, 'q') or '', self._query_int(query, 'limit', default=30, minimum=1))
+        else:
+            raise WorkspaceError()
+        self._json(result)
+        return True
+
+    def _workspace_post(self, path, payload):
+        """白名单处理手动项目关联、新建、排序及已有文本保存。"""
+        if path not in {'/api/projects/select', '/api/projects/create', '/api/projects/order', '/api/workspace/write'}:
+            return False
+        service = self._workspace()
+        self._validate_agent(payload.get('agent_id'))
+        allowed = {
+            '/api/projects/select': {'session', 'project_dir'}, '/api/projects/create': {'session', 'name'},
+            '/api/projects/order': {'order'}, '/api/workspace/write': {'session', 'path', 'content', 'expected_mtime', 'expected_etag'},
+        }[path] | {'agent_id'}
+        if set(payload) - allowed:
+            raise WorkspaceError()
+        session = payload.get('session', '')
+        if path == '/api/projects/select':
+            result = service.select(session, payload.get('project_dir'))
+        elif path == '/api/projects/create':
+            result = service.create(session, payload.get('name'))
+        elif path == '/api/projects/order':
+            result = service.manage('order', order=payload.get('order'))
+        else:
+            result = service.write(session, payload.get('path'), payload.get('content'), payload.get('expected_mtime'), payload.get('expected_etag'))
+        self._json(result)
+        return True
+
     @property
     def application(self) -> YanAgentApplication:
         """从类型化 Server 获取共享应用层。"""
@@ -147,14 +237,15 @@ class YanAgentHandler(BaseHTTPRequestHandler):
         *,
         required: bool = False,
         maximum: int = 256,
+        allow_empty: bool = False,
     ) -> str | None:
-        """读取单值查询参数，拒绝重复、空必填值和异常长度。"""
+        """读取单值查询参数；仅显式 allow_empty 的工作区根等参数可为空。"""
         values = query.get(field, [])
         if not values:
             if required:
                 raise RequestValidationError(reason="missing", field=field)
             return None
-        if len(values) != 1 or not values[0] or len(values[0]) > maximum:
+        if len(values) != 1 or (not values[0] and (required or not allow_empty)) or len(values[0]) > maximum:
             raise RequestValidationError(reason="invalid", field=field)
         return values[0]
 
@@ -207,7 +298,7 @@ class YanAgentHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-YanAgent-Workspace")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.end_headers()
         self.wfile.write(body)
@@ -300,6 +391,8 @@ class YanAgentHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         try:
+            if self._workspace_get(path, parsed):
+                return
             if path == "/stream":
                 values = parse_qs(parsed.query, keep_blank_values=True).get("request_id", [])
                 if len(values) != 1 or not values[0] or len(values[0]) > 128:
@@ -425,6 +518,8 @@ class YanAgentHandler(BaseHTTPRequestHandler):
         request_id: str | None = None
         try:
             payload = self._body()
+            if self._workspace_post(path, payload):
+                return
             if path == "/message":
                 request_id = f"run-{uuid.uuid4().hex}"
                 LOGGER.info(
@@ -589,6 +684,13 @@ class YanAgentHandler(BaseHTTPRequestHandler):
         """处理桌面会话重命名和置顶状态修改。"""
         path = urlparse(self.path).path
         try:
+            if path == '/api/projects/manage':
+                payload = self._body()
+                self._validate_agent(payload.get('agent_id'))
+                if set(payload) - {'path', 'name', 'agent_id'}:
+                    raise WorkspaceError()
+                self._json(self._workspace().manage('rename', payload.get('path'), payload.get('name')))
+                return
             if not path.startswith("/api/sessions/") or path.endswith("/generate_title"):
                 self._json({
                     "status": "not_implemented",
@@ -631,6 +733,13 @@ class YanAgentHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         try:
+            if path == '/api/projects/manage':
+                payload = self._body()
+                self._validate_agent(payload.get('agent_id'))
+                if set(payload) - {'path', 'agent_id'}:
+                    raise WorkspaceError()
+                self._json(self._workspace().manage('delete', payload.get('path')))
+                return
             if not path.startswith("/api/sessions/"):
                 self._json({
                     "status": "not_implemented",

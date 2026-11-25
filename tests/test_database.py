@@ -125,6 +125,7 @@ class DatabaseSchemaTests(unittest.TestCase):
         legacy_columns["sessions"].remove("message_count")
         legacy_columns["messages"].remove("is_error")
         legacy_columns.pop("run_steps", None)
+        legacy_columns.pop('workspace_projects', None)
         with (
             patch.object(database_module, "CURRENT_SCHEMA_VERSION", 1),
             patch.object(database_module, "MIGRATIONS", (first_migration,)),
@@ -194,7 +195,7 @@ class DatabaseSchemaTests(unittest.TestCase):
     def test_v2_database_upgrades_to_durable_steps_without_losing_runs(self) -> None:
         """Schema v2 原有 Run 升级后仍存在，并创建 v3 执行日志表。"""
         legacy_columns = {table: set(columns) for table, columns in database_module.REQUIRED_COLUMNS.items()
-                          if table != 'run_steps'}
+                          if table not in {'run_steps', 'workspace_projects'}}
         with (
             patch.object(database_module, 'CURRENT_SCHEMA_VERSION', 2),
             patch.object(database_module, 'MIGRATIONS', database_module.MIGRATIONS[:2]),
@@ -207,7 +208,7 @@ class DatabaseSchemaTests(unittest.TestCase):
                 conn.execute("INSERT INTO runs(request_id,user_id,agent_id,session_id,status,created_at) "
                              "VALUES('old-run','u','a','s','running',1)")
         upgraded = Database(data_dir=self.data_dir, environ={})
-        self.assertEqual(upgraded.initialize().schema_version, 3)
+        self.assertEqual(upgraded.initialize().schema_version, CURRENT_SCHEMA_VERSION)
         with upgraded.connection() as conn:
             self.assertEqual(conn.execute("SELECT status FROM runs WHERE request_id='old-run'").fetchone()[0], 'running')
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM run_steps").fetchone()[0], 0)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import re
 from typing import Any
 
@@ -58,6 +59,12 @@ class DesktopSessionService:
     async def list_sessions(self, *, page: int, page_size: int) -> dict[str, Any]:
         """返回桌面会话分页，并附上单 Agent 所有者标识。"""
         result = await self.store.list_sessions(page=page, page_size=page_size)
+        with self.store.database.connection() as conn:
+            projects = conn.execute('SELECT path FROM workspace_projects WHERE user_id=? AND agent_id=? ORDER BY sort_order,used_at DESC',
+                                    (self.store.user_id, self.store.agent_id)).fetchall()
+            rows = conn.execute('SELECT metadata_json FROM sessions WHERE user_id=? AND agent_id=?',
+                                (self.store.user_id, self.store.agent_id)).fetchall()
+        spaces = {json.loads(row['metadata_json']).get('workspace_project', {}).get('path', '__default__') for row in rows}
         return {
             "status": "success",
             "sessions": [self._session_payload(record) for record in result.sessions],
@@ -65,8 +72,9 @@ class DesktopSessionService:
             "page": result.page,
             "page_size": result.page_size,
             "has_more": result.has_more,
-            "group_mode": "time",
-            "project_order": [],
+            "group_mode": "project" if len(spaces) > 1 else "time",
+            "space_count": len(spaces),
+            "project_order": ['__default__', *[row['path'] for row in projects]],
         }
 
     async def history(
@@ -217,6 +225,7 @@ class DesktopSessionService:
             "msg_count": record.message_count,
             "pinned": record.pinned,
             "agent": {"id": record.agent_id, "name": "YanAgent"},
+            "project": record.metadata.get('workspace_project'),
         }
 
     def _message_payload(self, record: StoredMessage) -> dict[str, Any]:

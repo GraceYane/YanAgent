@@ -15,10 +15,8 @@ interface WorkspaceSelectorProps {
 }
 
 /**
- * Per-session project workspace picker. Mirrors the web console: pick the
- * default workspace (~/cow), a recent project, create a new project, or open
- * an existing directory via the native OS folder dialog. Selecting a project
- * scopes the agent's cwd, previews and `@` picker to that directory.
+ * 会话工作区选择器：选择默认目录、最近项目、托管新项目或系统对话框中的目录。
+ * 关联影响文件树、预览与手动编辑；模型文件/命令工具在后续阶段接入。
  */
 const WorkspaceSelector: React.FC<WorkspaceSelectorProps> = ({ sessionId }) => {
   const [state, setState] = useState<ProjectState | null>(null)
@@ -29,6 +27,9 @@ const WorkspaceSelector: React.FC<WorkspaceSelectorProps> = ({ sessionId }) => {
   const [newName, setNewName] = useState('')
   const [newError, setNewError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [selectionError, setSelectionError] = useState('')
+  const sessionRef = useRef(sessionId)
+  sessionRef.current = sessionId
   const rootRef = useRef<HTMLDivElement>(null)
 
   const reloadRoot = useWorkspaceStore((s) => s.reloadRoot)
@@ -38,7 +39,7 @@ const WorkspaceSelector: React.FC<WorkspaceSelectorProps> = ({ sessionId }) => {
     if (!sessionId) return
     try {
       const data = await apiClient.getProjects(sessionId)
-      if (data.status === 'success') setState(data)
+      if (data.status === 'success' && sessionRef.current === sessionId) setState(data)
     } catch {
       /* keep last state; selector is non-critical */
     }
@@ -74,6 +75,7 @@ const WorkspaceSelector: React.FC<WorkspaceSelectorProps> = ({ sessionId }) => {
   // session id is unchanged, so we force a root reload rather than relying on
   // the session-switch path (which would no-op).
   const applyState = (next: ProjectState) => {
+    if (sessionRef.current !== sessionId) return
     setState(next)
     openPanel('files')
     reloadRoot()
@@ -101,11 +103,12 @@ const WorkspaceSelector: React.FC<WorkspaceSelectorProps> = ({ sessionId }) => {
     if (!(await useWorkspaceStore.getState().guardUnsavedEdit())) return
     setOpenMenu(null)
     setBusy(true)
+    setSelectionError('')
     try {
       const res = await apiClient.selectProject(sessionId, projectDir)
       if (res.status === 'success') applyState(res)
-    } catch {
-      /* transient; leave current state untouched */
+    } catch (error) {
+      setSelectionError(error instanceof Error ? error.message : String(error))
     } finally {
       setBusy(false)
     }
@@ -156,6 +159,7 @@ const WorkspaceSelector: React.FC<WorkspaceSelectorProps> = ({ sessionId }) => {
 
   return (
     <div ref={rootRef} className="relative min-w-0">
+      {selectionError && <div role="alert" className="absolute bottom-full mb-2 text-xs text-danger w-72">{selectionError}</div>}
       <Tooltip label={fullPath || t('ws_sel_tip')}>
         <button
           type="button"

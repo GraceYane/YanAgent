@@ -583,6 +583,20 @@ function setupIPC() {
     return pythonBackend?.getDesktopToken() ?? ''
   })
 
+  /** 仅由可信桌面主窗口向本机后端取得本次进程的文件访问凭证。 */
+  ipcMain.handle('get-workspace-token', async (event, backendUrl: string) => {
+    if (event.sender !== mainWindow?.webContents) throw new Error('窗口无权访问工作区')
+    const port = await pythonBackend?.whenPortReady()
+    if (!port) return ''
+    const selected = new URL(backendUrl)
+    if (selected.protocol !== 'http:' || !['127.0.0.1', 'localhost'].includes(selected.hostname) || selected.port !== String(port)
+      || selected.username || selected.password) throw new Error('工作区只允许连接当前本机后端')
+    const response = await fetch(`http://127.0.0.1:${port}/api/workspace/access`, { signal: AbortSignal.timeout(5000), redirect: 'error' })
+    if (!response.ok) throw new Error('无法取得工作区访问凭证')
+    const data = await response.json() as { token?: string }
+    return data.token || ''
+  })
+
   ipcMain.handle('restart-backend', async () => {
     await pythonBackend?.restart()
     return true

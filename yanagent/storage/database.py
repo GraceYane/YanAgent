@@ -17,7 +17,7 @@ from pathlib import Path
 LOGGER = logging.getLogger("yanagent.storage")
 DATA_DIR_ENV = "YANAGENT_DATA_DIR"
 DATABASE_FILENAME = "yanagent.db"
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 
 class DatabaseInitializationError(RuntimeError):
@@ -196,7 +196,18 @@ MIGRATIONS += (
 )
 
 
+MIGRATIONS += (
+    Migration(version=4, name='workspace_projects', statements=(
+        '''CREATE TABLE workspace_projects (
+            user_id TEXT NOT NULL, agent_id TEXT NOT NULL, path TEXT NOT NULL,
+            name TEXT NOT NULL, used_at INTEGER NOT NULL, sort_order INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(user_id, agent_id, path))''',
+    )),
+)
+
+
 REQUIRED_COLUMNS = {
+    'workspace_projects': {'user_id', 'agent_id', 'path', 'name', 'used_at', 'sort_order'},
     "schema_migrations": {"version", "name", "checksum", "applied_at"},
     "sessions": {
         "user_id", "agent_id", "session_id", "title", "pinned", "created_at",

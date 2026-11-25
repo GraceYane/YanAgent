@@ -36,6 +36,7 @@ export interface EditState {
   baseline: string
   /** mtime the edit started from; a stale one is rejected by the backend. */
   baseMtime: number
+  baseEtag?: string
   dirty: boolean
   saving: boolean
   error: string | null
@@ -365,7 +366,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // Compared by path, not identity: a save or a tree refresh replaces the
     // entry with an equal-but-new object, and an identity check would then
     // abort the edit for no reason and leave the button looking dead.
-    if (get().current?.path !== current.path) return
+    if (get().sessionId !== sessionId || get().current?.abs_path !== current.abs_path || get().current?.path !== current.path) return
     if (res.status !== 'success' || !res.editable) {
       // Truncation is reported first: a partial read can also split a
       // multi-byte character and so come back lossy, but the size is the
@@ -390,6 +391,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         loaded: content,
         baseline: content,
         baseMtime: res.mtime,
+        baseEtag: res.etag,
         dirty: false,
         saving: false,
         error: null,
@@ -420,9 +422,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         content,
         session: sessionId,
         expectedMtime: force ? null : edit.baseMtime,
+        expectedEtag: edit.baseEtag,
       })
       // A save that landed after the user moved on must not revive the editor.
-      if (get().edit?.file.path !== edit.file.path) return
+      if (get().sessionId !== sessionId || get().edit?.file.abs_path !== edit.file.abs_path || get().edit?.file.path !== edit.file.path) return
 
       if (res.code === 'conflict') {
         set((s) => (s.edit ? { edit: { ...s.edit, saving: false } } : s))
@@ -449,6 +452,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
             // rewriting it would be a no-op here anyway.
             baseline: content,
             baseMtime: res.mtime ?? edit.baseMtime,
+            baseEtag: res.etag,
             dirty: false,
             saving: false,
           },

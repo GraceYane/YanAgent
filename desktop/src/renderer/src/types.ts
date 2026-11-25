@@ -11,6 +11,7 @@ export interface ElectronAPI {
   getDataDir: () => Promise<string>
   /** Per-launch secret shared with the spawned backend (desktop-only requests). */
   getDesktopToken?: () => Promise<string>
+  getWorkspaceToken?: (baseUrl: string) => Promise<string>
   /** On-disk path of a picked/dropped File; '' when it has none (pasted image). */
   getPathForFile?: (file: File) => string
   restartBackend: () => Promise<boolean>
@@ -267,6 +268,7 @@ export interface WorkspaceEntry {
 
 /** Response of GET /api/workspace/read: the editor's initial content. */
 export interface WorkspaceReadResult {
+  etag?: string
   path: string
   content: string
   /** The read stopped at the size cap, so the tail is missing. */
@@ -282,6 +284,7 @@ export interface WorkspaceReadResult {
 
 /** Response of POST /api/workspace/write. */
 export interface WorkspaceWriteResult {
+  etag?: string
   path?: string
   size?: number
   mtime?: number

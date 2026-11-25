@@ -32,6 +32,7 @@ from yanagent.models import ModelProvider
 from yanagent.models.factory import create_single_provider, create_provider_chain, select_model
 from yanagent.models.catalog import PROVIDERS
 from yanagent.models.normalization import context_limits, reasoning_capability
+from yanagent.workspaces import WorkspaceService
 from yanagent.models.settings import models_payload as multi_models_payload, save_model_action as save_multi_model_action, model_names
 from yanagent.runtime.agent_loop import AgentLoop
 from yanagent.sessions import RunStore, SessionStore, StoredMessage
@@ -64,6 +65,7 @@ class PreparedChat:
     recovery_source: str | None = None
     recovery_mode: str = "continue"
     acknowledge_uncertain: bool = False
+    workspace_root: str | None = None
 
 
 @dataclass(frozen=True)
@@ -124,6 +126,7 @@ class YanAgentApplication:
             provider_factory if provider_factory is not None else create_single_provider
         )
         self.session_store = session_store
+        self.workspaces = WorkspaceService(session_store) if session_store is not None else None
         self.run_store = run_store
         self.executions = None if run_store is None else ExecutionStore(run_store)
         self.recovery = (
@@ -415,6 +418,7 @@ class YanAgentApplication:
             metadata={
                 "provider": prepared.config.model_provider,
                 "model": prepared.config.model,
+                "workspace_root": prepared.workspace_root,
             },
         )
         return True
@@ -427,6 +431,7 @@ class YanAgentApplication:
         await self._ensure_session(prepared.session_id)
         await self.run_store.create(request_id, prepared.session_id, status="queued", metadata={
             "provider": prepared.config.model_provider, "model": prepared.config.model,
+            "workspace_root": prepared.workspace_root,
             "queued_message": prepared.message.content,
         })
         return True
@@ -776,6 +781,7 @@ class YanAgentApplication:
             agent_id=self.session_store.agent_id,
             session_id=session_id,
             request_id="context-usage",
+            workspace_root=str(self.workspaces.root(session_id)) if self.workspaces else None,
         )
         built = self.context_builder.build(
             identity=identity,
@@ -892,6 +898,7 @@ class YanAgentApplication:
             agent_id=agent_id,
             session_id=prepared.session_id,
             request_id=request_id,
+            workspace_root=prepared.workspace_root,
         )
 
     def tool_permission_context(
@@ -964,6 +971,7 @@ class YanAgentApplication:
             message=Message(role="user", content=message),
             config=config,
             provider=create_provider_chain(config, self.provider_factory),
+            workspace_root=str(self.workspaces.root(session_id)) if self.workspaces is not None else None,
         )
 
     def _session_model_config(self, session_id: str) -> AppConfig:

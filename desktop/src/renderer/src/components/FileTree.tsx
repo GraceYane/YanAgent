@@ -23,21 +23,24 @@ const FileTree: React.FC = () => {
   const [searching, setSearching] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const requestSeq = useRef(0)
 
   const loadDir = useCallback(async (path: string) => {
+    const request = ++requestSeq.current
     setLoading(true)
     setError(null)
     try {
       const data = await apiClient.workspaceTree(path, sessionId)
+      if (request !== requestSeq.current) return
       setDir(data.path || '')
       setRoot(data.root || '')
       setEntries(data.entries || [])
       setTruncated(!!data.truncated)
       setSearching(false)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      if (request === requestSeq.current) setError(e instanceof Error ? e.message : String(e))
     } finally {
-      setLoading(false)
+      if (request === requestSeq.current) setLoading(false)
     }
   }, [sessionId])
 
@@ -60,17 +63,19 @@ const FileTree: React.FC = () => {
       return
     }
     timerRef.current = setTimeout(async () => {
+      const request = ++requestSeq.current
       setLoading(true)
       setError(null)
       try {
         const data = await apiClient.workspaceSearch(query, 60, sessionId)
+        if (request !== requestSeq.current) return
         setEntries(data.results || [])
         setTruncated(false)
         setSearching(true)
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e))
+        if (request === requestSeq.current) setError(e instanceof Error ? e.message : String(e))
       } finally {
-        setLoading(false)
+        if (request === requestSeq.current) setLoading(false)
       }
     }, 220)
     return () => {
@@ -79,7 +84,7 @@ const FileTree: React.FC = () => {
     // `dir`/`searching` are read only to restore the listing when the query
     // clears; re-running on their change would fight the user's typing.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [query])
+  }, [query, sessionId])
 
   const crumbs = dir.split('/').filter(Boolean)
 

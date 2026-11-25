@@ -162,14 +162,25 @@ class ApiClient {
 
   private async request<T>(path: string, rawOptions?: RequestInit): Promise<T> {
     const { path: url, options } = this.carryAgent(path, rawOptions)
+    // 文件授权仅经桌面主进程获取；普通网页不能借通用 CORS 直接读写本机文件。
+    let workspaceToken: string | undefined
+    if (/^\/api\/(workspace\/|projects(?:[/?]|$))/.test(path)) {
+      if (!window.electronAPI?.getWorkspaceToken) {
+        throw new Error('当前桌面进程尚未加载工作区接口，请完全退出后重新启动桌面端；仅刷新页面无效。')
+      }
+      workspaceToken = await window.electronAPI.getWorkspaceToken(this.baseUrl)
+      if (!workspaceToken) throw new Error('尚未取得工作区访问凭证，请确认后端已启动并重新启动桌面端。')
+    }
     const res = await fetch(`${this.baseUrl}${url}`, {
       ...options,
+      ...(workspaceToken ? { redirect: 'error' as RequestRedirect } : {}),
       // Cookies still work for browser access; the desktop app relies on the
       // Authorization header below.
       credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
         ...(this.authToken ? { Authorization: `Bearer ${this.authToken}` } : {}),
+        ...(workspaceToken ? { 'X-YanAgent-Workspace': workspaceToken } : {}),
         ...options?.headers,
       },
     })
@@ -555,6 +566,7 @@ class ApiClient {
     content: string
     session?: string
     expectedMtime?: number | null
+    expectedEtag?: string
   }): Promise<WorkspaceWriteResult & ApiResult> {
     return this.request('/api/workspace/write', {
       method: 'POST',
@@ -563,6 +575,7 @@ class ApiClient {
         content: args.content,
         session: args.session || '',
         expected_mtime: args.expectedMtime ?? null,
+        expected_etag: args.expectedEtag,
       }),
     })
   }
@@ -575,7 +588,7 @@ class ApiClient {
     return this.request(`/api/projects?session=${encodeURIComponent(session)}`)
   }
 
-  /** Bind the session to a project dir, or clear it (projectDir=null → ~/cow). */
+  /** 关联当前会话项目；null 恢复 YanAgent 当前身份的默认工作区。 */
   async selectProject(session: string, projectDir: string | null): Promise<ProjectState & ApiResult> {
     return this.request('/api/projects/select', {
       method: 'POST',

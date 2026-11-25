@@ -201,9 +201,9 @@ const WorkspacePanel: React.FC = () => {
                 <IconButton onClick={openExternally} title={t('ws_open_external')}>
                   <ExternalLink size={13} />
                 </IconButton>
-                <IconButton onClick={download} title={t('ws_download')}>
+                {current.raw_url && <IconButton onClick={download} title={t('ws_download')}>
                   <Download size={13} />
-                </IconButton>
+                </IconButton>}
                 <IconButton onClick={copyPath} title={t('ws_copy_path')}>
                   {copied ? <Check size={13} /> : <Link2 size={13} />}
                 </IconButton>

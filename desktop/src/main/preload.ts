@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getBackendError: () => ipcRenderer.invoke('get-backend-error'),
   getDataDir: () => ipcRenderer.invoke('get-data-dir') as Promise<string>,
   getDesktopToken: () => ipcRenderer.invoke('get-desktop-token') as Promise<string>,
+  getWorkspaceToken: (baseUrl: string) => ipcRenderer.invoke('get-workspace-token', baseUrl) as Promise<string>,
   // Real on-disk path of a File picked or dropped by the user, so the local
   // backend can read it directly instead of receiving the bytes over HTTP.
   // '' for files with no path (e.g. a pasted clipboard image).

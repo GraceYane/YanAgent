@@ -20,7 +20,7 @@ const Centered: React.FC<{ children: React.ReactNode }> = ({ children }) => (
 
 /** Text-based previews (markdown / code / csv) fetch the file, then render. */
 const TextPreview: React.FC<{ file: WorkspaceEntry }> = ({ file }) => {
-  const [state, setState] = useState<{ text?: string; error?: string; loading: boolean }>({
+  const [state, setState] = useState<{ text?: string; error?: string; loading: boolean; limited?: boolean }>({
     loading: true,
   })
 
@@ -28,11 +28,11 @@ const TextPreview: React.FC<{ file: WorkspaceEntry }> = ({ file }) => {
     let cancelled = false
     setState({ loading: true })
     fetch(apiClient.getPreviewUrl(file.preview_url!))
-      .then((res) => {
+      .then(async (res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        return res.text()
+        return { text: await res.text(), limited: res.headers.get('X-YanAgent-Preview-Limited') === '1' }
       })
-      .then((text) => !cancelled && setState({ text, loading: false }))
+      .then((data) => !cancelled && setState({ ...data, loading: false }))
       .catch((e) => !cancelled && setState({ error: String(e.message || e), loading: false }))
     return () => {
       cancelled = true
@@ -59,6 +59,7 @@ const TextPreview: React.FC<{ file: WorkspaceEntry }> = ({ file }) => {
   if (file.kind === 'markdown') {
     return (
       <div className="p-4">
+        {state.limited && <p className="text-xs text-amber-600">{t('ws_preview_limited')}</p>}
         <Markdown content={state.text || ''} />
       </div>
     )
@@ -71,6 +72,8 @@ const TextPreview: React.FC<{ file: WorkspaceEntry }> = ({ file }) => {
       : null
 
   return (
+    <>
+    {state.limited && <p className="px-4 text-xs text-amber-600">{t('ws_preview_limited')}</p>}
     <pre className="m-0 p-4 text-[12.5px] leading-relaxed overflow-auto">
       {highlighted ? (
         <code className="hljs" dangerouslySetInnerHTML={{ __html: highlighted }} />
@@ -78,6 +81,7 @@ const TextPreview: React.FC<{ file: WorkspaceEntry }> = ({ file }) => {
         <code>{state.text}</code>
       )}
     </pre>
+    </>
   )
 }
 
@@ -156,13 +160,13 @@ const FilePreview: React.FC<FilePreviewProps> = ({ file, error }) => {
           <Icon size={26} className={colorFor(file.kind)} />
           <span className="text-content">{file.name}</span>
           <span>{t('ws_no_inline_preview')}</span>
-          <button
+          {file.raw_url && <button
             onClick={() => window.open(rawSrc, '_blank')}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-btn border border-default hover:border-accent hover:text-accent cursor-pointer transition-colors"
           >
             <Download size={13} />
             {t('ws_download')}
-          </button>
+          </button>}
         </Centered>
       )
     }
