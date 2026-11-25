@@ -8,9 +8,10 @@ from typing import Any, Literal
 from yanagent.contracts import ModelReply
 
 
-ModelStreamKind = Literal["text_delta", "tool_call_delta", "completed"]
+ModelStreamKind = Literal["text_delta", "reasoning_delta", "tool_call_delta", "completed"]
 ClientEventType = Literal[
     "delta",
+    "reasoning",
     "message_end",
     "tool_start",
     "tool_end",
@@ -38,8 +39,8 @@ class ModelStreamEvent:
 
     def __post_init__(self) -> None:
         """拒绝含糊事件，避免上层靠猜测区分文本、工具和最终结果。"""
-        if self.kind == "text_delta":
-            valid = bool(self.content) and self.tool_index is None and self.reply is None
+        if self.kind in {"text_delta", "reasoning_delta"}:
+            valid = type(self.content) is str and bool(self.content) and self.tool_index is None and self.reply is None
         elif self.kind == "tool_call_delta":
             valid = (
                 type(self.tool_index) is int
@@ -47,8 +48,10 @@ class ModelStreamEvent:
                 and self.reply is None
                 and bool(self.tool_call_id or self.tool_name or self.arguments_delta)
             )
-        else:
+        elif self.kind == "completed":
             valid = self.reply is not None and self.tool_index is None
+        else:
+            valid = False
         if not valid:
             raise ValueError("模型流事件字段与事件类型不匹配")
 
@@ -70,6 +73,7 @@ class RunEvent:
             raise ValueError("运行事件必须包含 request_id")
         if self.type not in {
             "delta",
+            "reasoning",
             "message_end",
             "tool_start",
             "tool_end",

@@ -15,6 +15,7 @@ from typing import Any, TypeVar
 
 from yanagent.chat import PreparedChat, YanAgentApplication
 from yanagent.contracts import Message, ModelReply, ToolCall, ToolResult
+from yanagent.models.normalization import context_limits
 from yanagent.errors import (
     AgentError, EmptyModelResponseError, ModelResponseError, ModelTimeoutError,
     ModelStreamInterruptedError, RequestValidationError, SessionStorageError,
@@ -554,6 +555,7 @@ class AgentRuntime:
         ) -> ModelReply:
             """消费一轮 Provider 流，实时转发文本，并仅返回已完整解析的轮次结果。"""
             turn_content: list[str] = []
+            turn_reasoning: list[str] = []
             completed_reply: ModelReply | None = None
             LOGGER.info(
                 "[streaming.py][AgentRuntime._run_stream] 开始流式模型轮次，"
@@ -566,12 +568,16 @@ class AgentRuntime:
             try:
                 async with aclosing(prepared.provider.stream(messages, tools=tools)) as stream:
                     async for event in stream:
-                        if event.kind in {"text_delta", "tool_call_delta"}:
+                        if event.kind in {"text_delta", "tool_call_delta", "reasoning_delta"}:
                             saw_delta = True
                         if event.kind == "text_delta":
                             turn_content.append(event.content)
                             content.append(event.content)
                             record.append("delta", {"content": event.content})
+                        elif event.kind == 'reasoning_delta':
+                            if prepared.config.enable_thinking:
+                                turn_reasoning.append(event.content)
+                                record.append('reasoning', {'content': event.content})
                         elif event.kind == "tool_call_delta":
                             # Provider 在 completed 前负责拼接并校验全部参数；此处绝不提前执行。
                             LOGGER.debug(
@@ -585,19 +591,25 @@ class AgentRuntime:
                             if completed_reply is not None or event.reply is None:
                                 raise ModelResponseError()
                             completed_reply = event.reply
-            except AgentError:
+            except AgentError as error:
                 if saw_delta:
                     LOGGER.warning(
                         "[streaming.py][AgentRuntime._run_stream] 模型流已有增量后失败，禁止自动重放，"
                         "request_id=%s", record.request_id,
                     )
-                    raise ModelStreamInterruptedError() from None
+                    interrupted = ModelStreamInterruptedError()
+                    interrupted.usage = getattr(error, 'usage', {})
+                    raise interrupted from None
                 raise
             if completed_reply is None:
                 if saw_delta:
                     raise ModelStreamInterruptedError()
                 raise EmptyModelResponseError()
             if completed_reply.content != "".join(turn_content):
+                raise ModelResponseError()
+            if not prepared.config.enable_thinking:
+                completed_reply.reasoning = ''
+            elif completed_reply.reasoning != ''.join(turn_reasoning):
                 raise ModelResponseError()
             if saw_delta and not completed_reply.tool_calls and not completed_reply.content.strip():
                 raise ModelStreamInterruptedError()
@@ -772,11 +784,8 @@ class AgentRuntime:
                 initial_usage=context.preparation_usage,
                 recovery_tool_attempts=context.recovery_tool_attempts,
                 recovery_tool_results=context.recovery_tool_results,
-                context_window_tokens=prepared.config.max_context_tokens or 64_000,
-                reserved_output_tokens=min(
-                    4_000,
-                    max(256, (prepared.config.max_context_tokens or 64_000) // 4),
-                ),
+                context_window_tokens=context_limits(prepared.config, include_fallback=True)[0],
+                reserved_output_tokens=context_limits(prepared.config, include_fallback=True)[1],
                 max_context_turns=prepared.config.max_context_turns,
             )
             record.set_accepting_instructions(False)

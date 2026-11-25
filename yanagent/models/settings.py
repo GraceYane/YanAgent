@@ -7,6 +7,7 @@ from yanagent.config import AppConfig, MASKED_SECRET
 from yanagent.errors import RequestValidationError
 from .catalog import PROVIDERS
 from .factory import select_model
+from .normalization import context_limits, reasoning_capability
 
 
 def model_names(config, provider):
@@ -25,7 +26,9 @@ def models_payload(config):
         profile = select_model(config, provider, config.model or 'unselected')
         names = model_names(config, provider)
         provider_models[provider] = names
-        catalog = [{'name': n, 'capabilities': ['text']} for n in names]
+        options = config.provider_configs.get(provider, {}).get('model_options', {})
+        catalog = [{'name': n, 'capabilities': ['text'],
+            **{key: value for key, value in options.get(n, {}).items() if key in {'context_window', 'max_output_tokens'}}} for n in names]
         providers.append({
             'id': provider, 'label': {'zh': spec.label, 'en': spec.label},
             'configured': bool(profile.api_key and profile.api_base), 'is_custom': False,
@@ -40,6 +43,7 @@ def models_payload(config):
     empty = {'editable': False, 'current_provider': '', 'current_model': '', 'providers': []}
     return {'status': 'success', 'providers': providers, 'capabilities': {
         'chat': {'editable': True, 'current_provider': config.model_provider, 'current_model': config.model,
+                 'context_window': context_limits(config, include_fallback=True)[0],
                  'providers': list(PROVIDERS), 'provider_models': provider_models},
         'chat_fallback': {'editable': True, **deepcopy(config.chat_fallback), 'providers': list(PROVIDERS),
                           'provider_models': provider_models, 'primary_provider': config.model_provider, 'primary_model': config.model},
@@ -96,8 +100,19 @@ def save_model_action(store, payload):
         models = payload.get('models', [])
         if type(models) is not list or any(type(item) is not dict or type(item.get('name')) is not str for item in models):
             raise RequestValidationError(reason='invalid', field='model')
-        if any(set(item) - {'name', 'capabilities'} or item.get('capabilities', ['text']) != ['text'] for item in models):
+        if any(set(item) - {'name', 'capabilities', 'context_window', 'max_output_tokens'} or item.get('capabilities', ['text']) != ['text'] for item in models):
             raise RequestValidationError(reason='unsupported', field='capability')
+        options = current.setdefault('model_options', {})
+        # 目录提交的是完整覆盖层；恢复预设时删除旧预算，保留手工声明的协议选项。
+        for saved in options.values():
+            saved.pop('context_window', None)
+            saved.pop('max_output_tokens', None)
+        for item in models:
+            saved = options.setdefault(item['name'], {})
+            for key in ('context_window', 'max_output_tokens'):
+                saved.pop(key, None)
+                if key in item:
+                    saved[key] = item[key]
         current.update(models=[item['name'] for item in models], hidden=payload.get('hidden', []))
     else:
         raise RequestValidationError(reason='unsupported', field='action')

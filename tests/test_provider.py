@@ -130,7 +130,7 @@ class CodecTests(unittest.TestCase):
             "prompt_tokens_details": {"cached_tokens": 2},
         }))
         self.assertEqual((reply.content, reply.finish_reason), ("部分内容", "length"))
-        self.assertEqual(reply.usage, {"input_tokens": 12, "output_tokens": 3, "total_tokens": 15})
+        self.assertEqual(reply.usage, {"input_tokens": 12, "output_tokens": 3, "total_tokens": 15, "cached_input_tokens": 2})
         self.assertEqual(parse_reply(response(usage={"prompt_tokens": 2})).usage, {"input_tokens": 2})
 
     def test_missing_null_and_zero_usage_are_distinct(self) -> None:
@@ -148,8 +148,9 @@ class CodecTests(unittest.TestCase):
         self.assertEqual(reply.content, "")
         self.assertEqual([call.id for call in reply.tool_calls], ["c1", "c2"])
         self.assertEqual(reply.tool_calls[1].arguments, {"x": 2})
-        self.assertEqual(parse_reply(response(reason="vendor_reason")).finish_reason, "vendor_reason")
-        self.assertIsNone(parse_reply(response(reason=None)).finish_reason)
+        for reason in ('vendor_reason', None):
+            with self.assertRaises(ModelResponseError):
+                parse_reply(response(reason=reason))
 
     def test_invalid_tool_arguments_never_become_empty_object(self) -> None:
         """损坏 JSON、重复键、非对象和非标准数值不能被修补为空参数。"""
@@ -201,7 +202,7 @@ class ProviderAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request["url"], "https://example.com/v1/chat/completions")
         self.assertEqual(request["headers"]["Authorization"], "Bearer fake-secret")
         self.assertEqual(request["timeout"], 12)
-        self.assertEqual(request["payload"], {"model": "demo", "stream": False,
+        self.assertEqual(request["payload"], {"model": "demo", "stream": False, "max_tokens": 4096,
                                              "messages": [{"role": "user", "content": "你好"}]})
         self.assertNotIn("fake-secret", repr(provider))
 

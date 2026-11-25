@@ -127,7 +127,7 @@ class ProviderContracts(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(url.endswith('/models/fixture-model:generateContent'))
         self.assertNotIn('fixture-key', url)
         self.assertEqual(headers['x-goog-api-key'], 'fixture-key')
-        self.assertEqual(payload['contents'][1]['parts'][0]['thoughtSignature'], 'opaque')
+        self.assertEqual(payload['contents'][1]['parts'], data['candidates'][0]['content']['parts'])
         self.assertEqual(payload['contents'][2]['parts'][0]['functionResponse']['name'], 'calc')
 
     async def test_gemini_stream_stop_usage_and_connection(self):

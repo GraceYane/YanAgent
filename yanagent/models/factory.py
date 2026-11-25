@@ -138,7 +138,7 @@ class FallbackProvider:
             try:
                 async with aclosing(self.candidates[self.index][2].stream(messages, tools=tools)) as stream:
                     async for event in stream:
-                        if event.kind in {'text_delta', 'tool_call_delta'}:
+                        if event.kind in {'text_delta', 'tool_call_delta', 'reasoning_delta'}:
                             emitted = True
                         if event.kind == 'completed':
                             if event.reply is None or (not event.reply.content.strip() and not event.reply.tool_calls):
@@ -154,6 +154,7 @@ class FallbackProvider:
             except FALLBACK_ERRORS as error:
                 if emitted or completed:
                     interrupted = ModelStreamInterruptedError()
+                    interrupted.usage = deepcopy(getattr(error, 'usage', {}))
                     self._attach_failed_usage(interrupted)
                     raise interrupted from None
                 previous_provider = self.candidates[self.index][0]

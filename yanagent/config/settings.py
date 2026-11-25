@@ -106,7 +106,7 @@ class AppConfig:
         for provider, profile in self.provider_configs.items():
             if provider not in {"openai-compatible", "openai", "deepseek", "qwen", "claude", "gemini"} or type(profile) is not dict:
                 raise ConfigurationError(field="provider_configs")
-            if set(profile) - {"api_key", "api_base", "models", "hidden"}:
+            if set(profile) - {"api_key", "api_base", "models", "hidden", "model_options"}:
                 raise ConfigurationError(field="provider_configs")
             for name in ("api_key", "api_base"):
                 _validate_text(profile.get(name, ""), name, allow_empty=True)
@@ -114,6 +114,20 @@ class AppConfig:
             if key and set(key) == {"*"}:
                 raise ConfigurationError(reason="masked_key", field="provider_configs")
             _validate_api_base(profile.get("api_base", ""))
+            options = profile.get('model_options', {})
+            if type(options) is not dict or len(options) > 200:
+                raise ConfigurationError(field='provider_configs')
+            for model_name, option in options.items():
+                _validate_text(model_name, 'model')
+                if type(option) is not dict or set(option) - {'context_window', 'max_output_tokens', 'thinking_protocol', 'thinking_budget'}:
+                    raise ConfigurationError(field='provider_configs')
+                for key, maximum in (('context_window', 1_000_000), ('max_output_tokens', 128_000), ('thinking_budget', 128_000)):
+                    if key in option and (type(option[key]) is not int or not 1 <= option[key] <= maximum):
+                        raise ConfigurationError(field='provider_configs')
+                protocols = {'none', 'claude-enabled', 'claude-adaptive'} if provider == 'claude' else (
+                    {'none', 'gemini-budget', 'gemini-level'} if provider == 'gemini' else {'none', 'openai', 'deepseek', 'qwen'})
+                if 'thinking_protocol' in option and (type(option['thinking_protocol']) is not str or option['thinking_protocol'] not in protocols):
+                    raise ConfigurationError(field='provider_configs')
             for name in ("models", "hidden"):
                 values = profile.get(name, [])
                 if type(values) is not list or len(values) > 200:

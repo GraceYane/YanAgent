@@ -53,23 +53,25 @@ const HoverAction: React.FC<{ onClick: () => void; title: string; danger?: boole
   </Tooltip>
 )
 
-/** One-line summary of a reply's provider usage, or '' when there is none. */
+/** 展示统一及旧版用量字段，缺失值保留为未知，推理子计数不重复累加。 */
 function usageLabel(usage?: MessageUsage): string {
   if (!usage) return ''
-  const n = (v?: number) => Math.max(0, Number(v) || 0)
-  const input = n(usage.prompt_tokens)
-  const output = n(usage.completion_tokens)
-  const total = n(usage.total_tokens) || input + output
-  if (!total) return ''
-  const cached = n(usage.prompt_cache_hit_tokens)
+  const n = (v?: number | null) => typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null
+  const input = n(usage.input_tokens ?? usage.prompt_tokens)
+  const output = n(usage.output_tokens ?? usage.completion_tokens)
+  const total = n(usage.total_tokens)
+  if (input == null && output == null && total == null) return ''
+  const cached = n(usage.cached_input_tokens ?? usage.prompt_cache_hit_tokens)
   const calls = n(usage.calls)
   const parts = [
-    `${t('msg_usage_total')} ${total.toLocaleString()}`,
-    `${t('msg_usage_in')} ${input.toLocaleString()}`,
-    `${t('msg_usage_out')} ${output.toLocaleString()}`,
+    `${t('msg_usage_total')} ${total?.toLocaleString() ?? '—'}`,
+    `${t('msg_usage_in')} ${input?.toLocaleString() ?? '—'}`,
+    `${t('msg_usage_out')} ${output?.toLocaleString() ?? '—'}`,
   ]
-  if (cached && input) parts.push(`${t('msg_usage_cached')} ${Math.round((cached * 100) / input)}%`)
-  if (calls > 1) parts.push(tf('msg_usage_calls', { n: calls }))
+  if (cached != null) parts.push(`${t('msg_usage_cached')} ${cached.toLocaleString()}`)
+  const reasoning = n(usage.reasoning_tokens)
+  if (reasoning != null) parts.push(`${t('msg_usage_reasoning')} ${reasoning.toLocaleString()}`)
+  if (calls != null && calls > 1) parts.push(tf('msg_usage_calls', { n: calls }))
   return parts.join(' · ')
 }
 
@@ -242,6 +244,8 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({
 
           {/* Final answer */}
           {message.content && <Markdown content={message.content} />}
+          {['length', 'context_length'].includes(message.finishReason || '') &&
+            <div className="mt-2 text-xs text-content-secondary">{t('reply_truncated')}</div>}
 
           {/* Files the agent wrote this turn — click to open the preview panel. */}
           {message.artifacts && message.artifacts.length > 0 && (

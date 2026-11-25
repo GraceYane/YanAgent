@@ -233,6 +233,11 @@ class DesktopSessionService:
         usage = message.metadata.get("usage")
         if type(usage) is dict:
             payload["usage"] = usage
+        if message.role == 'assistant':
+            payload['finish_reason'] = message.metadata.get('finish_reason')
+            reasoning = message.metadata.get('reasoning')
+            if type(reasoning) is str and reasoning:
+                payload['steps'] = [{'type': 'thinking', 'content': reasoning}]
         return payload
 
     def _turn_groups(self, records: list[StoredMessage]) -> list[list[StoredMessage]]:
@@ -338,6 +343,9 @@ class DesktopSessionService:
         for record in records:
             message = record.message
             if message.role == "assistant":
+                reasoning = message.metadata.get('reasoning')
+                if type(reasoning) is str and reasoning:
+                    steps.append({'type': 'thinking', 'content': reasoning})
                 if message.tool_calls:
                     if message.content.strip():
                         steps.append({"type": "content", "content": message.content})
@@ -405,6 +413,8 @@ class DesktopSessionService:
             "created_at": _seconds(records[0].created_at),
             "_seq": records[-1].sequence,
             "steps": steps,
+            "finish_reason": next((record.message.metadata.get('finish_reason') for record in reversed(records)
+                                   if record.message.role == 'assistant'), None),
         }
         if usage is not None:
             payload["usage"] = usage

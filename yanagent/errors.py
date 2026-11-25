@@ -267,6 +267,13 @@ class EmptyModelResponseError(ModelResponseError):
     message = "模型没有返回文本或工具调用，请稍后重试或检查模型配置。"
 
 
+class ModelOutputLimitError(ModelResponseError):
+    """输出额度耗尽且没有可用正文时停止，避免把截断误判为空响应重试。"""
+
+    code = 'model_output_limit'
+    message = '模型已达到输出或上下文上限，未返回完整答案；请调整模型预算后重试。'
+
+
 class ModelRefusalError(ModelResponseError):
     """标识模型明确拒绝或过滤了本次输出。"""
 

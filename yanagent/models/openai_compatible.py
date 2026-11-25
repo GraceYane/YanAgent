@@ -17,11 +17,14 @@ from yanagent.contracts import (
     ContractValidationError, Message, ModelReply, ToolCall, validate_conversation,
 )
 from yanagent.errors import (
-    EmptyModelResponseError, InvalidRequestError, ModelRefusalError, ModelResponseError,
+    EmptyModelResponseError, InvalidRequestError, ModelRefusalError, ModelResponseError, ModelOutputLimitError,
 )
 from yanagent.debug_log import yan_debug
 from yanagent.events import ModelStreamEvent
 from .provider import NonStreamingProvider
+from .normalization import (
+    normalize_usage, finish_reason as normalize_finish, reasoning_text, thinking_protocol, context_limits,
+)
 from .transport import (
     JsonTransport, SseTransport, UrllibJsonTransport, UrllibSseTransport, strict_json_loads,
 )
@@ -149,20 +152,16 @@ def parse_reply(data: dict[str, Any]) -> ModelReply:
         usage = {} if usage is None else usage
         if type(usage) is not dict:
             raise ModelResponseError()
-        normalized_usage = {
-            target: usage[source]
-            for source, target in (
-                ("prompt_tokens", "input_tokens"), ("completion_tokens", "output_tokens"),
-                ("total_tokens", "total_tokens"),
-            ) if source in usage
-        }
+        normalized_usage = normalize_usage(usage)
         reply = ModelReply(
             content=content, tool_calls=parsed_calls,
-            finish_reason=finish_reason, usage=normalized_usage,
+            finish_reason=normalize_finish(finish_reason, 'openai', bool(parsed_calls)), usage=normalized_usage,
         )
         reply.to_json().encode("utf-8")
         if not content.strip() and not parsed_calls:
-            raise EmptyModelResponseError()
+            error = ModelOutputLimitError() if reply.finish_reason == 'length' else EmptyModelResponseError()
+            error.usage = normalized_usage
+            raise error
         return reply
     except (ContractValidationError, ValueError, TypeError, RecursionError):
         raise ModelResponseError() from None
@@ -180,13 +179,17 @@ class _ToolCallParts:
 class StreamReplyBuilder:
     """把 Chat Completions 增量严格组装为统一 ``ModelReply``。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, reasoning_protocol='none', show_reasoning=False) -> None:
         """初始化文本、工具片段、结束原因和用量累积器。"""
         self._content: list[str] = []
         self._tools: dict[int, _ToolCallParts] = {}
         self._finish_reason: str | None = None
         self._usage: dict[str, Any] = {}
         self._saw_choice = False
+        self._reasoning = []
+        self._reasoning_protocol = reasoning_protocol
+        self._show_reasoning = show_reasoning
+        self._encrypted = None
 
     def add(self, data: dict[str, Any]) -> list[ModelStreamEvent]:
         """解析一个供应商 JSON 块，同时返回可立即向上游传播的增量。"""
@@ -200,6 +203,8 @@ class StreamReplyBuilder:
             choices = data.get("choices")
             if choices == [] and usage is not None:
                 return events
+            if self._finish_reason is not None:
+                raise ModelResponseError()
             if type(choices) is not list or len(choices) != 1 or type(choices[0]) is not dict:
                 raise ModelResponseError()
             choice = choices[0]
@@ -213,6 +218,14 @@ class StreamReplyBuilder:
                 raise ModelResponseError()
             if delta.get("refusal") or choice.get("finish_reason") == "content_filter":
                 raise ModelRefusalError()
+            if self._reasoning_protocol in {'deepseek', 'qwen'}:
+                thought = reasoning_text(delta.get('reasoning_content'))
+                if thought:
+                    self._reasoning.append(thought)
+                    if self._show_reasoning:
+                        events.append(ModelStreamEvent(kind='reasoning_delta', content=thought))
+                if self._reasoning_protocol == 'qwen' and delta.get('encrypted_content') is not None:
+                    self._encrypted = reasoning_text(delta['encrypted_content'])
             content = delta.get("content")
             if content is not None:
                 if type(content) is not str:
@@ -285,11 +298,18 @@ class StreamReplyBuilder:
             raise ModelResponseError()
         content = "".join(self._content)
         if not content.strip() and not calls:
-            raise EmptyModelResponseError()
+            error = ModelOutputLimitError() if self._finish_reason == 'length' else EmptyModelResponseError()
+            error.usage = self._usage
+            raise error
         try:
             return ModelReply(
                 content=content, tool_calls=calls,
-                finish_reason=self._finish_reason, usage=self._usage,
+                finish_reason=normalize_finish(self._finish_reason, 'openai', bool(calls)), usage=self._usage,
+                reasoning=''.join(self._reasoning) if self._show_reasoning else '',
+                provider_metadata={
+                    **({'reasoning_content': ''.join(self._reasoning)} if self._reasoning else {}),
+                    **({'encrypted_content': self._encrypted} if self._encrypted is not None else {}),
+                },
             )
         except (ContractValidationError, ValueError, TypeError, RecursionError):
             raise ModelResponseError() from None
@@ -299,15 +319,7 @@ def _normalize_usage(usage: Any) -> dict[str, Any]:
     """把供应商 Token 字段映射到内部名称，具体值由契约统一校验。"""
     if type(usage) is not dict:
         raise ModelResponseError()
-    return {
-        target: usage[source]
-        for source, target in (
-            ("prompt_tokens", "input_tokens"),
-            ("completion_tokens", "output_tokens"),
-            ("total_tokens", "total_tokens"),
-        )
-        if source in usage
-    }
+    return normalize_usage(usage)
 
 
 class OpenAICompatibleProvider(NonStreamingProvider):
@@ -329,17 +341,43 @@ class OpenAICompatibleProvider(NonStreamingProvider):
             stream_transport if stream_transport is not None else UrllibSseTransport()
         )
 
+    def _payload(self, messages, tools, stream):
+        """按明确协议发送思考及输出上限，回传状态只属于原供应商和模型。"""
+        converted, schemas = prepare_request(messages, tools)
+        protocol = thinking_protocol(self._config)
+        for original, item in zip(messages, converted):
+            state = original.metadata.get('provider_state', {})
+            if (original.role == 'assistant' and state.get('provider') == self._config.model_provider
+                    and state.get('model') == self._config.model):
+                if protocol == 'deepseek' and 'reasoning_content' in state:
+                    item['reasoning_content'] = state['reasoning_content']
+                if protocol == 'qwen' and 'encrypted_content' in state:
+                    item['encrypted_content'] = state['encrypted_content']
+        payload = {'model': self._config.model, 'messages': converted, 'stream': stream,
+                   'max_completion_tokens' if self._config.model_provider == 'openai' else 'max_tokens': context_limits(self._config)[1]}
+        if schemas:
+            payload['tools'] = schemas
+        if protocol == 'deepseek':
+            payload['thinking'] = {'type': 'enabled' if self._config.enable_thinking else 'disabled'}
+        elif protocol == 'qwen':
+            payload['enable_thinking'] = self._config.enable_thinking
+            if any('encrypted_content' in item for item in converted):
+                payload['preserve_thinking'] = True
+        elif protocol == 'openai' and self._config.enable_thinking:
+            effort = self._config.reasoning_effort_by_model.get(f'{self._config.model_provider}:{self._config.model.lower()}', 'high')
+            if effort not in {'low', 'medium', 'high'}:
+                raise InvalidRequestError()
+            payload['reasoning_effort'] = effort
+        if stream and (protocol != 'none' or self._config.model_provider == 'openai'):
+            payload['stream_options'] = {'include_usage': True}
+        return payload
+
     async def complete(
         self, messages: Sequence[Message], *, tools: Sequence[dict[str, Any]] = (),
     ) -> ModelReply:
         """检查配置和输入，发送一次 POST，并将结果转换为 ModelReply。"""
         self._config.require_model_ready()
-        converted, schemas = prepare_request(messages, tools)
-        payload: dict[str, Any] = {
-            "model": self._config.model, "messages": converted, "stream": False,
-        }
-        if schemas:
-            payload["tools"] = schemas
+        payload = self._payload(messages, tools, False)
         data = await self._transport.post_json(
             url=self._config.api_base.rstrip("/") + "/chat/completions",
             headers={"Authorization": f"Bearer {self._config.api_key}",
@@ -347,6 +385,15 @@ class OpenAICompatibleProvider(NonStreamingProvider):
             payload=payload, timeout=self._config.request_timeout,
         )
         reply = parse_reply(data)
+        protocol = thinking_protocol(self._config)
+        if protocol in {'deepseek', 'qwen'}:
+            message = data['choices'][0]['message']
+            thought = reasoning_text(message.get('reasoning_content'))
+            if 'reasoning_content' in message:
+                reply.provider_metadata['reasoning_content'] = thought
+            if protocol == 'qwen' and message.get('encrypted_content') is not None:
+                reply.provider_metadata['encrypted_content'] = reasoning_text(message['encrypted_content'])
+            reply.reasoning = thought if self._config.enable_thinking else ''
         reply.provider_metadata.update(provider=self._config.model_provider, model=self._config.model)
         yan_debug(
             "openai_compatible.py",
@@ -361,7 +408,8 @@ class OpenAICompatibleProvider(NonStreamingProvider):
     ) -> AsyncIterator[ModelStreamEvent]:
         """发送一次流式请求，传播文本/工具增量并在末尾生成统一完整响应。"""
         self._config.require_model_ready()
-        converted, schemas = prepare_request(messages, tools)
+        payload = self._payload(messages, tools, True)
+        converted, schemas = payload['messages'], payload.get('tools', [])
         yan_debug(
             "openai_compatible.py",
             "OpenAICompatibleProvider.stream",
@@ -371,11 +419,6 @@ class OpenAICompatibleProvider(NonStreamingProvider):
             tools=schemas,
         )
 
-        payload: dict[str, Any] = {
-            "model": self._config.model, "messages": converted, "stream": True,
-        }
-        if schemas:
-            payload["tools"] = schemas
         request_id = _request_id_for_log(messages)
         LOGGER.info(
             "[yanDebug][05-模型请求发送][openai_compatible.py]"
@@ -388,7 +431,7 @@ class OpenAICompatibleProvider(NonStreamingProvider):
             len(schemas),
             self._config.request_timeout,
         )
-        builder = StreamReplyBuilder()
+        builder = StreamReplyBuilder(reasoning_protocol=thinking_protocol(self._config), show_reasoning=self._config.enable_thinking)
         saw_done = False
 
         url = self._config.api_base.rstrip("/") + "/chat/completions"

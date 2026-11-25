@@ -365,6 +365,7 @@ class AgentLoop:
                     content=reply.content,
                     finish_reason=reply.finish_reason,
                     usage=usage,
+                    reasoning=reply.reasoning,
                 )
                 assistant.metadata["usage"] = deepcopy(usage)
                 sequence = await self._append(

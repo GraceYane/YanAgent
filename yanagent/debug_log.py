@@ -70,7 +70,10 @@ def _trace_value(value: Any) -> Any:
         copied.metadata = _trace_value(copied.metadata)
         return copied
     if isinstance(value, dict):
-        return {key: '[协议状态已隐藏]' if key in {'gemini_calls', 'thoughtSignature'} else _trace_value(item)
+        return {key: '[协议状态已隐藏]' if key in {
+                    'provider_state', 'reasoning', 'reasoning_content', 'thinking', 'thoughtSignature',
+                    'signature', 'encrypted_content', 'gemini_calls', 'claude_thinking',
+                } else _trace_value(item)
                 for key, item in value.items()}
     if isinstance(value, list):
         return [_trace_value(item) for item in value]

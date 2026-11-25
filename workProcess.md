@@ -2232,3 +2232,63 @@ Electron/React chatStore
 - 模型目录是内置示例加用户维护，不是远程发现服务；备用内部请求暂无逐供应商费用/耗时拆分，失败服务端未返回的 Token 不可准确得知。
 - P06-03～06 的 Workspace、文件命令、网页、多模态及产物并行尚未开发；P05 专项产品验收与既有全仓 TypeScript 问题继续单独跟进。
 
+## 2026-11-25：P06-02 响应差异统一
+
+### 实际完成的内容
+
+- 新增 models/normalization.py，以白名单映射三种协议的结束原因、Token 口径、Thinking 控制与窗口预算。未知/缺失结束原因不再作为成功，拒答和安全过滤仍保持不可借备用链绕过的错误；Claude pause_turn 和未支持的服务端工具不自动继续执行。
+- ModelReply 新增独立 reasoning 字段，默认空串且从调试 repr 隐藏。Provider 增加 reasoning_delta，Runtime 转为既有桌面 reasoning SSE，完成时校验已发文字/公开思考与完整响应一致。答案字段与公开思考分开，未知 reasoning/thinking 对象不被字符串化拼入答案。
+- DeepSeek/Qwen 仅按明确的公开 reasoning_content 提取；DeepSeek 必要思考历史在同模型工具轮次继续回传。Qwen 如返回 encrypted_content，则只原样保存与回传，并增加 preserve_thinking，不解释密文。OpenAI Chat 仅控制已知 reasoning_effort 和公开 Token，不伪造其不提供的思考正文或 Responses 摘要。
+- Claude 支持 thinking_delta、signature_delta 及 redacted_thinking，显示公开 thinking 文本、隐藏签名及 redacted 数据。完整响应及 SSE 均保存原生内容块的原序，正文、思考、工具交错时也不重排；同模型续接保持签名块完整。
+- Gemini 公开 thought=true 文本单独显示，所有原生 parts 及签名保持原序回传。原生 functionCall 缺少 ID 时，只生成内部 ToolCall 配对 ID，不修改已签名 part，也不对原本无 ID 的 functionResponse 强加 ID。切换供应商/模型不携带旧模型签名，统一工具消息仍保持配对。
+- 调试日志对内部 provider_state、公开 reasoning 和厂商签名/密文等字段隐藏。桌面历史只返回允许展示的公开内容与 thinking 步骤，必要原生状态保存在内部 Assistant metadata；不把状态原文散落到答案、错误说明或模型步骤白名单中。
+- 统一 Usage：兼容接口保留输入/输出/总量及缓存/推理子计数；Claude 将独立缓存读/写计数纳入输入；Gemini 将已知思考计数纳入输出，供应商 total 原样保留。累计流帧取最新字段，不逐帧相加；缺失、null 和零区别保留，子计数不重复加入已有总量。
+- 输出或上下文截断的部分正文仍可保存并显示提示；完全没有正文且已耗尽上限时返回 model_output_limit，不误当普通空响应重试。工具调用与结束原因必须匹配，即使截断参数是合法 JSON 也不能执行。流已有公开思考增量后，同样禁止重放或换模型拼接；转换中断错误时继续携带已知 Usage。
+- 模型目录可维护 context_window 和 max_output_tokens，model_options 可明确选择 Thinking 协议及预算。窗口由全局用户上限/模型声明/备用链约束共同决定；全局 0 时使用明确模型窗口，未知继续保守默认。聊天准备、摘要判断、手动用量与普通/流式循环共用解析，Provider 发送一致的有效输出上限。必要协议状态计入保守上下文估算。恢复目录默认值会清除旧预算，同时保留用户显式 Thinking 协议选项。
+- 桌面沿用思考区域，完成时提交到步骤并可刷新还原；展示统一输入、输出、总量、缓存及推理 Token，保留旧字段兼容。新增输出/上下文截断提示，设置界面按准确模型声明可用的思考强度选项。
+- 更新需求与路线图至 v1.19，新增 docs/P06_02_RESPONSE_NORMALIZATION.md，下一项 P06-03 Workspace。没有把 P05 产品验收、全部模型型号、Responses API 或多模态写成已完成。
+
+### 涉及的文件
+
+- `yanagent/models/normalization.py`：公开字段映射、用量口径、结束原因、思考协议和预算解析。
+- `yanagent/models/openai_compatible.py`、`native.py`、`factory.py`：请求控制、公开思考增量、原生签名/密文续接、结束与备用边界。
+- `yanagent/contracts.py`、`events.py`、`errors.py`、`debug_log.py`：独立 reasoning、类型化事件、输出限额错误和日志隐藏。
+- `yanagent/config/settings.py`、`models/settings.py`、`context.py`、`chat.py`：模型选项/目录、输出请求参数、共享上下文预算及协议状态估算。
+- `yanagent/runtime/agent_loop.py`、`runtime/streaming.py`、`sessions/desktop.py`：累计最终响应、独立桌面事件、失败已知用量及历史还原。
+- `desktop/src/renderer/src/components/MessageBubble.tsx`、`store/chatStore.ts`、`types.ts`、`i18n.ts`：思考步骤提交、用量显示和截断提示。
+- `tests/test_response_normalization.py`、`tests/test_provider.py`、`tests/test_multi_models.py`：新增 19 项专项与旧协议预设适配。
+- `docs/P06_02_RESPONSE_NORMALIZATION.md`、`P06_01_MULTI_MODELS.md`、`DEVELOPMENT_REQUIREMENTS.md`、`IMPLEMENTATION_ROADMAP.md`、`workProcess.md`。
+
+### 参考依据与设计取舍
+
+- 参考 CowAgentByYan HEAD 1fa66340 的 agent/protocol/agent_stream.py 中公开思考事件、缓存用量、Gemini 签名与窗口预留处理，以及 channel/web/core/providers.py 的模型目录。没有修改参考仓库或将其完整循环替换进 YanAgent。
+- 查阅 DeepSeek Thinking/工具回传、Qwen Thinking/密文、Claude Thinking/终止原因、Gemini generateContent 与 OpenAI Reasoning 官方文档，链接记录在专项说明。对接口变化采用可声明的 thinking_protocol 覆盖，不把少量已知型号规则包装成全部模型支持。
+- 展示与续接分开：用户关闭公开思考展示不表示可以删掉工具轮次需要的签名。Claude/Gemini 的原生块保留原序，同模型回传；桌面只看到适配器允许展示的内容。上下文估算将必要状态计入，宁可保守多算，也不把长签名和思考当作零 Token。
+- 不根据 response 的任意未知字段猜测正文，不解密 opaque 状态，不把模型输出上限耗尽视为无限补请求理由。服务端工具和新协议明确报不支持，而不是在现有函数工具执行链路中猜测行为。
+
+### 验证结果
+
+- 新增 19 项 P06-02 专项，全量 275 项离线测试通过，覆盖三种用量口径、缺失/null/零、思考开关、完整/流式公开字段、签名增量、交错内容原序、Gemini 内部 ID、密文回传、未知与截断结束、流停止后多余帧、备用不重放、目录预算与重置、自动窗口、日志隐藏及真实后台循环/SQLite 历史。
+- 2026-11-25 使用现有 openai-compatible/deepseek-flash 配置，完成第一轮非流式 calculator 请求、本地一次计算及第二轮流式答案。两次已知总 Token 为 413、436，第二轮缓存命中 256。只发送 1+1 问题，没有发项目文件或已有聊天历史。本次 reasoning_tokens=0、公开思考字符/事件均为 0，所以真实调用只证明工具续接、答案和用量归一化，不证明真实 Thinking 可视化已验收。
+- Renderer 生产构建通过；Python compileall 与 git diff --check 通过。TypeScript 检查仍只报告原有 ChannelsPage 图标 size 类型和重复 user_seq；没有报告本次新增功能的类型错误，未顺带修复基线问题。保留原有字体引用、Browserslist 及 bundle 体积提示。
+- 首轮回归揭示旧测试仍要求忽略缓存、允许任意/缺失结束原因和不设置输出参数；更新为验证新白名单、缓存与输出上限。缺失用量仍保留未知，没有为了测试通过推算兼容接口未提供的 total。一次新增运行时测试缺少 SessionStore 的显式 user/agent 归属，补齐测试配置后通过。
+- 自动测试使用虚构凭据、离线协议帧、本机 HTTP/后台事件循环和临时 SQLite；需要本机 socketpair 的运行通过审批执行。没有启动 Electron 点击全部思考设置，没有调用无凭据的厂商服务，也没有进行模型训练。
+
+### 岗位要求关联与实践证据
+
+- 对应 TARGET_ROLES.md 的模型/Prompt 接入（DYG-要求2～3、DYG-加分1、TX-要求4、XM-职责7）、统一协议（XM-职责1/3、DYQ-职责3、TX-职责1）、上下文与稳定性（XM-职责1～2/6～7、DYQ-职责2～3、TX-职责3）及 Python/TypeScript 工程和开源复盘相关条款。
+- 已实现证据包括三种协议对同一 ModelReply/ModelStreamEvent 的转换、公开显示与续接状态隔离、模型准确窗口/输出声明、跨供应商 Token 口径和统一截断策略。运行证据是 275 项离线测试、19 项专项、Renderer 构建及一次真实两轮计算器闭环；没有测量线上延迟、费用下降、真实多厂商故障恢复率或任务效果提升。
+- 面试可讲：缓存/推理计数不能机械相加，各服务的 input/output 口径不同；签名原序回传是协议续接要求，不是把内部推理展示给用户；模型结束原因决定是否可执行工具，合法 JSON 不能证明被截断的调用可执行；上下文窗口、用户限制、输出预留和备用候选必须一起约束输入。
+- 剩余差距为真实多厂商验证、服务端精确 token-count、动态型号/能力发现、Thinking 效果评测和价格/账单核对。应用层字段适配不等于理解或恢复模型隐藏思维，也不等于训练/微调经验。
+
+### 难点评分
+
+整体难度：**9/10**。难点一是把公开思考、正文和不透明续接状态拆开，同时支持完整及流式：Claude 的签名独立增量、Gemini 的签名 part 和缺省工具 ID 都不能被普通重建逻辑修改，交错块必须保留原序。难点二是计数口径：Claude 输入缓存需要补入，OpenAI 缓存和推理是已有总量的子集，Gemini 的候选与思考又是分开的；实现用协议专属映射、累计快照与未知值区分，避免重复求和。难点三是窗口和终止语义联动：预算需要覆盖自动摘要、工具循环、备用候选与实际请求输出；截断时拒绝执行工具、无答案耗尽额度时不重试。专项通过原生帧、真实后台循环与 SQLite 分别验证这三层边界。
+
+### 尚未完成的事项
+
+- 当前兼容服务没有返回真实 Thinking 文本；其他厂商缺少凭据，公开思考、原生签名和缓存口径的真实账号验收待补。厂商参数随型号变化，未知型号应显式设置 thinking_protocol 或禁用，不能保证默认型号判断适用于所有服务。
+- 不支持 OpenAI Responses 摘要、Claude/Gemini 原生服务端工具或所有未来字段；模型窗口来自用户声明而非远程权威目录，Token 仍为保守估算，没有精确 tokenizer/官方计数和费用计算。
+- 已完成 Assistant 的公开思考与协议状态可持久化；未完成的单个增量暂存在本次事件流，不承诺强杀重启后逐字还原。
+- 下一项 P06-03：工作区选择/创建、会话项目关联、文件树与路径边界；P05 专项产品验收和原有 TypeScript 基线问题继续单独跟进。
+

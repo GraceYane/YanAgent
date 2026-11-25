@@ -313,6 +313,7 @@ function historyToMessage(m: HistoryMessage): ChatMessage {
     extras: m.extras,
     botSeq: m._seq,
     usage: m.usage,
+    finishReason: m.finish_reason,
     isCancelled: cancelled || undefined,
     runState: m.run_state,
     runId: m.run_id,
@@ -736,6 +737,9 @@ export const useChatStore = create<ChatState>((set, get) => {
               content: next,
               botSeq: data.bot_seq ?? m.botSeq,
               usage: data.usage ?? m.usage,
+              finishReason: data.finish_reason ?? m.finishReason,
+              steps: m.reasoning?.trim() ? [...(m.steps || []), { type: 'thinking', content: m.reasoning }] : m.steps,
+              reasoning: '',
               isStreaming: false,
             }
           })

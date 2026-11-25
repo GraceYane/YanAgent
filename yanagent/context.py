@@ -104,6 +104,8 @@ def estimate_message_tokens(message: Message) -> int:
         + estimate_text_tokens(message.name or "")
         + estimate_text_tokens(message.tool_call_id or "")
         + estimate_text_tokens(tool_calls)
+        + (estimate_text_tokens(json.dumps(message.metadata['provider_state'], ensure_ascii=False, separators=(',', ':')))
+           if message.metadata.get('provider_state') else 0)
         + 4
     )
 

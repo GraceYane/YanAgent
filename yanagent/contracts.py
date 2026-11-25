@@ -263,6 +263,7 @@ class ModelReply(JsonContract):
     finish_reason: str | None = None  # 结束原因；未知时为 None，供应商适配层负责转换。
     usage: Usage = field(default_factory=dict)  # 非负 Token 计数；缺失为 {} 或 None 值。
     provider_metadata: dict[str, Any] = field(default_factory=dict, repr=False)
+    reasoning: str = field(default='', repr=False)  # 仅保存适配器明确允许展示的公开思考字段。
 
     def validate(self) -> None:
         _text(self.content, "ModelReply.content")
@@ -270,6 +271,7 @@ class ModelReply(JsonContract):
         _optional_text(self.finish_reason, "ModelReply.finish_reason")
         _usage(self.usage)
         _json_object(self.provider_metadata, "ModelReply.provider_metadata")
+        _text(self.reasoning, "ModelReply.reasoning")
 
     @classmethod
     def _decode_fields(cls, data: dict[str, Any]) -> dict[str, Any]:
@@ -280,7 +282,11 @@ class ModelReply(JsonContract):
         self.validate()
         return Message(
             role="assistant", content=self.content, tool_calls=deepcopy(self.tool_calls),
-            metadata={"provider_state": deepcopy(self.provider_metadata)} if self.provider_metadata else {},
+            metadata={
+                **({"provider_state": deepcopy(self.provider_metadata)} if self.provider_metadata else {}),
+                **({"reasoning": self.reasoning} if self.reasoning else {}),
+                **({"finish_reason": self.finish_reason} if self.finish_reason is not None else {}),
+            },
         )
 
 

@@ -31,6 +31,7 @@ from yanagent.errors import (
 from yanagent.models import ModelProvider
 from yanagent.models.factory import create_single_provider, create_provider_chain, select_model
 from yanagent.models.catalog import PROVIDERS
+from yanagent.models.normalization import context_limits, reasoning_capability
 from yanagent.models.settings import models_payload as multi_models_payload, save_model_action as save_multi_model_action, model_names
 from yanagent.runtime.agent_loop import AgentLoop
 from yanagent.sessions import RunStore, SessionStore, StoredMessage
@@ -231,6 +232,9 @@ class YanAgentApplication:
             "api_keys": {"api_key": MASKED_SECRET if config.api_key else ""},
             "providers": {pid: {
                 "label": {"zh": spec.label, "en": spec.label}, "models": model_names(config, pid),
+                "reasoning": reasoning_capability(replace(config, model_provider=pid)),
+                "reasoning_by_model": {name: reasoning_capability(replace(config, model_provider=pid, model=name))
+                                       for name in model_names(config, pid)},
                 "api_base_key": "api_base", "api_base_default": spec.api_base,
                 "api_base_placeholder": spec.api_base, "api_key_field": "api_key",
             } for pid, spec in PROVIDERS.items()},
@@ -333,11 +337,8 @@ class YanAgentApplication:
                 initial_usage=context.preparation_usage,
                 recovery_tool_attempts=context.recovery_tool_attempts,
                 recovery_tool_results=context.recovery_tool_results,
-                context_window_tokens=prepared.config.max_context_tokens or CONTEXT_WINDOW_TOKENS,
-                reserved_output_tokens=min(
-                    RESERVED_OUTPUT_TOKENS,
-                    max(256, (prepared.config.max_context_tokens or CONTEXT_WINDOW_TOKENS) // 4),
-                ),
+                context_window_tokens=context_limits(prepared.config, include_fallback=True)[0],
+                reserved_output_tokens=context_limits(prepared.config, include_fallback=True)[1],
                 max_context_turns=prepared.config.max_context_turns,
             )
             reply = loop_result.reply
@@ -579,8 +580,7 @@ class YanAgentApplication:
             )
 
         assembled = assemble(active_records, memory_summary)
-        context_window = prepared.config.max_context_tokens or CONTEXT_WINDOW_TOKENS
-        output_reserve = min(RESERVED_OUTPUT_TOKENS, max(256, context_window // 4))
+        context_window, output_reserve = context_limits(prepared.config, include_fallback=True)
         estimate = estimate_context_usage(
             messages=assembled.messages,
             tools=assembled.tools,
@@ -788,16 +788,12 @@ class YanAgentApplication:
             messages=built.messages,
             tools=built.tools,
             memory_summary=state["summary"],
-            reserved_output=min(
-                RESERVED_OUTPUT_TOKENS,
-                max(256, (config.max_context_tokens or CONTEXT_WINDOW_TOKENS) // 4),
-            ),
+            reserved_output=context_limits(config, include_fallback=True)[1],
         )
         # Usage panel reports current persisted context, not the synthetic empty User used by builder.
         history_tokens = max(0, estimate.history - 4)
         used = estimate.system + estimate.tools + history_tokens + estimate.memory
-        window = config.max_context_tokens or CONTEXT_WINDOW_TOKENS
-        reserve = min(RESERVED_OUTPUT_TOKENS, max(256, window // 4))
+        window, reserve = context_limits(config, include_fallback=True)
         limit = max(1, window - reserve)
         LOGGER.info(
             "[chat.py][YanAgentApplication.context_usage] 上下文用量已估算，"
