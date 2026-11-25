@@ -6,6 +6,8 @@ export interface PendingConfirm {
   msgKey: string
   /** Values for `{name}`-style placeholders in the body text. */
   vars?: Record<string, string>
+  /** 原样显示操作参数，滚动查看完整内容，避免仅凭工具名授权。 */
+  details?: string
   /** Label for the affirmative button; the other one is always a plain cancel. */
   okKey: string
   /** Style of the affirmative button; defaults to danger. */

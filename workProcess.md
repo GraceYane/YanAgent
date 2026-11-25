@@ -2374,3 +2374,62 @@ Electron/React chatStore
 - 难度 **5/10**：关键在于区分界面参数与安全凭证两个不同问题，不能通过全面允许空参数或绕过文件授权来“修好”。保留默认严格校验，仅根路径允许空值；权限错误使用具体领域说明，避免引导用户错误修改模型 API Key。
 - 待用户重启后复验实际桌面创建/文件树；后续模型文件工具仍按 P06-04 开发。
 
+## 2026-11-25：P06-04 文件与命令工具
+
+### 需求与实际完成内容
+
+- 用户要求开始 P06-04。基于 P06-03 工作区，把模型主动读取、写入、精确编辑、列目录和搜索接入默认工具目录，并接通命令执行、后台查询/停止、确认与既有操作记录。P06-03 此前仅支持界面手动文本编辑，不能用聊天里的路径代替模型工具；本项消除这层断点。
+- 有 SessionStore 的生产默认应用新增 read_file/write_file/edit_file/list_directory/search_files/execute_command/process_status/stop_process，连同原计算器和时间共 10 个工具。显式自定义工具注册表及无仓储测试模式保持原有目录，不强制给测试和调用方增加本机权限。
+- 权限上下文使用 PreparedChat 固定的真实工作区与 user/agent/session/run；ToolManager 在 handler 内用 ContextVar 绑定，finally 恢复。没有让模型通过 arguments 选择身份、授权根或任意 PID，跨会话交错调用验证读取不同目录。
+- 文件操作复用组件边界、Windows 逐级固定目录和 POSIX 描述符，不跟随符号链接/Junction/硬链接别名。UTF-8 文本最多 512 KiB；已有文件写入要求读取所得 SHA-256 etag，修改前与发布前核验，精确编辑默认唯一匹配；新建禁止覆盖。独占临时文件、flush/fsync 与同目录原子发布保留失败前原文，异常清理临时文件。可以明确创建父目录，不能把文本伪装成 .docx 等二进制文件。
+- 目录/内容搜索采用字面量和固定条目、深度、时间、读取字节上限，跳过版本库及依赖目录；有限结果包含截断信息。结构结果在 JSON 序列化后再控制体积，避免转义字符使执行器截出半段 JSON；既有更小上下文预算仍可进一步限流。
+- 命令在 Windows 默认选 PowerShell，POSIX 默认 Bash；cwd 单独传入且检查根内目录。PowerShell EncodedCommand 保留中文和引号，设置 UTF-8 输出/错误停止，保留原生命令退出码。只继承系统环境白名单，不注入后端 API Key；编码支持自动、UTF-8、GB18030、CP1252，UTF-8 尾部截断及流式半字符不会因此误判为 GBK。
+- 前台命令默认 20、最多 25 秒；后台默认 120、最多 600 秒并立即返回内部 process_id。读取线程排空合并 stdout/stderr，最多保留 48 KiB 尾部缓冲，模型最多 12000 字符。命令最长 4096 字符，长脚本先写工作区文件再运行，避免 Windows UTF-16/Base64 扩张后的命令行长度问题。
+- Windows 用 Python 门闩先阻塞执行，绑定 kill-on-close Job 后再放行，确保普通后代进入同一 Job；终止后查询 Job 活动进程归零，避免目录仍占用。POSIX 使用独立进程组。每会话最多 4 个活动命令，注册表最多 32 记录并回收已完成项；同会话后续 Run 可查询，其他身份、会话或换根后的同名进程拒绝访问。
+- 成功 Run 允许后台命令保留至自身期限，失败/取消回收该 Run 命令，Runtime 关闭同步兜底回收，处理监控协程尚未启动就取消的情况。process_status 可有限等待，重复查询受总轮数/总时间约束，而非普通读取的三次上限。进程内存注册表不承诺后端重启恢复，命令副作用不能回滚。
+- 写入、编辑、命令、停止进程保持必须确认，即使模式 allow 也不会绕过。确认事件传完整参数副本与工作区；桌面使用可滚动 JSON 文本原样展示，带参数确认不再由全局 Enter 自动批准，也不聚焦允许按钮。命令确认明确说明当前用户权限及 cwd 不构成沙箱；其他工具不显示无关命令提示。
+- 沿用 ToolCall/ToolResult、run_steps 与工具卡片：执行意图先落库，批准后先标记 executing 再发生副作用，结果回写模型，最终正文由下一轮模型生成。后台启动记录与后续查询结果可从历史查看，不把“已启动”当成“构建已完成”。
+- 更新需求与路线图 v1.21，下一项 P06-05；新增专项使用/设计文档，不修改既有开发记录。
+
+### 涉及的文件
+
+- 新增 yanagent/tools/execution_context.py、files.py、processes.py：可信上下文、文件工具、命令与进程管理。
+- 修改 yanagent/tools/manager.py、permissions.py：handler 上下文绑定、领域错误回传、完整参数确认；yanagent/workspace_paths.py 不再把 handler 的 ValueError 子类主动说明误吞成通用路径错误。
+- 修改 yanagent/chat.py、context.py：生产默认目录、工作区权限、失败 Run 进程回收和文件数据/命令边界提示。
+- 修改 yanagent/runtime/agent_loop.py、streaming.py：查询重复次数受整体预算约束、Runtime 退出回收与完整确认事件。
+- 修改 desktop/src/renderer/src/components/ConfirmDialog.tsx、store/confirmStore.ts、store/chatStore.ts、types.ts、i18n.ts：可审阅参数、工作区、明确命令权限说明及防误按确认。
+- 新增 tests/test_file_command_tools.py，更新 tests/test_agent_loop.py 的默认工具目录断言；更新 docs/DEVELOPMENT_REQUIREMENTS.md、IMPLEMENTATION_ROADMAP.md，新增 docs/P06_04_FILE_COMMAND_TOOLS.md 和本记录。
+
+### 参考与设计取舍
+
+- 本次实际读取 CowAgentByYan HEAD 1fa66340 的 agent/tools/bash/bash.py、background.py、decode.py、search_files/search_files.py。参考后台句柄、有限缓存、编码降级与统一搜索意图；没有复制自动注入密钥、任意根回退或 cmd.exe 默认方式。参考项目保持只读，HEAD 与前次记录不同只陈述本次读取结果，不推断用户的分支操作。
+- 核对 Python 子进程/管道和 Microsoft Job Objects 官方文档。使用 Popen + 有限 reader 线程适配常驻事件循环，避免 communicate 累积无界输出；Windows Job 统一回收普通后代，但明确它是生命周期能力，不是文件系统沙箱。
+- 文件授权根和任意命令权限明确分开：文件 handler/命令初始 cwd 可做路径边界；用户批准的 Shell 可读根外/联网，不能通过检查 cwd 或正则过滤虚称完全隔离。OS/容器沙箱和打包分发没有提前表述完成。
+- Word 等真正二进制文档没有新增专用生成器，文本工具主动拒绝假 docx。可在明确批准的命令中使用已安装的文档库/脚本，但不自动安装依赖、不宣称所有文件格式都支持。
+
+### 验证结果及踩坑
+
+- 新增 23 项专项，全部离线回归 322 项通过。使用真实临时中文目录、UTF-8 文件、SQLite、Windows PowerShell 及子进程；Fake 仅替代模型网络响应。未读写用户真实项目、未执行用户项目命令、未终止用户进程，也未调用真实模型。
+- 覆盖确认批准/拒绝/无确认界面、完整参数和根展示、读后带版本编辑、外部修改冲突、精确替换多匹配、原子替换失败保留原文件/清理临时文件、路径穿越/根外/Junction/硬链接拒绝、编码/二进制/体积限制、搜索和截断合法 JSON、并发会话上下文隔离。
+- 覆盖真实命令中文输出与 cwd/退出码、前台超时、外层取消、后台状态与停止、同会话后续查询及完整身份隔离、4 进程上限、环境 Key 不直接继承、输出排空和有限缓冲；创建真实孙代进程，证明期限后不能继续写迟到文件；Runtime 退出确实回收后台进程。打包模式缺外部 Python 时受控失败，防止把后端 exe 当解释器递归启动。
+- 流式真实 Runtime + SQLite 验证模型请求→等待确认→批准创建 hello 文本→Tool Result→最终正文，检查历史四条消息配对和 run_steps completed；拒绝不创建文件并留下失败工具结束事件。没有将 Fake 预设回答当作真实模型能力验收。
+- 完整 npm run build 通过，含 Renderer 和主进程；全量 Renderer tsc 仍报原有 ChannelsPage 图标 size 类型及重复 user_seq，不在本任务中扩展修复，也没有宣称全仓类型通过。Python compileall 和 git diff --check 通过。原字体、Browserslist、bundle 大小提示保留。
+- 实际发现并修复：后台刚创建即取消时监控 finally 可能尚未进入，必须同步兜底；TerminateJobObject 返回不等于全部后代句柄立即释放，需等待活动成员退出；locked_path 把 ToolHandlerError（ValueError 子类）统一转换丢掉冲突说明；Windows CRLF 的测试应核验语义而非强制改变文件换行；Fake 流预设需要独立 stream_outcomes 且正文增量与 completed 一致，不能只塞非流式预设。
+- 更新既有默认目录断言到实际 10 项，保留原 Agent Loop 消息顺序和用量断言；未通过删掉失败场景掩盖业务问题。所有难点均有系统资源或生产入口证据，未测性能改善百分比。
+
+### 岗位要求关联与实践证据
+
+- 工具调用与执行管控：对应 XM-职责1/6、DYQ-职责2～3、TX-职责1/要求2。证据是统一 Schema/参数校验、workspace scope、完整参数一次性确认、handler 前 executing 持久化、etag 与原子写、真实命令取消/后代回收及 Tool Result 回交模型。不是“模型直接调用本地 Python”，而是运行时按模型请求执行。
+- Agent 核心闭环：对应 XM-职责1、DYG-职责1/4、DYQ-职责2、TX-职责1。生产流式链路展示模型请求、本地批准执行、记录和下一轮正文；Fake 用于确定性流程测试，真实模型任务选择质量还没有验收。
+- Session/隔离与运行调度：对应 XM-职责1～2/要求3、DYG-职责2、DYQ-职责2、TX-职责1。上下文使用不可变根快照和协程局部身份，进程按完整会话与根归属，后续 Run 可查询但不能跨身份；后台留存与失败取消/Runtime 资源释放分工明确。当前无容器/OS 强隔离或线上多租户经历。
+- 稳定性与可观测性：对应 XM-职责6～7、DYQ-职责2～3、TX-职责3。中文日志包含文件/函数、Run、内部进程 ID、状态/退出码；统一步骤记录、输出/扫描预算、非零/超时失败、保留原文和副作用去重沿用。没有把本机测试结果写成线上可用性或延迟指标。
+- Python/TypeScript 工程与开源复盘：对应 XM-要求2/4/6、DYQ-要求2～4、DYG-职责4、TX-要求1/5～6。实际自主实现后端工具与 Job 生命周期、扩展既有复制桌面的确认 UI；对照 CowAgent 后选择不继承模型密钥、保守文本读写、命令明确权限。能够复现的面试要点是“取消协程不等于杀进程”“原子写不等于外部编辑事务”“工作目录不等于沙箱”“后台启动结果不等于任务完成”。
+
+### 难点评分与剩余事项
+
+整体难度：**9/10**。主要难点是命令树和异步任务的生命周期衔接：通过执行门闩保证 Windows 后代归属，在监控未进入时仍能回收，等 Job 活动成员归零再释放目录；同时处理前台 wait、后台跨 Run 查询和 Runtime 退出。第二处是副作用与确认/记录的一致性：完整参数绑定确认、执行前落库、文件 etag+原子发布与恢复去重连接。第三处是多层预算与编码：管道持续排空但有限缓存，UTF-8 半字符不能误判编码，序列化后裁剪确保结构结果不轻易损坏。
+
+- 待重启后端与桌面后实际点击确认框、真实模型完成“读取项目→改端口→构建”联调；本次没有强制重启用户正在调试的进程。
+- POSIX Bash/进程组、打包应用/外部 Python、ACL/扩展属性保留尚未实测。主动脱离 POSIX 进程组、同权限恶意进程、命令文件系统隔离和副作用回滚不作保证。
+- Word/PDF/Excel 等格式依赖真正库和脚本；没有新增专用文档生成器或自动安装依赖。网页搜索/浏览器与多模态留 P06-05；产物索引/下载和并行留 P06-06；P05 产品专项和既有 Renderer 类型基线继续保留。
+

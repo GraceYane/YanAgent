@@ -449,6 +449,7 @@ export interface StreamEvent {
   user_seq?: number
   risk_level?: string
   scope?: string
+  workspace?: string
   arguments?: Record<string, unknown>
   status?: string
   result?: string

@@ -20,7 +20,7 @@ const ConfirmDialog: React.FC = () => {
     if (!pending) return
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') answer(false)
-      else if (e.key === 'Enter') answer(true)
+      else if (e.key === 'Enter' && !pending.details) answer(true)
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
@@ -36,9 +36,14 @@ const ConfirmDialog: React.FC = () => {
   return (
     <Modal open elevated title={t(pending.titleKey)} onClose={() => answer(false)}>
       <p className="text-sm text-content-secondary leading-relaxed">{message}</p>
+      {pending.details && (
+        <pre className="max-h-[45vh] overflow-auto whitespace-pre-wrap break-all rounded-lg bg-surface-secondary p-3 text-xs select-text">
+          {pending.details}
+        </pre>
+      )}
       <div className="flex items-center justify-end gap-2 pt-1">
         <Btn onClick={() => answer(false)}>{t('config_cancel')}</Btn>
-        <Btn variant={pending.tone ?? 'danger'} onClick={() => answer(true)} autoFocus>
+        <Btn variant={pending.tone ?? 'danger'} onClick={() => answer(true)} autoFocus={!pending.details}>
           {t(pending.okKey)}
         </Btn>
       </div>

@@ -234,6 +234,8 @@ class AgentRuntime:
         asyncio.set_event_loop(self._loop)
         self._started.set()
         self._loop.run_forever()
+        if self.application.process_service is not None:
+            self.application.process_service.close_loop()
         pending = asyncio.all_tasks(self._loop)
         for task in pending:
             task.cancel()
@@ -368,6 +370,8 @@ class AgentRuntime:
                 "tool": request.tool_name,
                 "risk_level": request.risk_level,
                 "scope": request.scope,
+                "arguments": request.arguments,
+                "workspace": request.workspace,
             })
             LOGGER.info(
                 "[streaming.py][AgentRuntime._request_tool_confirmation] 已等待工具确认，"

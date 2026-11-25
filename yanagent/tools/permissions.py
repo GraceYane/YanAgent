@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from copy import deepcopy
 from typing import Any, Literal, Protocol
 
 from yanagent.contracts import ToolCall
@@ -134,6 +135,8 @@ class ToolConfirmationRequest:
     tool_name: str
     risk_level: str
     scope: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+    workspace: str | None = None
 
     def __post_init__(self) -> None:
         """拒绝外部伪造的空确认字段，并校验请求 ID 的固定形状。"""
@@ -264,6 +267,8 @@ def build_confirmation_request(
         tool_name=call.name,
         risk_level=definition.risk_level,
         scope=definition.scope,
+        arguments=deepcopy(call.arguments),
+        workspace=context.workspace,
     )
 
 

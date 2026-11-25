@@ -178,7 +178,8 @@ class NonStreamingAgentLoopTests(unittest.TestCase):
         self.assertEqual(calls[2].messages[-1].content, "12")
         self.assertEqual(
             [schema["name"] for schema in calls[2].tools],
-            ["calculator", "current_time"],
+            ["calculator", "current_time", "edit_file", "execute_command", "list_directory",
+             "process_status", "read_file", "search_files", "stop_process", "write_file"],
         )
 
         history = _run(self.sessions.complete_history("loop"))

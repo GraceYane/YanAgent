@@ -491,7 +491,9 @@ class AgentLoop:
                         fingerprint = self._tool_fingerprint(call)
                         count = tool_attempts.get(fingerprint, 0)
                         definition = self.tools.get(call.name)
-                        limit = 3 if definition is not None and definition.read_only else 1
+                        # 状态轮询没有新副作用，由总轮数/总时间限制，避免三次查询后误判长构建失败。
+                        limit = (self.max_model_turns if call.name == 'process_status' and definition is not None and definition.read_only
+                                 else 3 if definition is not None and definition.read_only else 1)
                         if count >= limit:
                             previous = tool_results.get(fingerprint)
                             detail = (

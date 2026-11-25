@@ -584,10 +584,12 @@ export const useChatStore = create<ChatState>((set, get) => {
             const approved = await askConfirm({
               titleKey: 'tool_confirm_title',
               msgKey: 'tool_confirm_message',
+              details: JSON.stringify({ workspace: data.workspace, arguments: data.arguments }, null, 2),
               vars: {
                 tool: data.tool || 'tool',
                 risk: data.risk_level || 'unknown',
                 scope: data.scope || 'unknown',
+                warning: data.tool === 'execute_command' ? t('tool_command_warning') : '',
               },
               okKey: 'tool_confirm_allow',
               tone: 'danger',

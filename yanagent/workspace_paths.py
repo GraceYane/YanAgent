@@ -154,7 +154,7 @@ def locked_path(path, *, directory=False):
                 if not directory and (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
                     raise WorkspaceError()
                 yield fd
-    except (OSError, ValueError):
+    except OSError:
         raise WorkspaceError() from None
 
 

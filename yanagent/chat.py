@@ -136,9 +136,16 @@ class YanAgentApplication:
         if tool_manager is None:
             tool_manager = ToolManager()
             register_safe_example_tools(tool_manager)
+            if session_store is not None:
+                from yanagent.tools.files import file_definitions
+                from yanagent.tools.processes import ProcessService
+                tool_manager.process_service = ProcessService()
+                for definition in (*file_definitions(), *tool_manager.process_service.definitions()):
+                    tool_manager.register(definition)
         elif not isinstance(tool_manager, ToolManager):
             raise TypeError("tool_manager 必须是 ToolManager")
         self.tool_manager = tool_manager
+        self.process_service = getattr(tool_manager, 'process_service', None)
         if context_builder is None:
             context_builder = PromptContextBuilder()
         elif not isinstance(context_builder, PromptContextBuilder):
@@ -486,6 +493,8 @@ class YanAgentApplication:
         usage: dict[str, int | None] | None = None,
     ) -> bool:
         """保存 Run 终态；重复完成返回 False，并留下可定位的中文日志。"""
+        if status != 'completed' and self.process_service is not None:
+            await self.process_service.cancel_run(request_id)
         if self.run_store is None:
             return False
         try:
@@ -911,11 +920,12 @@ class YanAgentApplication:
         """用可信运行身份构造流式和非流式共用的工具权限上下文。"""
         identity = self._runtime_identity(prepared, request_id=request_id)
         return ToolPermissionContext(
-            allowed_scopes=frozenset({"global", "user", "agent", "session"}),
+            allowed_scopes=frozenset({"global", "user", "agent", "session"} | ({"workspace"} if prepared.workspace_root else set())),
             run_id=request_id,
             user_id=identity.user_id,
             agent_id=identity.agent_id,
             session_id=identity.session_id,
+            workspace=prepared.workspace_root,
             confirmation_ui_available=confirmation_ui_available,
         )
 

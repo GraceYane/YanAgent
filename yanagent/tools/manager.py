@@ -490,7 +490,7 @@ class ToolManager:
         )
         try:
             content = await asyncio.wait_for(
-                definition.handler(arguments),
+                self._invoke(definition, arguments, context),
                 timeout=self.timeout_seconds,
             )
         except asyncio.CancelledError:
@@ -546,3 +546,15 @@ class ToolManager:
             truncated,
         )
         return result
+
+    async def _invoke(self, definition, arguments, context):
+        """在当前协程绑定可信身份，完成或取消后恢复，隔离并发会话。"""
+        from .execution_context import execution_context
+        from yanagent.workspace_paths import WorkspaceError
+        token = execution_context.set(context)
+        try:
+            return await definition.handler(arguments)
+        except (WorkspaceError, OSError, UnicodeError):
+            raise ToolHandlerError('工作区路径无效、存在链接、文件无法访问或编码不受支持。') from None
+        finally:
+            execution_context.reset(token)
