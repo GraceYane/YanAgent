@@ -118,11 +118,11 @@ class ExecutionStore:
 
     async def finish(self, step_id: str, *, result: ToolResult | None = None,
                      usage: dict | None = None, error_code: str | None = None,
-                     duration_ms: int = 0) -> None:
+                     duration_ms: int = 0, details: dict | None = None) -> None:
         """保存模型用量或工具结果；已进入 handler 的失败保守视为不确定。"""
-        await asyncio.to_thread(self._finish_sync, step_id, result, usage, error_code, duration_ms)
+        await asyncio.to_thread(self._finish_sync, step_id, result, usage, error_code, duration_ms, details)
 
-    def _finish_sync(self, step_id: str, result, usage, error_code, duration_ms: int) -> None:
+    def _finish_sync(self, step_id: str, result, usage, error_code, duration_ms: int, details=None) -> None:
         """事务性结束步骤并累计已知模型用量，重复结束不重复计费。"""
         try:
             with self.database.transaction(immediate=True) as conn:
@@ -133,6 +133,8 @@ class ExecutionStore:
                 if row["status"] not in {"pending", "running"}:
                     return
                 data = _decode_json_object(row["data_json"])
+                if details:
+                    data.update({k: v for k, v in details.items() if k in {'provider', 'model', 'fallback_transitions'}})
                 if row["kind"] == "tool":
                     if result is not None:
                         data["result"] = result.to_dict()

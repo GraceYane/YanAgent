@@ -262,12 +262,14 @@ class ModelReply(JsonContract):
     tool_calls: list[ToolCall] = field(default_factory=list)  # 模型要求执行的工具。
     finish_reason: str | None = None  # 结束原因；未知时为 None，供应商适配层负责转换。
     usage: Usage = field(default_factory=dict)  # 非负 Token 计数；缺失为 {} 或 None 值。
+    provider_metadata: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def validate(self) -> None:
         _text(self.content, "ModelReply.content")
         _tool_calls(self.tool_calls)
         _optional_text(self.finish_reason, "ModelReply.finish_reason")
         _usage(self.usage)
+        _json_object(self.provider_metadata, "ModelReply.provider_metadata")
 
     @classmethod
     def _decode_fields(cls, data: dict[str, Any]) -> dict[str, Any]:
@@ -277,7 +279,8 @@ class ModelReply(JsonContract):
         """转换为 Assistant 消息，完整保留后续 Tool Result 所引用的调用。"""
         self.validate()
         return Message(
-            role="assistant", content=self.content, tool_calls=deepcopy(self.tool_calls)
+            role="assistant", content=self.content, tool_calls=deepcopy(self.tool_calls),
+            metadata={"provider_state": deepcopy(self.provider_metadata)} if self.provider_metadata else {},
         )
 
 

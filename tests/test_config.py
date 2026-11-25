@@ -165,7 +165,7 @@ class ConfigTests(unittest.TestCase):
         cases = {
             "port": [True, 0, 65536, 1.5, "9876"],
             "request_timeout": [True, 0, -1, 3601, float("nan"), float("inf"), "60"],
-            "model_provider": ["TODO", "claude", "", None],
+            "model_provider": ["TODO", "unknown-vendor", "", None],
             "permission_mode": ["unknown", True],
             "host": ["", " ", "host/name", "host\nname"],
             "model": [False, None, " model", "a\nb", "\ud800"],

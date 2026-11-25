@@ -7,6 +7,8 @@ import os
 import sys
 from pprint import pformat
 from typing import Any
+from copy import deepcopy
+from yanagent.contracts import Message
 
 
 DEBUG_LOGGER_NAME = "yanagent.debug_trace"
@@ -61,9 +63,25 @@ def configure_yan_debug_logging(*, only_debug: bool | None = None) -> bool:
     return True
 
 
+def _trace_value(value: Any) -> Any:
+    """保留现有流程调试结构，屏蔽原生协议的不透明工具签名。"""
+    if isinstance(value, Message):
+        copied = deepcopy(value)
+        copied.metadata = _trace_value(copied.metadata)
+        return copied
+    if isinstance(value, dict):
+        return {key: '[协议状态已隐藏]' if key in {'gemini_calls', 'thoughtSignature'} else _trace_value(item)
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [_trace_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_trace_value(item) for item in value)
+    return value
+
+
 def yan_debug(source: str, function: str, message: str, /, **values: Any) -> None:
     """输出一条统一的流程调试日志，并对附加对象执行多行美化。"""
     lines = [f"[yanDebug][{source}][{function}] {message}"]
     for name, value in values.items():
-        lines.append(f"{name}:\n{pformat(value, sort_dicts=False, width=120)}")
+        lines.append(f"{name}:\n{pformat(_trace_value(value), sort_dicts=False, width=120)}")
     _LOGGER.info("\n".join(lines))

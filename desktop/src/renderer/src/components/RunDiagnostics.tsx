@@ -49,6 +49,9 @@ export default function RunDiagnostics({ sessionId, requestId }: { sessionId: st
         {data.error_code && <div>{t('run_error')}: {data.error_code}</div>}
         {data.steps.map((step) => <div key={step.step_id} className="flex flex-wrap gap-2">
           <span>{step.kind === 'tool' ? step.data.call?.name : `${t('run_model_attempt')} ${step.data.attempt ?? ''}`}</span>
+          {step.kind === 'model' && step.data.provider && <span>{step.data.provider} / {step.data.model}</span>}
+          {step.kind === 'model' && step.data.fallback_transitions?.map((item, index) =>
+            <span key={index}>{item.provider} / {item.model}: {item.error_code} →</span>)}
           <span>{t(`run_step_${step.status}`)}</span>
           <span>{step.duration_ms == null ? '—' : `${step.duration_ms} ms`}</span>
           {step.error_code && <span>{step.error_code}</span>}

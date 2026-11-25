@@ -28,7 +28,10 @@ from yanagent.errors import (
     SessionNotFoundError,
     RunRecoveryError,
 )
-from yanagent.models import ModelProvider, OpenAICompatibleProvider
+from yanagent.models import ModelProvider
+from yanagent.models.factory import create_single_provider, create_provider_chain, select_model
+from yanagent.models.catalog import PROVIDERS
+from yanagent.models.settings import models_payload as multi_models_payload, save_model_action as save_multi_model_action, model_names
 from yanagent.runtime.agent_loop import AgentLoop
 from yanagent.sessions import RunStore, SessionStore, StoredMessage
 from yanagent.sessions.runs import TerminalRunStatus
@@ -117,7 +120,7 @@ class YanAgentApplication:
         """注入配置、Provider、仓储、工具注册表和统一上下文构建器。"""
         self.config_store = config_store if config_store is not None else ConfigStore()
         self.provider_factory = (
-            provider_factory if provider_factory is not None else OpenAICompatibleProvider
+            provider_factory if provider_factory is not None else create_single_provider
         )
         self.session_store = session_store
         self.run_store = run_store
@@ -171,6 +174,7 @@ class YanAgentApplication:
             "use_linkai", "cow_lang", "agent_max_context_tokens",
             "agent_max_context_turns", "agent_max_steps", "enable_thinking",
             "reasoning_effort_by_model", "subagent_enabled", "self_evolution_enabled",
+            "provider_configs", "chat_fallback", "max_output_tokens",
         }
         if any(type(key) is not str or key not in allowed for key in updates):
             raise RequestValidationError(reason="unknown_field", field="updates")
@@ -205,7 +209,6 @@ class YanAgentApplication:
     def config_payload(self) -> dict[str, Any]:
         """把精简配置映射为复制桌面端 `/config` 所需的兼容字段。"""
         config = self.load_config()
-        models = self._model_names(config)
         return {
             "status": "success",
             "use_agent": True,
@@ -226,108 +229,65 @@ class YanAgentApplication:
             "self_evolution_enabled": config.self_evolution_enabled,
             "api_bases": {"api_base": config.api_base},
             "api_keys": {"api_key": MASKED_SECRET if config.api_key else ""},
-            "providers": {
-                PROVIDER_ID: {
-                    "label": {"zh": "OpenAI 兼容接口", "en": "OpenAI-compatible"},
-                    "models": models,
-                    "api_base_key": "api_base",
-                    "api_base_default": DEFAULT_API_BASE,
-                    "api_base_placeholder": DEFAULT_API_BASE,
-                    "api_key_field": "api_key",
-                }
-            },
+            "providers": {pid: {
+                "label": {"zh": spec.label, "en": spec.label}, "models": model_names(config, pid),
+                "api_base_key": "api_base", "api_base_default": spec.api_base,
+                "api_base_placeholder": spec.api_base, "api_key_field": "api_key",
+            } for pid, spec in PROVIDERS.items()},
         }
+
+    async def session_settings(self, session_id: str, updates: dict[str, Any] | None = None) -> dict[str, Any]:
+        """读取或更新会话覆盖；仅保存模型引用，不向会话写入供应商凭据。"""
+        if self.session_store is None:
+            raise SessionNotFoundError()
+        config = self.load_config()
+        try:
+            settings = (await self.session_store.get(session_id)).metadata.get('model_settings', {})
+        except SessionNotFoundError:
+            settings = {}
+        if updates is not None:
+            _ensure_keys(updates, {'provider', 'model', 'permission', 'agent_id'})
+            changes = {}
+            if 'provider' in updates or 'model' in updates:
+                provider, model = updates.get('provider'), updates.get('model')
+                if provider is None and model is None:
+                    changes.update(provider=None, model=None)
+                else:
+                    if type(provider) is not str or type(model) is not str:
+                        raise RequestValidationError(reason='invalid', field='model')
+                    selected = select_model(config, provider, model)
+                    selected.require_model_ready()
+                    changes.update(provider=provider, model=model)
+            if 'permission' in updates:
+                permission = updates['permission']
+                mapping = {'read-only': 'deny', 'workspace-write': 'ask', 'full-access': 'allow'}
+                if permission is not None and (type(permission) is not str or permission not in mapping):
+                    raise RequestValidationError(reason='invalid', field='body')
+                changes['permission'] = mapping.get(permission)
+            await self._ensure_session(session_id)
+            await self.session_store.update_model_settings(session_id, changes)
+            settings = {**settings, **changes}
+        permissions = {'deny': 'read-only', 'ask': 'workspace-write', 'allow': 'full-access'}
+        return {'status': 'success', 'model': {
+            'provider': settings.get('provider') or config.model_provider,
+            'model': settings.get('model') or config.model,
+            'source': 'session' if settings.get('model') else 'global',
+            'global': {'provider': config.model_provider, 'model': config.model},
+            'providers': [{'id': pid, 'label': spec.label, 'models': model_names(config, pid)} for pid, spec in PROVIDERS.items()],
+        }, 'permission': {'mode': permissions[settings.get('permission') or config.permission_mode],
+            'global': permissions[config.permission_mode], 'source': 'session' if settings.get('permission') else 'global',
+            'modes': list(permissions.values())}}
 
     def models_payload(self) -> dict[str, Any]:
-        """返回模型控制台可渲染的单 Provider 目录和聊天能力状态。"""
-        config = self.load_config()
-        models = self._model_names(config)
-        catalog = [{"name": name, "capabilities": ["text"]} for name in models]
-        empty = {"editable": False, "current_provider": "", "current_model": "", "providers": []}
-        capabilities = {
-            "chat": {
-                "editable": True,
-                "current_provider": config.model_provider,
-                "current_model": config.model,
-                "providers": [PROVIDER_ID],
-                "provider_models": {PROVIDER_ID: models},
-            },
-            "vision": dict(empty),
-            "asr": dict(empty),
-            "tts": dict(empty),
-            "embedding": dict(empty),
-            "image": dict(empty),
-            "search": {"editable": False, "providers": [], "available": False},
-        }
-        return {
-            "status": "success",
-            "providers": [{
-                "id": PROVIDER_ID,
-                "label": {"zh": "OpenAI 兼容接口", "en": "OpenAI-compatible"},
-                "configured": bool(config.api_base and config.api_key),
-                "is_custom": False,
-                "active": True,
-                "api_key_field": "api_key",
-                "api_base_field": "api_base",
-                "api_key_masked": MASKED_SECRET if config.api_key else "",
-                "api_base": config.api_base,
-                "api_base_default": DEFAULT_API_BASE,
-                "api_base_placeholder": DEFAULT_API_BASE,
-                "catalog": catalog,
-                "hidden": [],
-                "seed": catalog,
-                "effective": catalog,
-                "models": models,
-            }],
-            "capabilities": capabilities,
-        }
+        """返回供应商目录、脱敏凭据、能力声明和备用链。"""
+        return multi_models_payload(self.load_config())
 
     def save_model_action(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """处理本阶段的凭据保存、聊天模型选择和清除动作。"""
-        if type(payload) is not dict:
-            raise RequestValidationError(reason="invalid_json", field="body")
-        action = payload.get("action")
-        if type(action) is not str:
-            raise RequestValidationError(reason="missing", field="action")
-
-        if action == "set_provider":
-            _ensure_keys(payload, {"action", "provider_id", "api_key", "api_base"})
-            self._require_provider(payload)
-            updates = {
-                key: payload[key]
-                for key in ("api_key", "api_base")
-                if key in payload and payload[key] != MASKED_SECRET
-            }
-            if not updates:
-                raise RequestValidationError(reason="missing", field="updates")
-        elif action == "set_capability":
-            _ensure_keys(payload, {"action", "capability", "provider_id", "model"})
-            self._require_provider(payload)
-            if payload.get("capability") != "chat":
-                raise RequestValidationError(reason="unsupported", field="capability")
-            updates = {"model": _require_text(payload, "model", maximum=256)}
-        elif action == "delete_provider":
-            _ensure_keys(payload, {"action", "provider_id"})
-            self._require_provider(payload)
-            updates = {"api_base": "", "api_key": "", "model": ""}
-        else:
-            raise RequestValidationError(reason="unsupported", field="action")
-
+        """在配置锁内保存模型设置，记录动作而不记录密钥或请求正文。"""
         with self._config_lock:
-            if (
-                action == "set_provider"
-                and "api_key" in updates
-                and "api_base" not in updates
-                and not self.config_store.load().api_base
-            ):
-                updates["api_base"] = DEFAULT_API_BASE
-            config = self.config_store.save(updates)
-        LOGGER.info(
-            "[chat.py][YanAgentApplication.save_model_action] 模型配置动作完成，动作=%s，变更字段=%s",
-            action,
-            sorted(updates),
-        )
-        return {"status": "success", "applied": config.to_dict()}
+            result = save_multi_model_action(self.config_store, payload)
+        LOGGER.info("[chat.py][YanAgentApplication.save_model_action] 模型设置已更新，动作=%s", payload.get("action"))
+        return result
 
     async def chat(
         self,
@@ -810,7 +770,7 @@ class YanAgentApplication:
         history = [
             record.message for record in records if record.sequence >= first_sequence
         ]
-        config = self.load_config()
+        config = self._session_model_config(session_id)
         identity = RuntimeIdentity(
             user_id=self.session_store.user_id,
             agent_id=self.session_store.agent_id,
@@ -896,8 +856,8 @@ class YanAgentApplication:
             }
         removed_turns = turns[:-2]
         removed_records = [record for turn in removed_turns for record in turn]
-        config = self.load_config()
-        provider = self.provider_factory(config)
+        config = self._session_model_config(session_id)
+        provider = create_provider_chain(config, self.provider_factory)
         config.require_model_ready()
         summary, _ = await self._summarize_history(
             provider, previous_summary=state["summary"], records=removed_records,
@@ -1002,13 +962,29 @@ class YanAgentApplication:
     def prepare_chat(self, payload: dict[str, Any]) -> PreparedChat:
         """同步固定请求、配置和 Provider；具体 Provider 在执行前检查必需配置。"""
         session_id, message = self._validate_chat_payload(payload)
-        config = self.load_config()
+        config = self._session_model_config(session_id)
         return PreparedChat(
             session_id=session_id,
             message=Message(role="user", content=message),
             config=config,
-            provider=self.provider_factory(config),
+            provider=create_provider_chain(config, self.provider_factory),
         )
+
+    def _session_model_config(self, session_id: str) -> AppConfig:
+        """读取会话的有效模型快照，供聊天、用量查询与手动压缩共用。"""
+        config = self.load_config()
+        if self.session_store is not None:
+            try:
+                overrides = self.session_store._get_sync(session_id).metadata.get("model_settings", {})
+            except SessionNotFoundError:
+                overrides = {}
+            if overrides.get("model"):
+                config = select_model(config, overrides["provider"], overrides["model"])
+            if overrides.get("permission"):
+                config = replace(config, permission_mode=overrides["permission"])
+        if config.model:
+            config = select_model(config, config.model_provider, config.model)
+        return config
 
     def _validate_chat_payload(self, payload: dict[str, Any]) -> tuple[str, str]:
         """检查聊天正文及本阶段允许的兼容字段，不执行附件或语音请求。"""
@@ -1035,16 +1011,6 @@ class YanAgentApplication:
         if "lang" in payload and payload["lang"] is not None and type(payload["lang"]) is not str:
             raise RequestValidationError(reason="invalid", field="body")
         return session_id, message
-
-    def _require_provider(self, payload: dict[str, Any]) -> None:
-        """保证桌面动作只修改当前阶段唯一的兼容 Provider。"""
-        if payload.get("provider_id") != PROVIDER_ID:
-            raise RequestValidationError(reason="unsupported", field="provider_id")
-
-    def _model_names(self, config: AppConfig) -> list[str]:
-        """优先展示已保存模型；未配置时提供可替换的常见示例名称。"""
-        names = ([config.model] if config.model else []) + list(DEFAULT_MODEL_SUGGESTIONS)
-        return list(dict.fromkeys(name for name in names if name))
 
 
 def ensure_application_ready(application: YanAgentApplication) -> None:

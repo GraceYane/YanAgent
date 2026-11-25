@@ -611,7 +611,10 @@ export interface RunDiagnostics {
     status: string
     duration_ms: number | null
     error_code?: string | null
-    data: { call?: { name: string }; attempt?: number }
+    data: {
+      call?: { name: string }; attempt?: number; provider?: string; model?: string
+      fallback_transitions?: Array<{ provider: string; model: string; error_code: string }>
+    }
     usage: Record<string, number | null>
   }>
 }

@@ -631,11 +631,13 @@ class AgentLoop:
             await asyncio.shield(self.executions.finish(
                 step_id, error_code=error.code if isinstance(error, AgentError) else
                     "cancelled" if isinstance(error, asyncio.CancelledError) else "unexpected_error",
+                usage=getattr(error, 'usage', {}),
                 duration_ms=int((asyncio.get_running_loop().time() - started) * 1000),
             ))
             raise
         await self.executions.finish(
             step_id, usage=reply.usage,
+            details=reply.provider_metadata,
             error_code="empty_model_response" if not reply.tool_calls and not reply.content.strip() else None,
             duration_ms=int((asyncio.get_running_loop().time() - started) * 1000),
         )
@@ -667,6 +669,7 @@ class AgentLoop:
                     raise EmptyModelResponseError()
                 return reply, retry_usage
             except AgentError as error:
+                retry_usage = _merge_usage(retry_usage, getattr(error, 'usage', {}))
                 delay = retry_delay(error, attempt)
                 if delay is None:
                     raise

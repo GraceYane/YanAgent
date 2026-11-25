@@ -345,6 +345,24 @@ class SessionStore:
             "summary": summary,
         }
 
+    async def update_model_settings(self, session_id: str, updates: dict[str, Any]) -> None:
+        """事务性合并当前会话模型与权限覆盖，不覆盖摘要等其他元数据。"""
+        await asyncio.to_thread(self._update_model_settings_sync, _identifier(session_id), updates)
+
+    def _update_model_settings_sync(self, session_id: str, updates: dict[str, Any]) -> None:
+        """仅改模型设置命名空间，避免并发设置与上下文清理互相覆盖。"""
+        try:
+            with self.database.transaction(immediate=True) as conn:
+                row = self._select_session(conn, session_id)
+                if row is None:
+                    raise SessionNotFoundError()
+                metadata = _decode_json_object(row['metadata_json'])
+                metadata.setdefault('model_settings', {}).update(updates)
+                conn.execute("UPDATE sessions SET metadata_json=? WHERE user_id=? AND agent_id=? AND session_id=?",
+                    (_json_object(metadata), self.user_id, self.agent_id, session_id))
+        except sqlite3.Error:
+            raise SessionStorageError() from None
+
     async def update_context_state(
         self,
         session_id: str,

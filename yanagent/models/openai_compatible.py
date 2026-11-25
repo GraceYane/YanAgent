@@ -347,6 +347,7 @@ class OpenAICompatibleProvider(NonStreamingProvider):
             payload=payload, timeout=self._config.request_timeout,
         )
         reply = parse_reply(data)
+        reply.provider_metadata.update(provider=self._config.model_provider, model=self._config.model)
         yan_debug(
             "openai_compatible.py",
             "OpenAICompatibleProvider.complete",
@@ -420,6 +421,7 @@ class OpenAICompatibleProvider(NonStreamingProvider):
         if not saw_done:
             raise ModelResponseError()
         reply = builder.finish()
+        reply.provider_metadata.update(provider=self._config.model_provider, model=self._config.model)
         yan_debug(
             "openai_compatible.py",
             "OpenAICompatibleProvider.stream",

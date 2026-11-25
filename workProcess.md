@@ -2172,3 +2172,63 @@ Electron/React chatStore
 - 恢复仅接受同一 Session 最新失败/中断/取消 Run，使用当前配置；不支持多进程共同操作同一数据库的分布式运行租约。摘要请求暂不单独生成步骤，供应商未返回的失败请求 Token 无法准确记录。
 - 需补 Electron 真机点击及外部副作用核对验收；全仓 TypeScript 基线问题单独处理。下一开发项为 P06-01：多模型与备用链。
 
+## 2026-11-25：P06-01 多模型与备用链（11 月 24 日开始，25 日收尾）
+
+### 实际完成的内容
+
+- 增加供应商目录与 Provider 工厂，支持 openai-compatible、openai、deepseek、qwen、claude、gemini 六类入口。前四类复用现有 Chat Completions 适配器；Claude 使用 Messages，Gemini 使用 generateContent/streamGenerateContent，均接到统一 ModelReply 和 ModelStreamEvent。
+- 原生文本及函数工具支持完整响应、工具请求、工具结果回传和 SSE。Claude 按 text/tool_use/tool_result 转换，Gemini 按 functionCall/functionResponse 转换。完整参数形成后仍由 AgentLoop 调用本地 ToolManager，适配器本身不执行工具。
+- 增加可维护的模型目录和文本、流式、工具协议能力声明。内置名称仅作为示例，可通过既有模型设置维护或隐藏；不宣称目录是实时厂商列表，也不宣称任意用户填入的模型都有工具能力。
+- 增加 provider_configs 保存供应商独立凭据、地址与目录，保留旧平铺配置兼容。全局模型切换、旧配置入口及环境变量切换均隔离凭据；切供应商而未指定新模型时清空旧模型。清除活动密钥会同步档案，避免旧密钥被自动恢复。公开嵌套配置脱敏，模型设置动作不会把环境密钥回写到文件。
+- 实现 GET/POST 会话设置接口，复用输入框现有模型菜单。会话只存供应商/模型引用和可选权限覆盖；SQLite 事务合并 metadata.model_settings，保留上下文摘要。重建仓储后仍可恢复会话选择，之后修改设置不改变已准备任务的快照。聊天、手动压缩和用量查询共用会话模型选择逻辑。
+- 增加默认关闭、最多四项的备用链，候选位置在每个 Run 中独立且仅向后推进。连接、超时、429、5xx、完全空响应可切换；认证、权限、拒答、非法请求和坏响应结构不切换。同供应商保留 Retry-After 等待，所有请求继续受 Run 总期限和取消约束。
+- 流在输出任何文字或工具参数后失败，明确中断而不拼接备用回答。工具执行后的模型故障只重发带 Tool Result 的当前上下文，不重新执行前置 handler；原有写工具指纹与恢复保护继续生效。空响应已知 Usage 在切换及有限补请求之间累计一次，未知用量不补零。
+- ModelReply 增加默认可省略的内部 provider_metadata，用于实际供应商、模型、备用轨迹及必要的 Gemini 工具签名。Assistant 保存签名供下轮原样回传；答案不输出 thought 文本，调试日志隐藏 opaque 签名，模型步骤只接收白名单诊断字段。桌面执行记录展示实际模型与切换原因，备用链编辑限制与后端对齐。
+- 更新配置示例、需求进度、路线图，新增 docs/P06_01_MULTI_MODELS.md。下一项 P06-02；P05 整体产品验收和 P06 其他步骤没有被本项标记完成。
+
+### 涉及的文件
+
+- `yanagent/models/catalog.py`、`factory.py`、`native.py`、`settings.py`：供应商声明、选择与备用链、原生协议及模型设置适配。
+- `yanagent/models/openai_compatible.py`、`yanagent/contracts.py`、`yanagent/debug_log.py`：实际来源标识、内部协议状态和调试日志脱敏。
+- `yanagent/config/settings.py`、`yanagent/errors.py`、`config.example.json`：配置验证、凭据隔离及默认结构。
+- `yanagent/chat.py`、`yanagent/sessions/store.py`、`app.py`：全局设置、会话持久化选择与 HTTP 入口。
+- `yanagent/runtime/agent_loop.py`、`yanagent/sessions/executions.py`：备用空响应的已知用量交接、模型实际来源持久化。
+- `desktop/src/renderer/src/components/RunDiagnostics.tsx`、`pages/settings/ChatFallbackCard.tsx`、`types.ts`、`i18n.ts`：实际模型展示、四项链限制、完整/重复输入检查及说明。
+- `tests/test_multi_models.py`、`tests/test_config.py`：多模型验收与旧单供应商限制预设调整。
+- `docs/P06_01_MULTI_MODELS.md`、`docs/DEVELOPMENT_REQUIREMENTS.md`、`docs/IMPLEMENTATION_ROADMAP.md`、`workProcess.md`。
+
+### 参考依据与设计取舍
+
+- 检查 CowAgentByYan 的 channel/web/core/providers.py 设置及凭据选择，以及 tests/test_fallback_provider_credentials.py 的备用凭据回归；参考 HEAD 为 1fa66340，检查时参考仓库无受跟踪文件差异。本次未修改参考项目。
+- 对照 DeepSeek、Claude、Gemini、Qwen 官方接口文档，链接记录在专项说明。复用兼容适配器降低重复维护；原生服务保留原生消息和鉴权，避免以兼容接口名义隐藏工具历史差异。
+- 备用链限制在模型调用边界，而不是重新运行 Run。不同供应商有独立地址及密钥，切换时一并选择；保持旧模型名或密钥看似可请求，却可能发到错误服务。Qwen 地址随账号地域变化，故要求用户明确填写。
+- Gemini 的工具签名属于续接协议状态，不能当作可展示的思考内容。只保存函数调用及其签名；回传可以保留，日志和诊断不可扩散任意厂商字段。完整 Thinking 与模型窗口配置留给 P06-02。
+
+### 验证结果
+
+- 新增 20 项多模型专项；最终全量离线测试 256 项通过，覆盖真实 SQLite、重建仓储、本机 HTTP、Fake Provider 及原生 SSE 帧。兼容四类入口验证配置和鉴权，详细文本/工具/流语义复用既有共享适配器测试；Claude/Gemini 另有原生契约测试。
+- 专项包括工具声明/结果回传、Gemini 签名续接且不泄露日志、原生拒答/坏结构/截断流、首帧前后切换策略、真实 AgentLoop 的前置写 handler 只执行一次、空响应切换/补请求已知用量、全局与环境凭据隔离、密钥清除、会话持久化、快照固定及 HTTP 身份/未知字段拒绝。
+- 2026-11-24，现有 openai-compatible/deepseek-flash 配置真实完整响应和流式调用均成功，已知总 Token 分别为 46 和 42。测试仅发「只回复 OK」，没有发项目内容、历史或调用本地工具。这不代表 DeepSeek 官方直连和其他厂商已通过真实验证。
+- Renderer 最终生产构建、Python compileall 和 git diff --check 通过。保留字体引用、Browserslist 和较大 bundle 提示。
+- TypeScript 全仓检查仍失败，错误仅为 ChannelsPage 的 IconComponent/Lucide size 类型以及 types.ts 两处重复 user_seq；与先前 P05-06 记录和 HEAD 基线一致。本次没有将 Vite 构建成功表述为 TypeScript 全仓通过，也没有顺带修复其他阶段遗留问题。
+- 一次专项失败是重建 Session 测试错把返回的嵌套 model.provider 当作顶层 provider；修正断言后通过。检查中还补齐了环境切换凭据隔离、可省略工具描述及空响应 Usage 交接的边界验证。
+- 上次 TypeScript 检查因自动审批服务额度不足未执行，11 月 25 日继续后审批及检查已恢复。全量测试与构建在允许本机 socketpair 和 Node 父目录读取的审批环境执行，没有更改操作系统权限。
+
+### 岗位要求关联与实践证据
+
+- 对应 TARGET_ROLES.md 中 Agent 核心链路（XM-职责1、DYQ-职责2、TX-职责1）、可用性/稳定性/可观测性（XM-职责6～7、DYQ-职责2～3、TX-职责3）、Python/TypeScript 工程（XM-要求2、DYQ-要求2、TX-要求1）与开源拆解及复盘（XM-要求4/6、DYQ-要求3～4、TX-要求5～6）的相关部分。
+- 已实现证据为统一工厂、原生工具消息转换、供应商独立配置、会话选择与不可变任务快照、有限备用策略、实际模型轨迹和用量交接。验证证据为 256 项离线测试、20 项专项、本机 HTTP 设置链路、Renderer 构建及现有兼容模型两种真实调用；这些不等于线上 SLA、跨地域容灾能力或企业级多租户部署经验。
+- 面试可讲：同样的工具闭环可以跨协议，前提是工具调用与结果正确配对；切备用必须切凭据及地址，不能只改模型 ID；模型请求失败与工具副作用失败属于不同边界；部分流不能自动重放，否则答案及工具参数可能被拼接或重复。内部协议状态可保存但必须与用户答案/日志分开。
+- 未测量真实供应商切换成功率、端到端延迟改善或费用降低；没有训练、微调模型，也没有完成所有模型高级能力。后续仍需多厂商真实工具闭环、效果与成本评测。
+
+### 难点评分
+
+整体难度：**8/10**。第一处难点是保持三种协议的工具历史语义一致：Claude 以 tool_use/tool_result 块衔接，Gemini 以 functionCall/functionResponse 和必要签名衔接，兼容接口则通过 tool_calls/tool_call_id 衔接；统一适配后由同一个执行循环运行工具，避免每个供应商独立实现权限和持久化。第二处是切换安全：每次选择目标档案，文件和环境入口也执行隔离，显式清空不能由旧档案复活，任务配置与后续设置互不影响。第三处是故障边界：备用只重发当前模型输入，已输出增量禁止换模型拼接，写工具已执行则保持结果并沿用指纹保护。第四处是已知用量交接，空响应切换后若最后候选仍空，需要把累计消耗交给上层有限重试并清空内部计数，避免漏计或重复累计。
+
+### 尚未完成的事项
+
+- OpenAI 官方、DeepSeek 官方直连、Qwen、Claude 和 Gemini 缺少对应凭据，真实调用未测；未在 Electron 点击验收所有模型选择和备用设置，未实测跨供应商限流故障。
+- P06-02：进一步统一 Thinking、结束原因、缓存/推理 Token、模型上下文窗口和输出预算差异。当前只提供文本与函数工具基础接入，没有图像、语音或完整原生服务端工具。
+- 模型目录是内置示例加用户维护，不是远程发现服务；备用内部请求暂无逐供应商费用/耗时拆分，失败服务端未返回的 Token 不可准确得知。
+- P06-03～06 的 Workspace、文件命令、网页、多模态及产物并行尚未开发；P05 专项产品验收与既有全仓 TypeScript 问题继续单独跟进。
+

@@ -7,6 +7,7 @@ import math
 import os
 import tempfile
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -82,6 +83,9 @@ class AppConfig:
     reasoning_effort_by_model: dict[str, str] = field(default_factory=dict)
     subagent_enabled: bool = False
     self_evolution_enabled: bool = False
+    provider_configs: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
+    chat_fallback: dict[str, Any] = field(default_factory=lambda: {"enabled": False, "chain": []})
+    max_output_tokens: int = 4096
 
     def __post_init__(self) -> None:
         """构造时统一校验类型、允许值及超时范围，不接受隐式类型转换。"""
@@ -93,8 +97,50 @@ class AppConfig:
             raise ConfigurationError(field="host")
         if type(self.port) is not int or not 1 <= self.port <= 65535:
             raise ConfigurationError(field="port")
-        if self.model_provider != "openai-compatible":
+        if self.model_provider not in {"openai-compatible", "openai", "deepseek", "qwen", "claude", "gemini"}:
             raise ConfigurationError(field="model_provider")
+        if type(self.max_output_tokens) is not int or not 1 <= self.max_output_tokens <= 128_000:
+            raise ConfigurationError(field="max_output_tokens")
+        if type(self.provider_configs) is not dict:
+            raise ConfigurationError(field="provider_configs")
+        for provider, profile in self.provider_configs.items():
+            if provider not in {"openai-compatible", "openai", "deepseek", "qwen", "claude", "gemini"} or type(profile) is not dict:
+                raise ConfigurationError(field="provider_configs")
+            if set(profile) - {"api_key", "api_base", "models", "hidden"}:
+                raise ConfigurationError(field="provider_configs")
+            for name in ("api_key", "api_base"):
+                _validate_text(profile.get(name, ""), name, allow_empty=True)
+            key = profile.get("api_key", "")
+            if key and set(key) == {"*"}:
+                raise ConfigurationError(reason="masked_key", field="provider_configs")
+            _validate_api_base(profile.get("api_base", ""))
+            for name in ("models", "hidden"):
+                values = profile.get(name, [])
+                if type(values) is not list or len(values) > 200:
+                    raise ConfigurationError(field="provider_configs")
+                for value in values:
+                    _validate_text(value, "model")
+                    if len(value) > 256:
+                        raise ConfigurationError(field="model")
+        fallback = self.chat_fallback
+        if (type(fallback) is not dict or set(fallback) - {"enabled", "chain"}
+            or type(fallback.get("enabled", False)) is not bool
+            or type(fallback.get("chain", [])) is not list or len(fallback.get("chain", [])) > 4):
+            raise ConfigurationError(field="chat_fallback")
+        seen = set()
+        for link in fallback.get("chain", []):
+            if type(link) is not dict or set(link) != {"provider", "model"}:
+                raise ConfigurationError(field="chat_fallback")
+            _validate_text(link["provider"], "model_provider")
+            _validate_text(link["model"], "model")
+            if link["provider"] not in {"openai-compatible", "openai", "deepseek", "qwen", "claude", "gemini"}:
+                raise ConfigurationError(field="chat_fallback")
+            pair = (link["provider"], link["model"])
+            if pair in seen:
+                raise ConfigurationError(field="chat_fallback")
+            seen.add(pair)
+        if fallback.get("enabled") and not seen:
+            raise ConfigurationError(field="chat_fallback")
         if self.permission_mode not in {"deny", "ask", "allow"}:
             raise ConfigurationError(field="permission_mode")
         if type(self.max_context_tokens) is not int or not 0 <= self.max_context_tokens <= 1_000_000:
@@ -133,6 +179,9 @@ class AppConfig:
         """返回默认安全的展示字典，短密钥和长密钥均完全隐藏。"""
         result = asdict(self)
         result["api_key"] = MASKED_SECRET if self.api_key else ""
+        for profile in result["provider_configs"].values():
+            if "api_key" in profile:
+                profile["api_key"] = MASKED_SECRET if profile["api_key"] else ""
         return result
 
 
@@ -200,6 +249,11 @@ class ConfigStore:
     def _effective(self, file_values: dict[str, Any]) -> AppConfig:
         """应用非空环境覆盖；数字显式解析，空串占位不清除文件值。"""
         values = dict(file_values)
+        selected = self._environ.get('YAN_MODEL_PROVIDER')
+        if selected and selected != file_values.get('model_provider', 'openai-compatible'):
+            # 环境切换供应商时也必须隔离文件层的主模型凭据。
+            profile = file_values.get('provider_configs', {}).get(selected, {}) if type(selected) is str else {}
+            values.update(api_key=profile.get('api_key', ''), api_base=profile.get('api_base', ''), model='')
         for env_name, name in ENV_FIELDS.items():
             raw = self._environ.get(env_name)
             if raw is None or raw == "":
@@ -225,6 +279,28 @@ class ConfigStore:
         """局部更新文件后返回生效快照；省略密钥保留原值，空串明确清除。"""
         updates = _check_fields(updates)
         file_values = self._read_file()
+        updates = deepcopy(updates)
+        # 在读取嵌套档案前验证原始更新，非法结构应返回配置错误。
+        AppConfig(**{**file_values, **updates})
+        previous = AppConfig(**file_values)
+        selected_provider = updates.get('model_provider', previous.model_provider)
+        profiles = deepcopy(updates.get('provider_configs', previous.provider_configs))
+        if type(profiles) is not dict:
+            raise ConfigurationError(field='provider_configs')
+        if selected_provider != previous.model_provider:
+            profiles.setdefault(previous.model_provider, {}).update(api_key=previous.api_key, api_base=previous.api_base)
+            target = profiles.get(selected_provider, {}) if type(selected_provider) is str else {}
+            updates.setdefault('api_key', target.get('api_key', ''))
+            updates.setdefault('api_base', target.get('api_base', ''))
+            updates.setdefault('model', '')
+        if type(selected_provider) is str:
+            target = profiles.setdefault(selected_provider, {})
+            if type(target) is not dict:
+                raise ConfigurationError(field='provider_configs')
+            for name in ('api_key', 'api_base'):
+                if name in updates:
+                    target[name] = updates[name]
+        updates['provider_configs'] = profiles
         file_values.update(updates)
         saved = AppConfig(**file_values)
         effective = self._effective(file_values)

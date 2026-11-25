@@ -366,6 +366,12 @@ class YanAgentHandler(BaseHTTPRequestHandler):
                     until_sequence=until_sequence,
                 )))
                 return
+            if path.startswith("/api/sessions/") and path.endswith("/settings"):
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                self._validate_agent(self._query_text(query, "agent_id"))
+                session_id = self._session_id_from_path(path, suffix="/settings")
+                self._json(self.runtime.execute(self.application.session_settings(session_id)))
+                return
             if path.startswith("/api/sessions/") and path.endswith("/context_usage"):
                 query = parse_qs(parsed.query, keep_blank_values=True)
                 self._validate_agent(self._query_text(query, "agent_id"))
@@ -431,6 +437,11 @@ class YanAgentHandler(BaseHTTPRequestHandler):
                     self._json(self.runtime.start_stream(payload, request_id=request_id))
                 else:
                     self._json(self.runtime.complete(payload, request_id=request_id))
+                return
+            if path.startswith("/api/sessions/") and path.endswith("/settings"):
+                self._validate_agent(payload.get("agent_id"))
+                session_id = self._session_id_from_path(path, suffix="/settings")
+                self._json(self.runtime.execute(self.application.session_settings(session_id, payload)))
                 return
             if path == "/config":
                 self._json(self.application.save_config(payload))

@@ -10,11 +10,8 @@ import { resolveModels, providerLabel } from './modelsHelpers'
 // small button on the main model card (see ChatFallbackButton) and is edited
 // in a modal. It sits idle until the primary model fails a turn for good.
 //
-// The backups form an ordered chain rather than a single model: link 1 is
-// tried first and, if it also fails, link 2 takes over, and so on. The chain
-// is unbounded — however many links the user adds is how many backups a turn
-// gets — so the modal renders one editable row per link with up/down/remove
-// controls instead of a single provider + model picker.
+// 备用模型按序尝试，最多四项，与后端有界备用链约束一致。
+const MAX_FALLBACK_LINKS = 4
 
 export interface ChatFallbackSavePayload {
   enabled: boolean
@@ -236,9 +233,10 @@ const ChatFallbackModal: React.FC<ChatFallbackModalProps> = ({
   }
 
   const addLink = () => {
+    // 界面与后端同时限制数量，避免保存时才发现超限。
     const firstProvider = (state?.providers || [])[0] || ''
     const firstModel = resolveModels(data, firstProvider, state?.provider_models)[0]?.value || ''
-    setChain((prev) => [...prev, { provider: firstProvider, model: firstModel }])
+    setChain((prev) => prev.length >= MAX_FALLBACK_LINKS ? prev : [...prev, { provider: firstProvider, model: firstModel }])
   }
 
   const removeLink = (i: number) => {
@@ -259,8 +257,9 @@ const ChatFallbackModal: React.FC<ChatFallbackModalProps> = ({
 
   // Enabling needs at least one complete link; the backend rejects an empty
   // chain for the same reason (a fallback with nothing to fall back to).
-  const hasCompleteLink = chain.some((l) => !!l.provider && !!l.model)
-  const incomplete = enabled && !hasCompleteLink
+  const hasCompleteLink = chain.length > 0 && chain.every((l) => !!l.provider && !!l.model)
+  const duplicate = new Set(chain.map((l) => JSON.stringify([l.provider, l.model]))).size !== chain.length
+  const incomplete = enabled && (!hasCompleteLink || duplicate)
 
   return (
     <Modal
@@ -324,6 +323,7 @@ const ChatFallbackModal: React.FC<ChatFallbackModalProps> = ({
           <button
             type="button"
             onClick={addLink}
+            disabled={chain.length >= MAX_FALLBACK_LINKS}
             className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-btn text-xs
                        text-accent bg-accent-soft hover:bg-accent-soft/70 cursor-pointer transition-colors"
           >

@@ -10,6 +10,7 @@ CONFIG_FIELDS = frozenset({
     "request_timeout", "permission_mode", "max_context_tokens", "max_context_turns",
     "max_agent_steps", "enable_thinking", "reasoning_effort_by_model",
     "subagent_enabled", "self_evolution_enabled",
+    "provider_configs", "chat_fallback", "max_output_tokens",
 })
 REQUEST_FIELDS = frozenset({
     "body", "session_id", "message", "stream", "attachments", "is_voice",
