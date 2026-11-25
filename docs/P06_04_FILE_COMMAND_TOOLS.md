@@ -69,3 +69,18 @@
 - CowAgentByYan 当前参考 HEAD `1fa66340`：agent/tools/bash/bash.py、background.py、decode.py、search_files/search_files.py。借鉴后台句柄、有限输出和编码分层；未照搬自动注入密钥、跨根放行或 Windows cmd.exe 路径。
 - [Python 子进程异步与管道说明](https://docs.python.org/3/library/asyncio-subprocess.html)：采用持续排空和有限缓冲，避免大输出堵塞/无限 communicate 内存；本项使用 Popen + reader 线程兼容常驻事件循环。
 - [Microsoft Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)：普通后代归属和统一终止的依据，Job 用于生命周期管理，不是文件系统沙箱。
+
+## 2026-11-25 联调修正：已有文件工具仍自称只有两个
+
+- 用户截图中的旧会话连续声称只有 calculator/current_time。只读检查当前 9876 后端 `/api/tools` 实际返回 10 项，包括 read_file/write_file；截图对应会话的历史确实多次保存了旧的能力拒绝说明。该证据说明模型正文不能作为实际工具注册表；未将它诊断成路径权限拒绝，因为没有对应 read_file 执行结果。
+- 系统 Prompt 增加每轮实时工具名称列表，明确历史回复与摘要中的能力说明可能已过期，以当前 Schema 为准。仅在 read_file 实际存在时，要求明确读取请求先提交工具，再根据真实结果作答，不能未尝试就声称没有工具。工具为空或运行时拒绝时仍保留原约束，没有强制 tool_choice、伪造读取或自动批准。
+- 新增合成旧历史/摘要回归，保留历史原文，验证实际 Chat Completions tools 中完整 10 项且包含文件读写；检查无工具时不会错误宣称 read_file 存在。专项增至 24 项，全量 323 项离线回归通过。
+- 自动审批拒绝了向已配置外部模型重放完整私人历史的诊断请求；该请求未执行，未通过其他通道重放，改用合成历史本地验证。模型实际遵循效果仍需重启 Python 后端加载 Prompt 后，在桌面重新发送读取请求复验，不保证仅改 Prompt 消除所有模型误判。
+
+### 再次复验：旧会话仍拒绝
+
+- 后续用户截图证明提示词修正并未解决旧会话。只读核对该轮是在后端重启后产生，不能继续归因为未重启；全局/会话模型均是当前兼容接口 deepseek-flash。
+- 使用完全合成数据完成 4 次真实模型对照：非流式/流式、无历史/合成旧能力陈述（流式含 8 轮重复陈述），均返回 read_file。没有执行工具或把示例结果写入用户会话。
+- 用户随后明确授权“同意这一次重放”。只进行 1 次原会话流式请求重放：发送前确认实际 HTTP payload 含 10 项工具、28 条消息及新实时能力规则，模型仍不返回 ToolCall，重复声称只有两个工具。重放未执行工具，未修改会话或文件。已证明具体旧上下文会触发错误能力判断，而非工具未注册或 read_file 运行时报错；尚未把原因细分为某条正文或某段协议状态。
+- 本机仅统计历史协议推理字段长度和能力词标记，未输出或篡改具体内容。DeepSeek 当前官方工具模式要求完整回传历史 reasoning_content，因此没有用随意删除签名/推理字段来修复。参考：[Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode/)。
+- 当前用户可使用输入框的上下文圆环 →“清除”，再发送“使用 read_file 读取当前工作区 test.txt”；这会移除后续模型输入中的旧历史/摘要，保留界面历史与项目关联。也可新建会话再确认工作区。此次仅给出入口，未自动清空用户上下文，未声称真实文件已经读取成功；代码输入链未新增强制调用或自动重试补丁。

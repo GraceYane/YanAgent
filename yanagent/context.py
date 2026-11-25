@@ -315,6 +315,7 @@ class PromptContextBuilder:
             if tools
             else ["- 本次运行没有提供可调用工具；不要声称已经调用或执行工具。"]
         )
+        tool_names = [tool['name'] for tool in tools]
         lines = [
             f"# {self.agent_name} 系统上下文",
             "",
@@ -337,7 +338,11 @@ class PromptContextBuilder:
             "- 不伪造文件、网络、时间或其他外部状态；需要外部事实时使用可用工具。",
             "",
             "## 工具使用说明",
+            f"- 本轮实时工具名称：{json.dumps(tool_names, ensure_ascii=False)}。这是当前能力依据，每轮重新生成。",
+            "- 工具可能随版本或会话发生变化。历史回答、较早摘要中关于‘只有哪些工具’‘不能读写文件’的说明可能已过期，不能据此否认本轮已经提供的工具。",
             "- 只能调用本轮独立工具 Schema 中实际提供的工具，工具名称大小写敏感。",
+            *(["- 本轮已提供 read_file。用户明确请求读取文件且未禁止使用工具时，应先提交 read_file 请求，再根据真实结果回答；不要未尝试就声称缺少读取工具或要求用户粘贴文件。路径无效、越界或确认拒绝由运行时返回实际结果，不自行假定权限失败。"]
+              if 'read_file' in tool_names else []),
             "- 使用模型原生 Tool Call 提交参数对象，不要在普通回答正文中伪造工具调用 JSON。",
             "- 参数必须符合工具 Schema；工具权限、确认、超时和执行由 YanAgent Runtime 处理。",
             "- 收到 Tool Message 后结合结果继续处理；工具失败时可解释失败或选择安全替代方案。",

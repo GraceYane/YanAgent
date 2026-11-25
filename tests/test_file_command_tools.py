@@ -16,6 +16,9 @@ from unittest.mock import patch
 from yanagent.chat import YanAgentApplication
 from yanagent.config import ConfigStore
 from yanagent.contracts import ModelReply, ToolCall
+from yanagent.contracts import Message
+from yanagent.context import PromptContextBuilder, RuntimeIdentity
+from yanagent.models.openai_compatible import prepare_request
 from yanagent.events import ModelStreamEvent
 from yanagent.models import FakeProvider
 from yanagent.runtime import AgentRuntime
@@ -385,6 +388,31 @@ class FileToolRuntimeTests(unittest.TestCase):
         events = self.collect('reject-run', approve=False)
         self.assertFalse((self.app.workspaces.root('s') / '你好.txt').exists())
         self.assertTrue(any(event['type'] == 'tool_end' and event['status'] == 'error' for event in events))
+
+    def test_old_capability_claim_does_not_replace_current_schema(self):
+        """旧回复与摘要保留为历史，当前系统能力及 HTTP 工具字段仍含实际文件工具。"""
+        prepared = self.app.prepare_chat({'session_id': 's', 'message': '读取 test.txt 的内容'})
+        old_claim = '本轮只有 calculator 和 current_time，不能读取文件。'
+        context = PromptContextBuilder().build(
+            identity=RuntimeIdentity('local', 'default', 's', 'current-run', workspace_root=prepared.workspace_root),
+            history=[Message('user', '读一下 test.txt'), Message('assistant', old_claim)],
+            current=prepared.message, tools=self.app.tool_manager.schemas(), memory_summary=old_claim,
+        )
+        system = context.messages[0].content
+        self.assertIn('历史回答、较早摘要', system)
+        self.assertIn('本轮已提供 read_file', system)
+        self.assertIn('应先提交 read_file 请求', system)
+        self.assertEqual(context.messages[2].content, old_claim)
+        converted, schemas = prepare_request(context.messages, context.tools)
+        self.assertEqual(converted[0]['role'], 'system')
+        self.assertEqual(converted[-1]['content'], '读取 test.txt 的内容')
+        self.assertEqual(len(schemas), 10)
+        self.assertIn('read_file', [schema['function']['name'] for schema in schemas])
+        self.assertIn('write_file', [schema['function']['name'] for schema in schemas])
+        empty = PromptContextBuilder().build(identity=RuntimeIdentity('local', 'default', 's', 'empty-run'),
+            history=[], current=Message('user', '读取 test.txt'))
+        self.assertNotIn('本轮已提供 read_file', empty.messages[0].content)
+        self.assertEqual(empty.tools, ())
 
     def test_runtime_close_reaps_background_after_successful_run(self):
         """成功回答后后台仍可运行；关闭 Runtime 必须终止，不能留下服务。"""
